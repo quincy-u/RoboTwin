@@ -33,6 +33,9 @@ class DatasetConfig:
 
 DEFAULT_DATASET_CONFIG = DatasetConfig()
 
+# Head-camera 3D-OBB projection: 8 corners × 2 coords × up to 2 objects.
+OBB_HEAD_DIM = 32
+
 
 def create_empty_dataset(
     repo_id: str,
@@ -80,6 +83,11 @@ def create_empty_dataset(
             "names": [
                 motors,
             ],
+        },
+        "observation.obb_head": {
+            "dtype": "float32",
+            "shape": (OBB_HEAD_DIM, ),
+            "names": ["obb_head"],
         },
     }
 
@@ -175,6 +183,7 @@ def load_raw_episode_data(
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor,
 ]:
     with h5py.File(ep_path, "r") as ep:
         state = torch.from_numpy(ep["/observations/qpos"][:])
@@ -188,6 +197,11 @@ def load_raw_episode_data(
         if "/observations/effort" in ep:
             effort = torch.from_numpy(ep["/observations/effort"][:])
 
+        if "/observations/obb_head" in ep:
+            obb_head = torch.from_numpy(np.asarray(ep["/observations/obb_head"][:], dtype=np.float32))
+        else:
+            obb_head = torch.zeros((state.shape[0], OBB_HEAD_DIM), dtype=torch.float32)
+
         imgs_per_cam = load_raw_images_per_camera(
             ep,
             [
@@ -197,7 +211,7 @@ def load_raw_episode_data(
             ],
         )
 
-    return imgs_per_cam, state, action, velocity, effort
+    return imgs_per_cam, state, action, velocity, effort, obb_head
 
 
 def populate_dataset(
@@ -212,7 +226,7 @@ def populate_dataset(
     for ep_idx in tqdm.tqdm(episodes):
         ep_path = hdf5_files[ep_idx]
 
-        imgs_per_cam, state, action, velocity, effort = load_raw_episode_data(ep_path)
+        imgs_per_cam, state, action, velocity, effort, obb_head = load_raw_episode_data(ep_path)
         num_frames = state.shape[0]
         # add prompt
         dir_path = os.path.dirname(ep_path)
@@ -226,6 +240,7 @@ def populate_dataset(
             frame = {
                 "observation.state": state[i],
                 "action": action[i],
+                "observation.obb_head": obb_head[i],
                 "task": instruction,
             }
 

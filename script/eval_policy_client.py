@@ -331,7 +331,7 @@ def main(usr_args):
 
     # model = get_model(usr_args)
     model = ModelClient(port=port)
-    st_seed, suc_num = eval_policy(task_name,
+    st_seed, suc_num = evals_policy(task_name,
                                    TASK_ENV,
                                    args,
                                    model,

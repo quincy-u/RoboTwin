@@ -89,10 +89,21 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        sampled = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        # When the model is configured with ``predict_obb=True``, ``sample_actions`` returns
+        # ``(actions, future_obb)``; otherwise it returns just ``actions``.
+        if isinstance(sampled, tuple):
+            actions, future_obb = sampled
+            outputs = {
+                "state": inputs["state"],
+                "actions": actions,
+                "future_obb": future_obb,
+            }
+        else:
+            outputs = {
+                "state": inputs["state"],
+                "actions": sampled,
+            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

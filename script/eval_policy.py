@@ -159,7 +159,7 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = int(usr_args.get("test_num", 100))
     topk = 1
 
     model = get_model(usr_args)
@@ -233,10 +233,10 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
+                stack_trace = traceback.format_exc()
+                print(" -------------")
+                print("Error: ", e)
+                print(" -------------")
                 TASK_ENV.close_env()
                 now_seed += 1
                 args["render_freq"] = render_freq
@@ -305,6 +305,11 @@ def eval_policy(task_name,
             print("\033[92mSuccess!\033[0m")
         else:
             print("\033[91mFail!\033[0m")
+
+        if hasattr(model, 'latencies') and len(model.latencies) > 0:
+            avg_latency = sum(model.latencies) / len(model.latencies)
+            print(f"\033[93mAverage Inference Latency:\033[0m {avg_latency:.4f}s per inference call ({1/avg_latency:.2f} FPS)")
+            model.latencies = []
 
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))

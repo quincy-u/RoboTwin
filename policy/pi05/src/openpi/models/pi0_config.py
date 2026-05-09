@@ -32,11 +32,33 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Joint OBB denoising (pi0.5 only). When True, the action expert jointly denoises the action chunk and a
+    # per-timestep OBB-plan token containing 8 projected 3D-corner (x, y) coordinates for up to `max_objects`
+    # manipulated objects. obb_dim = max_objects * 16.
+    predict_obb: bool = False
+    max_objects: int = 2
+    obb_dim: int = 32
+    lambda_obb: float = 1.0
+
+    pytorch_compile_mode: str | None = "max-autotune"
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.pytorch_compile_mode is not None:
+            assert self.pytorch_compile_mode in [
+                "default",
+                "reduce-overhead",
+                "max-autotune",
+                "max-autotune-no-cudagraphs",
+            ]
+        if self.predict_obb:
+            assert self.pi05, "predict_obb=True is only supported with pi05=True"
+            assert self.obb_dim == self.max_objects * 16, (
+                f"obb_dim ({self.obb_dim}) must equal max_objects * 16 ({self.max_objects * 16})"
+            )
 
     @property
     @override
@@ -56,6 +78,16 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        future_obb_gt_spec = None
+        valid_obj_mask_spec = None
+        if self.predict_obb:
+            future_obb_gt_spec = jax.ShapeDtypeStruct(
+                [batch_size, self.action_horizon, self.obb_dim], jnp.float32
+            )
+            valid_obj_mask_spec = jax.ShapeDtypeStruct(
+                [batch_size, self.action_horizon, self.max_objects], jnp.float32
+            )
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -71,6 +103,8 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                future_obb_gt=future_obb_gt_spec,
+                valid_obj_mask=valid_obj_mask_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

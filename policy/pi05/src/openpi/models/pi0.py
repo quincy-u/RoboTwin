@@ -67,6 +67,10 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.predict_obb = config.predict_obb
+        self.obb_dim = config.obb_dim
+        self.max_objects = config.max_objects
+        self.lambda_obb = config.lambda_obb
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -98,6 +102,12 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        # OBB-plan projections (one OBB token per future timestep, carrying all 8*(x,y) corner coords for up to
+        # max_objects objects). Initialised randomly; pretrained pi0.5 checkpoints will skip these.
+        if self.predict_obb:
+            self.obb_in_proj = nnx.Linear(config.obb_dim, action_expert_config.width, rngs=rngs)
+            self.obb_out_proj = nnx.Linear(action_expert_config.width, config.obb_dim, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -138,7 +148,11 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        obb_t: at.Float[at.Array, "b ah od"] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -176,10 +190,25 @@ class Pi0(_model.BaseModel):
             action_time_tokens = self.action_time_mlp_out(action_time_tokens)
             action_expert_tokens = action_time_tokens
             adarms_cond = None
+
+        # OBB-plan tokens come BEFORE action tokens. The OBB block opens a new cumsum group so the prefix
+        # cannot attend back into the suffix; the action block does NOT open another group, which keeps
+        # OBB and action tokens in the same group → full bidirectional attention between them.
+        if self.predict_obb:
+            assert obb_t is not None, "obb_t must be provided when predict_obb=True"
+            obb_tokens = self.obb_in_proj(obb_t)
+            tokens.append(obb_tokens)
+            input_mask.append(jnp.ones(obb_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [True] + ([False] * (self.action_horizon - 1))
+
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
-        # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        if self.predict_obb:
+            # No new boundary: OBB+action share a cumsum group → bidirectional attention.
+            ar_mask += [False] * self.action_horizon
+        else:
+            # image/language/state inputs do not attend to action tokens
+            ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -189,7 +218,7 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, noise_rng, time_rng, obb_noise_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
@@ -199,9 +228,21 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        # OBB flow uses the *same* timestep so the two streams stay aligned at every denoising step.
+        obb_t = None
+        u_obb = None
+        if self.predict_obb:
+            assert observation.future_obb_gt is not None, "future_obb_gt is required when predict_obb=True"
+            obb_gt = observation.future_obb_gt
+            obb_noise = jax.random.normal(obb_noise_rng, obb_gt.shape)
+            obb_t = time_expanded * obb_noise + (1 - time_expanded) * obb_gt
+            u_obb = obb_noise - obb_gt
+
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, x_t, time, obb_t=obb_t
+        )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
@@ -209,9 +250,34 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        # Suffix layout: [(state?), (obb_H?), action_H]. Action tokens are always the last action_horizon entries.
+        h = self.action_horizon
+        v_t = self.action_out_proj(suffix_out[:, -h:])
+        action_loss_per_t = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+
+        if not self.predict_obb:
+            return action_loss_per_t
+
+        # OBB tokens sit immediately before the action tokens.
+        obb_out = suffix_out[:, -2 * h : -h]
+        v_obb = self.obb_out_proj(obb_out)
+        # Reduce per-timestep with the validity mask: average over the 16 corner-coords of each object,
+        # then take a mask-weighted average across the (up to) max_objects slots so missing objects do
+        # not contribute to the gradient.
+        obb_err = jnp.square(v_obb - u_obb)  # [*b, ah, od]
+        obb_err_per_obj = jnp.mean(
+            obb_err.reshape((*obb_err.shape[:-1], self.max_objects, self.obb_dim // self.max_objects)),
+            axis=-1,
+        )  # [*b, ah, max_objects]
+        mask = observation.valid_obj_mask  # [*b, ah, max_objects]
+        if mask is None:
+            obb_loss_per_t = jnp.mean(obb_err_per_obj, axis=-1)
+        else:
+            mask_sum = jnp.maximum(jnp.sum(mask, axis=-1), 1.0)
+            obb_loss_per_t = jnp.sum(obb_err_per_obj * mask, axis=-1) / mask_sum  # [*b, ah]
+
+        return action_loss_per_t + self.lambda_obb * obb_loss_per_t
 
     @override
     def sample_actions(
@@ -221,14 +287,20 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> _model.Actions:
+        obb_noise: at.Float[at.Array, "b ah od"] | None = None,
+    ) -> _model.Actions | tuple[_model.Actions, at.Float[at.Array, "b ah mo c"]]:
+        """Run flow-matching inference. When predict_obb=True, also returns the denoised future OBB
+        trajectory reshaped to [B, H, max_objects, 16]."""
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        rng_a, rng_b = jax.random.split(rng)
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(rng_a, (batch_size, self.action_horizon, self.action_dim))
+        if self.predict_obb and obb_noise is None:
+            obb_noise = jax.random.normal(rng_b, (batch_size, self.action_horizon, self.obb_dim))
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -236,10 +308,15 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        h = self.action_horizon
+
         def step(carry):
-            x_t, time = carry
+            x_t, obb_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                obb_t=obb_t if self.predict_obb else None,
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
@@ -266,14 +343,24 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.action_out_proj(suffix_out[:, -h:])
+            if self.predict_obb:
+                v_obb = self.obb_out_proj(suffix_out[:, -2 * h : -h])
+                new_obb_t = obb_t + dt * v_obb
+            else:
+                new_obb_t = obb_t
 
-            return x_t + dt * v_t, time + dt
+            return x_t + dt * v_t, new_obb_t, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _, _, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        # while_loop requires fixed-shape carry; use a placeholder zero array when OBB is disabled.
+        obb_t_init = obb_noise if self.predict_obb else jnp.zeros((batch_size, h, max(self.obb_dim, 1)))
+        x_0, obb_0, _ = jax.lax.while_loop(cond, step, (noise, obb_t_init, 1.0))
+        if self.predict_obb:
+            future_obb_pred = obb_0.reshape((batch_size, h, self.max_objects, self.obb_dim // self.max_objects))
+            return x_0, future_obb_pred
         return x_0

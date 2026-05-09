@@ -46,12 +46,19 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Extra regex (full-match) of parameter paths that should fall back to their freshly-initialized
+    # values when the checkpoint does not contain them. LoRA weights are always allowed; this knob
+    # extends the allow-list (e.g. ``".*obb_(in|out)_proj.*"`` for the joint OBB modules in pi0.5
+    # when fine-tuning from a base checkpoint that pre-dates them).
+    extra_missing_regex: str | None = None
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        missing_regex = ".*lora.*"
+        if self.extra_missing_regex:
+            missing_regex = f"(?:{missing_regex})|(?:{self.extra_missing_regex})"
+        return _merge_params(loaded_params, params, missing_regex=missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

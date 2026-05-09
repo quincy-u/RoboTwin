@@ -39,6 +39,11 @@ class AlohaInputs(transforms.DataTransformFn):
     # replaced with black images and the corresponding `image_mask` will be set to False.
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
 
+    # Extra top-level keys to forward unchanged through the transform. Useful for auxiliary
+    # signals (e.g. OBB trajectories) that downstream transforms consume but Aloha-specific
+    # processing should not touch.
+    extra_keys: tuple[str, ...] = ()
+
     def __call__(self, data: dict) -> dict:
         data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
 
@@ -84,6 +89,10 @@ class AlohaInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        for k in self.extra_keys:
+            if k in data:
+                inputs[k] = data[k]
+
         return inputs
 
 
@@ -95,10 +104,19 @@ class AlohaOutputs(transforms.DataTransformFn):
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
 
+    # Extra top-level keys to forward through unchanged (mirror of ``AlohaInputs.extra_keys``).
+    # Used to pipe auxiliary signals (e.g. predicted OBB trajectories) past the action-only
+    # output projection.
+    extra_keys: tuple[str, ...] = ()
+
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
         actions = np.asarray(data["actions"][:, :14])
-        return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
+        out = {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
+        for k in self.extra_keys:
+            if k in data:
+                out[k] = data[k]
+        return out
 
 
 def _joint_flip_mask() -> np.ndarray:

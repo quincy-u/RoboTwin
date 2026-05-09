@@ -106,6 +106,13 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Joint OBB-denoising fields (used by pi0.5 with predict_obb=True).
+    # Future projected 3D OBB corner trajectories, flat. Shape [*b, H, max_objects * 16].
+    # For up to 2 objects with 8 corners (x,y) each: 2 * 16 = 32.
+    future_obb_gt: at.Float[ArrayT, "*b ah od"] | None = None
+    # Per-timestep, per-object validity mask. Shape [*b, H, max_objects].
+    valid_obj_mask: at.Float[ArrayT, "*b ah mo"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +133,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            future_obb_gt=data.get("future_obb_gt"),
+            valid_obj_mask=data.get("valid_obj_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +214,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        future_obb_gt=observation.future_obb_gt,
+        valid_obj_mask=observation.valid_obj_mask,
     )
 
 
@@ -312,7 +323,10 @@ def restore_params(
 
     with ocp.PyTreeCheckpointer() as ckptr:
         metadata = ckptr.metadata(params_path)
-        item = {"params": metadata["params"]}
+        # orbax-checkpoint >= 0.11.30 returns a StepMetadata wrapper around the tree;
+        # older versions returned the tree directly. Unwrap if needed.
+        md_tree = getattr(metadata, "item_metadata", metadata)
+        item = {"params": md_tree["params"]}
 
         params = ckptr.restore(
             params_path,

@@ -1,0 +1,13 @@
+# Basic experiment configuration (keep unchanged)
+policy_name: null
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Add Parameters You Need
+train_config_name: pi05_aloha_full_base
+model_name: robotwin_obb
+checkpoint_id: 19999
+pi0_step: 50

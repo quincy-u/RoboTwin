@@ -59,7 +59,9 @@ def create_trained_policy(
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         if robotwin_repo_id is not None:
-            data_config.asset_id = robotwin_repo_id
+            # ``DataConfig`` is a frozen dataclass; rebuild it with the override.
+            import dataclasses as _dc
+            data_config = _dc.replace(data_config, asset_id=robotwin_repo_id)
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:

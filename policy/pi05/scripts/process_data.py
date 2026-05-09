@@ -9,6 +9,11 @@ import argparse
 import yaml, json
 
 
+OBB_PER_OBJECT_DIM = 16   # 8 corners × (x, y)
+OBB_MAX_OBJECTS = 2       # pick_dual_bottles has 2; others zero-pad
+OBB_TOTAL_DIM = OBB_PER_OBJECT_DIM * OBB_MAX_OBJECTS
+
+
 def load_hdf5(dataset_path):
     if not os.path.isfile(dataset_path):
         print(f"Dataset does not exist at \n{dataset_path}\n")
@@ -27,7 +32,19 @@ def load_hdf5(dataset_path):
         for cam_name in root[f"/observation/"].keys():
             image_dict[cam_name] = root[f"/observation/{cam_name}/rgb"][()]
 
-    return left_gripper, left_arm, right_gripper, right_arm, image_dict
+        # Head-camera 3D-OBB projections: (T, 16) per object, sorted by name
+        # for deterministic ordering. Concatenated and zero-padded to OBB_TOTAL_DIM.
+        obb_group_path = "/observation/head_camera/proj_3d_obb"
+        T = left_gripper.shape[0]
+        obb_head = np.zeros((T, OBB_TOTAL_DIM), dtype=np.float32)
+        if obb_group_path in root:
+            obj_keys = sorted(root[obb_group_path].keys())
+            for i, k in enumerate(obj_keys[:OBB_MAX_OBJECTS]):
+                arr = np.asarray(root[f"{obb_group_path}/{k}"][()], dtype=np.float32)
+                start = i * OBB_PER_OBJECT_DIM
+                obb_head[:, start:start + OBB_PER_OBJECT_DIM] = arr
+
+    return left_gripper, left_arm, right_gripper, right_arm, image_dict, obb_head
 
 
 def images_encoding(imgs):
@@ -76,7 +93,7 @@ def data_transform(path, episode_num, save_path):
         ) as f:
             json.dump(save_instructions_json, f, indent=2)
 
-        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all, image_dict = (load_hdf5(
+        left_gripper_all, left_arm_all, right_gripper_all, right_arm_all, image_dict, obb_head_all = (load_hdf5(
             os.path.join(path, "data", f"episode{i}.hdf5")))
         qpos = []
         actions = []
@@ -85,6 +102,7 @@ def data_transform(path, episode_num, save_path):
         cam_left_wrist = []
         left_arm_dim = []
         right_arm_dim = []
+        obb_head = []
 
         last_state = None
         for j in range(0, left_gripper_all.shape[0]):
@@ -102,21 +120,25 @@ def data_transform(path, episode_num, save_path):
 
             if j != left_gripper_all.shape[0] - 1:
                 qpos.append(state)
+                obb_head.append(obb_head_all[j])
 
+                # Keep cameras at their native collection resolution (D435 -> 320x240).
+                # The pi0.5 model resizes to 224x224 internally, so any extra resize here
+                # is purely a storage choice — and a misleading one for the OBB head, since
+                # the projected pixel coords stay in 320x240 space. Storing the RGB at
+                # 320x240 keeps the OBB normalization (image_width=320, image_height=240
+                # in pi05_aloha_full_base) consistent with what the model actually sees.
                 camera_high_bits = image_dict["head_camera"][j]
                 camera_high = cv2.imdecode(np.frombuffer(camera_high_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_high_resized = cv2.resize(camera_high, (640, 480))
-                cam_high.append(camera_high_resized)
+                cam_high.append(camera_high)
 
                 camera_right_wrist_bits = image_dict["right_camera"][j]
                 camera_right_wrist = cv2.imdecode(np.frombuffer(camera_right_wrist_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_right_wrist_resized = cv2.resize(camera_right_wrist, (640, 480))
-                cam_right_wrist.append(camera_right_wrist_resized)
+                cam_right_wrist.append(camera_right_wrist)
 
                 camera_left_wrist_bits = image_dict["left_camera"][j]
                 camera_left_wrist = cv2.imdecode(np.frombuffer(camera_left_wrist_bits, np.uint8), cv2.IMREAD_COLOR)
-                camera_left_wrist_resized = cv2.resize(camera_left_wrist, (640, 480))
-                cam_left_wrist.append(camera_left_wrist_resized)
+                cam_left_wrist.append(camera_left_wrist)
 
             if j != 0:
                 action = state
@@ -132,6 +154,7 @@ def data_transform(path, episode_num, save_path):
             obs.create_dataset("qpos", data=np.array(qpos))
             obs.create_dataset("left_arm_dim", data=np.array(left_arm_dim))
             obs.create_dataset("right_arm_dim", data=np.array(right_arm_dim))
+            obs.create_dataset("obb_head", data=np.array(obb_head, dtype=np.float32))
             image = obs.create_group("images")
             cam_high_enc, len_high = images_encoding(cam_high)
             cam_right_wrist_enc, len_right = images_encoding(cam_right_wrist)

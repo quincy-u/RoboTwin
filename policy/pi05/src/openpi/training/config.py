@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robotwin_obb_policy as robotwin_obb_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -253,11 +254,29 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
+    # Optional extension hooks for auxiliary signals (e.g. OBB joint denoising).
+    extra_passthrough_keys: tuple[str, ...] = ()
+    extra_data_transform_inputs: tyro.conf.Suppress[Sequence[_transforms.DataTransformFn]] = ()
+    extra_data_transform_outputs: tyro.conf.Suppress[Sequence[_transforms.DataTransformFn]] = ()
+    extra_output_keys: tuple[str, ...] = ()
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            inputs=[
+                aloha_policy.AlohaInputs(
+                    adapt_to_pi=self.adapt_to_pi,
+                    extra_keys=tuple(self.extra_passthrough_keys),
+                ),
+                *self.extra_data_transform_inputs,
+            ],
+            outputs=[
+                aloha_policy.AlohaOutputs(
+                    adapt_to_pi=self.adapt_to_pi,
+                    extra_keys=tuple(self.extra_output_keys),
+                ),
+                *self.extra_data_transform_outputs,
+            ],
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
@@ -552,12 +571,18 @@ _CONFIGS = [
     ###
     ### finetune config for robotwin
     ###
-    # pi05_base by full
+    # pi05_base full finetune + joint OBB denoising on RoboTwin (head-camera OBB only).
     TrainConfig(
         name="pi05_aloha_full_base",
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            predict_obb=True,
+            max_objects=2,
+            obb_dim=32,
+            lambda_obb=1.0,
+        ),
         data=LeRobotAlohaDataConfig(
-            repo_id="your_repo_id",
+            repo_id="robotwin_demo_clean_9tasks_obb",
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({
@@ -569,16 +594,42 @@ _CONFIGS = [
                     "state": "observation.state",
                     "actions": "action",
                     "prompt": "prompt",
+                    "future_obb_pixels": "observation.obb_head",
+                    "future_obb_is_pad": "observation.obb_head_is_pad",
                 })
             ]),
+            action_sequence_keys=("action", "observation.obb_head"),
+            extra_passthrough_keys=("future_obb_pixels", "future_obb_is_pad"),
+            # head_camera_type=D435 projects OBB corners into 320×240 pixel space; match
+            # that here so the normalized targets span ~[0, 1] across the actual image content.
+            extra_data_transform_inputs=(
+                robotwin_obb_policy.RobotwinObbInputs(
+                    image_width=320.0,
+                    image_height=240.0,
+                    clamp_margin=0.05,
+                    max_objects=2,
+                    per_object_dim=16,
+                ),
+            ),
+            # With train-norm matching the native OBB pixel space, no post-output rescale needed.
+            extra_output_keys=("future_obb",),
+            extra_data_transform_outputs=(
+                robotwin_obb_policy.RobotwinObbOutputs(
+                    max_objects=2,
+                    per_object_dim=16,
+                ),
+            ),
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            extra_missing_regex=r".*obb_(?:in|out)_proj.*",
+        ),
         num_train_steps=20_000,
         batch_size=64,
-        fsdp_devices=1,  # refer line 359
+        fsdp_devices=2,
     ),
     # pi05_base by lora
     TrainConfig(
