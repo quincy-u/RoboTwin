@@ -36,7 +36,8 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
-def main(task_name=None, task_config=None):
+def main(task_name=None, task_config=None, collect_failure=False, failure_num=None,
+         target_noise_std=0.0):
 
     task = class_decorator(task_name)
     config_path = f"./task_config/{task_config}.yml"
@@ -45,6 +46,14 @@ def main(task_name=None, task_config=None):
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     args['task_name'] = task_name
+    args["collect_failure"] = collect_failure
+    args["target_noise_std"] = float(target_noise_std)
+    if collect_failure:
+        if failure_num is None:
+            failure_num = 2 * args["episode_num"]
+        args["failure_num"] = failure_num
+    if collect_failure or args["target_noise_std"] > 0.0:
+        args["save_path"] = args["save_path"].rstrip("/") + "_fail"
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -105,15 +114,23 @@ def main(task_name=None, task_config=None):
 
 def run(TASK_ENV, args):
     epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    collect_failure = args.get("collect_failure", False)
+    target_count = args["failure_num"] if collect_failure else args["episode_num"]
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
+    if collect_failure:
+        print("\033[91m[Failure-data mode] saving only failed episodes\033[0m")
 
     # =========== Collect Seed ===========
     os.makedirs(args["save_path"], exist_ok=True)
 
+    user_target_noise_std = args.get("target_noise_std", 0.0)
+
     if not args["use_seed"]:
         print("\033[93m" + "[Start Seed and Pre Motion Data Collection]" + "\033[0m")
         args["need_plan"] = True
+        if user_target_noise_std > 0.0:
+            print(f"\033[91m[Target-pose noise] std={user_target_noise_std} m on every planner target\033[0m")
 
         if os.path.exists(os.path.join(args["save_path"], "seed.txt")):
             with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
@@ -124,19 +141,33 @@ def run(TASK_ENV, args):
                     epid = max(seed_list) + 1
             print(f"Exist seed file, Start from: {epid} / {suc_num}")
 
-        while suc_num < args["episode_num"]:
+        while suc_num < target_count:
             try:
                 TASK_ENV.setup_demo(now_ep_num=suc_num, seed=epid, **args)
                 TASK_ENV.play_once()
 
-                if TASK_ENV.plan_success and TASK_ENV.check_success():
-                    print(f"simulate data episode {suc_num} success! (seed = {epid})")
-                    seed_list.append(epid)
-                    TASK_ENV.save_traj_data(suc_num)
-                    suc_num += 1
+                episode_succeeded = TASK_ENV.plan_success and TASK_ENV.check_success()
+
+                if collect_failure:
+                    if episode_succeeded:
+                        print(f"seed {epid} succeeded; skipping (failure-only mode)")
+                    elif not TASK_ENV.plan_success:
+                        print(f"seed {epid}: planner failed mid-chain; skipping (want full-execution failures)")
+                    else:
+                        # plan_success=True, check_success=False: full execution that didn't reach goal
+                        print(f"capture failure episode {suc_num} (seed = {epid}, full execution, check_success=False)")
+                        seed_list.append(epid)
+                        TASK_ENV.save_traj_data(suc_num)
+                        suc_num += 1
                 else:
-                    print(f"simulate data episode {suc_num} fail! (seed = {epid})")
-                    fail_num += 1
+                    if episode_succeeded:
+                        print(f"simulate data episode {suc_num} success! (seed = {epid})")
+                        seed_list.append(epid)
+                        TASK_ENV.save_traj_data(suc_num)
+                        suc_num += 1
+                    else:
+                        print(f"simulate data episode {suc_num} fail! (seed = {epid})")
+                        fail_num += 1
 
                 TASK_ENV.close_env()
 
@@ -187,6 +218,7 @@ def run(TASK_ENV, args):
         args["need_plan"] = False
         args["render_freq"] = 0
         args["save_data"] = True
+        args["target_noise_std"] = 0.0
 
         clear_cache_freq = args["clear_cache_freq"]
 
@@ -199,7 +231,7 @@ def run(TASK_ENV, args):
         while exist_hdf5(st_idx):
             st_idx += 1
 
-        for episode_idx in range(st_idx, args["episode_num"]):
+        for episode_idx in range(st_idx, target_count):
             print(f"\033[34mTask name: {args['task_name']}\033[0m")
 
             TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
@@ -225,12 +257,18 @@ def run(TASK_ENV, args):
                 json.dump(info_db, file, ensure_ascii=False, indent=4)
 
             TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
+            if getattr(TASK_ENV, "FRAME_IDX", 0) == 0:
+                print(f"\033[93m[skip episode {episode_idx}] no frames captured during replay\033[0m")
+                continue
             TASK_ENV.merge_pkl_to_hdf5_video()
+            TASK_ENV.save_obb2d()
             TASK_ENV.remove_data_cache()
-            assert TASK_ENV.check_success(), "Collect Error"
+            if not collect_failure and user_target_noise_std == 0.0:
+                assert TASK_ENV.check_success(), "Collect Error"
 
-        command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
-        os.system(command)
+        if not collect_failure and user_target_noise_std == 0.0:
+            command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"
+            os.system(command)
 
 
 if __name__ == "__main__":
@@ -243,8 +281,17 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
+    parser.add_argument("--collect-failure", action="store_true",
+                        help="Collect failure-only trajectories into ./<save_path>_fail/")
+    parser.add_argument("--failure-num", type=int, default=None,
+                        help="Number of failure episodes to collect (default: 2 * episode_num)")
+    parser.add_argument("--target-noise-std", type=float, default=0.0,
+                        help="Gaussian noise std (meters) added to each planner target end-effector position during Phase 1")
     parser = parser.parse_args()
     task_name = parser.task_name
     task_config = parser.task_config
 
-    main(task_name=task_name, task_config=task_config)
+    main(task_name=task_name, task_config=task_config,
+         collect_failure=parser.collect_failure,
+         failure_num=parser.failure_num,
+         target_noise_std=parser.target_noise_std)

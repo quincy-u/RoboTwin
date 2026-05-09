@@ -2,6 +2,8 @@ from ._base_task import Base_Task
 from .utils import *
 import sapien
 import math
+import numpy as np
+from copy import deepcopy
 
 
 class lift_pot(Base_Task):
@@ -46,6 +48,16 @@ class lift_pot(Base_Task):
 
         self.info["info"] = {"{A}": f"{self.model_name}/base{self.model_id}"}
         return self.info
+
+    def get_tracked_objects(self) -> dict:
+        return {"pot": self.pot}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        pot_pose = self.pot.get_pose()
+        obs["object_pose"] = {"pot": np.concatenate([pot_pose.p, pot_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
 
     def check_success(self):
         pot_pose = self.pot.get_pose()

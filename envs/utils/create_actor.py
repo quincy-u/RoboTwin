@@ -5,8 +5,133 @@ import transforms3d as t3d
 import sapien.physx as sapienp
 import json
 import os, re
+import xml.etree.ElementTree as ET
 
 from .actor_utils import Actor, ArticulationActor
+
+
+def _rpy_to_quat(rpy):
+    """Convert URDF rpy (roll, pitch, yaw) to [qw, qx, qy, qz]."""
+    roll, pitch, yaw = rpy
+    R = t3d.euler.euler2mat(roll, pitch, yaw, axes='sxyz')
+    q = t3d.quaternions.mat2quat(R)
+    return q.tolist()
+
+
+def _get_body_rotation_from_urdf(urdf_path):
+    """Return [qw,qx,qy,qz] rotation from the URDF root/base link to the
+    first visual body link via fixed joints, or None if no fixed joint exists."""
+    try:
+        tree = ET.parse(str(urdf_path))
+        root = tree.getroot()
+        for joint in root.findall('joint'):
+            if joint.get('type') == 'fixed':
+                parent_el = joint.find('parent')
+                origin_el = joint.find('origin')
+                if parent_el is not None and parent_el.get('link') == 'base':
+                    rpy_str = origin_el.get('rpy', '0 0 0') if origin_el is not None else '0 0 0'
+                    rpy = [float(v) for v in rpy_str.split()]
+                    if any(abs(v) > 1e-6 for v in rpy):
+                        return _rpy_to_quat(rpy)
+    except Exception:
+        pass
+    return None
+
+
+def _parse_obj_vertices(filepath):
+    """Parse vertex positions from an OBJ file. Returns (N,3) array or None."""
+    verts = []
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                if line.startswith('v '):
+                    parts = line.split()
+                    verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    except Exception:
+        pass
+    return np.array(verts) if verts else None
+
+
+def _compute_link_bboxes_from_urdf(model_dir: Path, urdf_path: Path) -> dict:
+    """Compute per-link bounding boxes (in each link's own frame, unscaled)
+    from the mesh OBJ files referenced in the URDF.
+
+    Returns dict mapping link_name -> {"min": [...], "max": [...],
+                                        "center": [...], "extents": [...]}
+    Only links with visual geometry are included.
+    """
+    cache_path = model_dir / "link_bboxes_cache.json"
+    if cache_path.exists():
+        return json.load(open(cache_path))
+
+    try:
+        tree = ET.parse(str(urdf_path))
+        root = tree.getroot()
+    except Exception:
+        return {}
+
+    result = {}
+    for link in root.findall('link'):
+        link_name = link.get('name')
+        all_verts = []
+        for visual in link.findall('visual'):
+            origin_el = visual.find('origin')
+            xyz = [0.0, 0.0, 0.0]
+            if origin_el is not None:
+                xyz = [float(v) for v in origin_el.get('xyz', '0 0 0').split()]
+            geom = visual.find('geometry/mesh')
+            if geom is not None:
+                mesh_path = model_dir / geom.get('filename')
+                verts = _parse_obj_vertices(mesh_path)
+                if verts is not None and len(verts) > 0:
+                    all_verts.append(verts + np.array(xyz))
+        if not all_verts:
+            continue
+        combined = np.concatenate(all_verts, axis=0)
+        mn = combined.min(axis=0).tolist()
+        mx = combined.max(axis=0).tolist()
+        result[link_name] = {
+            "min": mn, "max": mx,
+            "center": [(mn[i] + mx[i]) / 2 for i in range(3)],
+            "extents": [mx[i] - mn[i] for i in range(3)],
+        }
+
+    if result:
+        with open(cache_path, 'w') as f:
+            json.dump(result, f)
+    return result
+
+
+def _get_revolute_joints_from_urdf(urdf_path: Path) -> list:
+    """Parse revolute joints from URDF. Returns list of dicts:
+       {"name", "parent", "child", "origin_xyz", "axis"}
+    """
+    joints = []
+    try:
+        tree = ET.parse(str(urdf_path))
+        root = tree.getroot()
+        for joint in root.findall('joint'):
+            if joint.get('type') == 'revolute':
+                parent_el = joint.find('parent')
+                child_el = joint.find('child')
+                origin_el = joint.find('origin')
+                axis_el = joint.find('axis')
+                xyz = [0.0, 0.0, 0.0]
+                if origin_el is not None:
+                    xyz = [float(v) for v in origin_el.get('xyz', '0 0 0').split()]
+                axis = [0.0, 0.0, 1.0]
+                if axis_el is not None:
+                    axis = [float(v) for v in axis_el.get('xyz', '0 0 1').split()]
+                joints.append({
+                    "name": joint.get('name'),
+                    "parent": parent_el.get('link') if parent_el is not None else None,
+                    "child": child_el.get('link') if child_el is not None else None,
+                    "origin_xyz": xyz,
+                    "axis": axis,
+                })
+    except Exception:
+        pass
+    return joints
 
 
 class UnStableError(Exception):
@@ -649,6 +774,27 @@ def create_sapien_urdf_obj(
         bounding_box_file = modeldir / "bounding_box.json"
         if bounding_box_file.exists():
             bounding_box = json.load(open(bounding_box_file, "r", encoding="utf-8"))
-            model_data["extents"] = (np.array(bounding_box["max"]) - np.array(bounding_box["min"])).tolist()
+            bb_min = np.array(bounding_box["min"])
+            bb_max = np.array(bounding_box["max"])
+            model_data["extents"] = (bb_max - bb_min).tolist()
+            model_data["center"] = ((bb_min + bb_max) / 2).tolist()
+
+        # Compute rotation from articulation root (base link) to the first visual
+        # body link via fixed joints. get_pose() returns the base link pose, but
+        # the bounding box is measured in the body link frame, so we need this
+        # offset rotation to project the OBB correctly.
+        urdf_path = modeldir / "mobility.urdf"
+        body_q = _get_body_rotation_from_urdf(urdf_path)
+        if body_q is not None:
+            model_data["body_q"] = body_q
+
+        # Per-link bboxes (for dynamic OBB on articulated objects with revolute joints)
+        link_bboxes = _compute_link_bboxes_from_urdf(modeldir, urdf_path)
+        if link_bboxes:
+            model_data["link_bboxes"] = link_bboxes
+
+        revolute_joints = _get_revolute_joints_from_urdf(urdf_path)
+        if revolute_joints:
+            model_data["revolute_joints"] = revolute_joints
     object.set_name(modelname)
     return ArticulationActor(object, model_data)

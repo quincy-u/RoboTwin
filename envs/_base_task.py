@@ -112,6 +112,7 @@ class Base_Task(gym.Env):
         self.need_plan = kwags.get("need_plan", True)
         self.left_joint_path = kwags.get("left_joint_path", [])
         self.right_joint_path = kwags.get("right_joint_path", [])
+        self.target_noise_std = float(kwags.get("target_noise_std", 0.0) or 0.0)
         self.left_cnt = 0
         self.right_cnt = 0
 
@@ -197,6 +198,16 @@ class Base_Task(gym.Env):
     def check_success(self):
         pass
 
+    def _perturb_target_pose(self, pose):
+        std = getattr(self, "target_noise_std", 0.0)
+        if std <= 0.0 or pose is None:
+            return pose
+        pose = list(pose)
+        pose[0] += float(np.random.normal(0.0, std))
+        pose[1] += float(np.random.normal(0.0, std))
+        pose[2] += float(np.random.normal(0.0, std))
+        return pose
+
     def setup_scene(self, **kwargs):
         """
         Set the scene
@@ -214,7 +225,11 @@ class Base_Task(gym.Env):
         sapien.render.set_camera_shader_dir("rt")
         sapien.render.set_ray_tracing_samples_per_pixel(32)
         sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        # Prefer OptiX by default on NVIDIA; allow env override when needed.
+        # Valid values: "optix", "oidn", or empty string to disable.
+        rt_denoiser = os.environ.get("ROBOTWIN_RT_DENOISER", "optix").strip().lower()
+        if rt_denoiser in {"oidn", "optix"}:
+            sapien.render.set_ray_tracing_denoiser(rt_denoiser)
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -495,9 +510,19 @@ class Base_Task(gym.Env):
         # pointcloud
         if self.data_type.get("pointcloud", False):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
+        # object masks
+        if self.data_type.get("object_mask", False):
+            tracked = self.get_tracked_objects()
+            if tracked:
+                masks = self.cameras.get_object_masks(tracked)
+                for camera_name, camera_masks in masks.items():
+                    pkl_dic["observation"][camera_name]["object_mask"] = camera_masks
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
+
+    def get_tracked_objects(self) -> dict:
+        return {}
 
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
         self._update_render()
@@ -549,6 +574,198 @@ class Base_Task(gym.Env):
 
         os.makedirs(f"{self.save_dir}/data", exist_ok=True)
         process_folder_to_hdf5_video(cache_path, target_file_path, target_video_path)
+
+    # ------------------------------------------------------------------
+    # 2D OBB helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _quat_to_mat(q):
+        w, x, y, z = q
+        return np.array([
+            [1-2*(y*y+z*z),   2*(x*y-z*w),   2*(x*z+y*w)],
+            [  2*(x*y+z*w), 1-2*(x*x+z*z),   2*(y*z-x*w)],
+            [  2*(x*z-y*w),   2*(y*z+x*w), 1-2*(x*x+y*y)],
+        ])
+
+    @staticmethod
+    def _axis_angle_to_mat(axis, angle):
+        """Rodrigues rotation: axis (3,) unit vector, angle in radians."""
+        ax, ay, az = axis / (np.linalg.norm(axis) + 1e-12)
+        c, s = np.cos(angle), np.sin(angle)
+        t = 1 - c
+        return np.array([
+            [t*ax*ax + c,    t*ax*ay - s*az, t*ax*az + s*ay],
+            [t*ax*ay + s*az, t*ay*ay + c,    t*ay*az - s*ax],
+            [t*ax*az - s*ay, t*ay*az + s*ax, t*az*az + c   ],
+        ])
+
+    _SIGNS = np.array([[-1,-1,-1],[-1,-1,1],[-1,1,-1],[-1,1,1],
+                       [ 1,-1,-1],[ 1,-1,1],[ 1,1,-1],[ 1,1,1]], dtype=float)
+
+    @staticmethod
+    def _link_corners(pos_link, R_link, bbox, scale):
+        """Return (8,3) world corners for a single link bbox (unscaled mesh units)."""
+        center = np.array(bbox["center"]) * scale
+        half = np.array(bbox["extents"]) * scale / 2.0
+        center_w = pos_link + R_link @ center
+        return center_w + (Base_Task._SIGNS * half) @ R_link.T
+
+    @staticmethod
+    def _box_corners_world(pose_7, model_data):
+        pos = pose_7[:3]
+        R = Base_Task._quat_to_mat(pose_7[3:])
+        scale = np.array(model_data["scale"])
+        if scale.ndim == 0:
+            scale = np.array([scale, scale, scale])
+        # trans_mat translation is baked into get_pose().p by create_sapien_urdf_obj;
+        # undo it so the OBB center aligns with the actual mesh geometry.
+        trans_mat = np.array(model_data.get("transform_matrix", np.eye(4)))
+        pos = pos - trans_mat[:3, 3]
+        # For URDF articulations, get_pose() returns the root/base link pose but
+        # the bounding box is in the body link frame. Apply the fixed joint rotation.
+        if "body_q" in model_data:
+            R = R @ Base_Task._quat_to_mat(np.array(model_data["body_q"]))
+        center_local = np.array(model_data.get("center", [0, 0, 0])) * scale
+        half = np.array(model_data["extents"]) * scale / 2.0
+        center_world = pos + R @ center_local
+        return center_world + (Base_Task._SIGNS * half) @ R.T
+
+    @staticmethod
+    def _articulated_corners_world(pose_7, qpos, model_data, obj_name=None):
+        """Compute world-space corners for links of an articulated object
+        given its root pose and current joint positions.
+
+        Supports one level of revolute joints from the first body link (link_0).
+        Returns (N,3) array of corners (union over all links).
+
+        For laptop, returns only the moving (lid) link's corners so the OBB
+        tracks the lid rather than the whole body+lid envelope.
+        """
+        pos = pose_7[:3]
+        R_root = Base_Task._quat_to_mat(pose_7[3:])
+        scale = np.array(model_data["scale"])
+        if scale.ndim == 0:
+            scale = np.array([scale, scale, scale])
+        trans_mat = np.array(model_data.get("transform_matrix", np.eye(4)))
+        pos_link0 = pos - trans_mat[:3, 3]
+        R_link0 = R_root @ Base_Task._quat_to_mat(np.array(model_data["body_q"]))
+
+        link_bboxes = model_data["link_bboxes"]
+        revolute_joints = model_data["revolute_joints"]
+        only_moving = (obj_name == "laptop")
+
+        # first_link is the body link directly connected to the SAPIEN articulation root
+        # (the one whose world pose = pos_link0, R_link0 computed above).
+        # It's the parent in revolute joints that isn't a child of any revolute joint.
+        child_links = {j["child"] for j in revolute_joints}
+        first_link = None
+        for j in revolute_joints:
+            if j["parent"] not in child_links:
+                first_link = j["parent"]
+                break
+        if first_link is None:
+            # Fallback: first non-base link in link_bboxes
+            first_link = next((k for k in link_bboxes if k != 'base'), None)
+        if first_link is None:
+            return Base_Task._box_corners_world(pose_7, model_data)
+
+        # Map link name -> (world_pos, world_R)
+        link_poses = {first_link: (pos_link0, R_link0)}
+
+        # All corners across links
+        all_corners = []
+        if first_link in link_bboxes and not only_moving:
+            all_corners.append(
+                Base_Task._link_corners(pos_link0, R_link0, link_bboxes[first_link], scale))
+
+        # Process each revolute joint in qpos order
+        for ji, jinfo in enumerate(revolute_joints):
+            parent_name = jinfo["parent"]
+            child_name = jinfo["child"]
+            if parent_name not in link_poses:
+                continue  # parent not yet resolved; skip
+            pos_parent, R_parent = link_poses[parent_name]
+            joint_xyz = np.array(jinfo["origin_xyz"]) * scale
+            axis = np.array(jinfo["axis"])
+            angle = float(qpos[ji]) if ji < len(qpos) else 0.0
+            R_joint = Base_Task._axis_angle_to_mat(axis, angle)
+            pos_child = pos_parent + R_parent @ joint_xyz
+            R_child = R_parent @ R_joint
+            link_poses[child_name] = (pos_child, R_child)
+            if child_name in link_bboxes:
+                all_corners.append(
+                    Base_Task._link_corners(pos_child, R_child, link_bboxes[child_name], scale))
+
+        if not all_corners:
+            return Base_Task._box_corners_world(pose_7, model_data)
+        return np.concatenate(all_corners, axis=0)
+
+    @staticmethod
+    def _project_points(pts_world, intrinsic, extrinsic):
+        import cv2 as _cv2
+        ones = np.ones((pts_world.shape[0], 1))
+        pts_cam = (extrinsic @ np.concatenate([pts_world, ones], axis=1).T).T
+        pts_img = (intrinsic @ pts_cam.T).T
+        return (pts_img[:, :2] / pts_img[:, 2:3]).astype(np.float32)
+
+    def save_obb2d(self):
+        """Compute and write proj_3d_obb for tracked objects into the episode HDF5.
+
+        Stores the 8 corners of the 3D OBB projected to 2D pixel coords,
+        flattened to 16 values per timestep: [x0,y0, x1,y1, ..., x7,y7].
+        """
+        if not self.save_data:
+            return
+        tracked = self.get_tracked_objects()
+        if not tracked:
+            return
+
+        hdf5_path = f"{self.save_dir}/data/episode{self.ep_num}.hdf5"
+        if not os.path.exists(hdf5_path):
+            return
+
+        import h5py
+        with h5py.File(hdf5_path, "r+") as f:
+            cams = [c for c in f["observation"].keys()
+                    if "rgb" in f[f"observation/{c}"]]
+            T = f[f"observation/{cams[0]}/rgb"].shape[0]
+
+            for obj_name, actor in tracked.items():
+                if actor is None or actor.config is None:
+                    continue
+                model_data = actor.config
+                pose_key = f"object_pose/{obj_name}"
+                if pose_key not in f:
+                    continue
+                poses = f[pose_key][:]   # (T, 7)
+
+                # Use per-link FK if qpos was saved and model has articulation data
+                qpos_key = f"object_qpos/{obj_name}"
+                use_articulated = (
+                    qpos_key in f
+                    and "link_bboxes" in model_data
+                    and "revolute_joints" in model_data
+                    and "body_q" in model_data
+                )
+                qpos_data = f[qpos_key][:] if use_articulated else None
+
+                for c in cams:
+                    intrinsics = f[f"observation/{c}/intrinsic_cv"][:]
+                    extrinsics = f[f"observation/{c}/extrinsic_cv"][:]
+                    obb_data = np.zeros((T, 16), dtype=np.float32)
+                    for t in range(T):
+                        if use_articulated:
+                            corners_w = self._articulated_corners_world(
+                                poses[t], qpos_data[t], model_data, obj_name=obj_name)
+                        else:
+                            corners_w = self._box_corners_world(poses[t], model_data)
+                        corners_2d = self._project_points(
+                            corners_w, intrinsics[t], extrinsics[t])
+                        obb_data[t] = corners_2d.flatten()
+                    key = f"observation/{c}/proj_3d_obb/{obj_name}"
+                    if key in f:
+                        del f[key]
+                    f.create_dataset(key, data=obb_data)
 
     def remove_data_cache(self):
         folder_path = self.folder_path["cache"]
@@ -746,6 +963,7 @@ class Base_Task(gym.Env):
             pose = pose.p.tolist() + pose.q.tolist()
 
         if self.need_plan:
+            pose = self._perturb_target_pose(pose)
             left_result = self.robot.left_plan_path(pose, constraint_pose=constraint_pose)
             self.left_joint_path.append(deepcopy(left_result))
         else:
@@ -779,6 +997,7 @@ class Base_Task(gym.Env):
             pose = pose.p.tolist() + pose.q.tolist()
 
         if self.need_plan:
+            pose = self._perturb_target_pose(pose)
             right_result = self.robot.right_plan_path(pose, constraint_pose=constraint_pose)
             self.right_joint_path.append(deepcopy(right_result))
         else:
@@ -816,6 +1035,8 @@ class Base_Task(gym.Env):
             right_target_pose = (right_target_pose.p.tolist() + right_target_pose.q.tolist())
         save_freq = self.save_freq if save_freq == -1 else save_freq
         if self.need_plan:
+            left_target_pose = self._perturb_target_pose(left_target_pose)
+            right_target_pose = self._perturb_target_pose(right_target_pose)
             left_result = self.robot.left_plan_path(left_target_pose, constraint_pose=left_constraint_pose)
             right_result = self.robot.right_plan_path(right_target_pose, constraint_pose=right_constraint_pose)
             self.left_joint_path.append(deepcopy(left_result))

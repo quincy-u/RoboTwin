@@ -52,6 +52,16 @@ class grab_roller(Base_Task):
         self.info["info"] = {"{A}": f"102_roller/base{self.model_id}"}
         return self.info
 
+    def get_tracked_objects(self) -> dict:
+        return {"roller": self.roller}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        roller_pose = self.roller.get_pose()
+        obs["object_pose"] = {"roller": np.concatenate([roller_pose.p, roller_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
+
     def check_success(self):
         roller_pose = self.roller.get_pose().p
         return (self.is_left_gripper_close() and self.is_right_gripper_close() and roller_pose[2] > 0.8)

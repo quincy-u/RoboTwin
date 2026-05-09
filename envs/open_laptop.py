@@ -2,6 +2,8 @@ from ._base_task import Base_Task
 from .utils import *
 import sapien
 import math
+import numpy as np
+from copy import deepcopy
 
 
 class open_laptop(Base_Task):
@@ -57,6 +59,17 @@ class open_laptop(Base_Task):
             "{a}": str(arm_tag),
         }
         return self.info
+
+    def get_tracked_objects(self) -> dict:
+        return {"laptop": self.laptop}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        laptop_pose = self.laptop.get_pose()
+        obs["object_pose"] = {"laptop": np.concatenate([laptop_pose.p, laptop_pose.q])}
+        obs["object_qpos"] = {"laptop": self.laptop.get_qpos()}
+        self.now_obs = deepcopy(obs)
+        return obs
 
     def check_success(self, target=0.4):
         limit = self.laptop.get_qlimits()[0]

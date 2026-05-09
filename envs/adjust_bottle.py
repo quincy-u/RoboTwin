@@ -2,6 +2,7 @@ from ._base_task import Base_Task
 from .utils import *
 import sapien
 import math
+from copy import deepcopy
 
 
 class adjust_bottle(Base_Task):
@@ -59,6 +60,17 @@ class adjust_bottle(Base_Task):
             "{a}": str(arm_tag),
         }
         return self.info
+
+    def get_tracked_objects(self) -> dict:
+        return {"bottle": self.bottle}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        bottle_pose = self.bottle.get_pose()
+        # 6D pose: [x, y, z, qw, qx, qy, qz]
+        obs["object_pose"] = {"bottle": np.concatenate([bottle_pose.p, bottle_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
 
     def check_success(self):
         target_hight = 0.9

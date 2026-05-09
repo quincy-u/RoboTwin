@@ -89,6 +89,19 @@ class pick_dual_bottles(Base_Task):
         self.info["info"] = {"{A}": f"001_bottle/base13", "{B}": f"001_bottle/base16"}
         return self.info
 
+    def get_tracked_objects(self) -> dict:
+        return {"bottle1": self.bottle1, "bottle2": self.bottle2}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        p1, p2 = self.bottle1.get_pose(), self.bottle2.get_pose()
+        obs["object_pose"] = {
+            "bottle1": np.concatenate([p1.p, p1.q]),
+            "bottle2": np.concatenate([p2.p, p2.q]),
+        }
+        self.now_obs = deepcopy(obs)
+        return obs
+
     def check_success(self):
         bottle1_target = self.left_target_pose[:2]
         bottle2_target = self.right_target_pose[:2]

@@ -1,5 +1,7 @@
 from ._base_task import Base_Task
 from .utils import *
+import numpy as np
+from copy import deepcopy
 
 
 class turn_switch(Base_Task):
@@ -36,6 +38,16 @@ class turn_switch(Base_Task):
 
         self.info["info"] = {"{A}": f"056_switch/base{self.model_id}", "{a}": str(arm_tag)}
         return self.info
+
+    def get_tracked_objects(self) -> dict:
+        return {"switch": self.switch}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        switch_pose = self.switch.get_pose()
+        obs["object_pose"] = {"switch": np.concatenate([switch_pose.p, switch_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
 
     def check_success(self):
         limit = self.switch.get_qlimits()[0]

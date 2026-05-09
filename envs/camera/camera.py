@@ -408,6 +408,42 @@ class Camera:
                 res[camera_name][f"{level}_segmentation"] = _get_segmentation(camera, level=level)
         return res
 
+    def get_object_masks(self, tracked_objects: dict) -> dict:
+        """Return per-camera binary uint8 masks for each tracked actor.
+
+        tracked_objects: {name: sapien_actor}
+        Returns: {camera_name: {name: mask_HxW uint8}}
+        """
+        def _actor_ids(camera):
+            return camera.get_picture("Segmentation")[..., 1]  # actor-level IDs [H, W]
+
+        def _get_mask(actor_ids, actor):
+            from sapien.physx import PhysxArticulation
+            inner = actor.actor if hasattr(actor, 'actor') else actor
+            if isinstance(inner, PhysxArticulation):
+                mask = np.zeros(actor_ids.shape, dtype=np.uint8)
+                for link in inner.get_links():
+                    mask |= (actor_ids == link.entity.per_scene_id).astype(np.uint8)
+                return mask
+            return (actor_ids == inner.per_scene_id).astype(np.uint8)
+
+        def _masks_for_camera(camera):
+            actor_ids = _actor_ids(camera)
+            return {name: _get_mask(actor_ids, actor) for name, actor in tracked_objects.items()}
+
+        res = {}
+        if self.collect_wrist_camera:
+            res["left_camera"] = _masks_for_camera(self.left_camera)
+            res["right_camera"] = _masks_for_camera(self.right_camera)
+
+        for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
+            if camera_name == "head_camera":
+                if self.collect_head_camera:
+                    res[camera_name] = _masks_for_camera(camera)
+            else:
+                res[camera_name] = _masks_for_camera(camera)
+        return res
+
     # Get Camera Depth
     def get_depth(self) -> dict:
 

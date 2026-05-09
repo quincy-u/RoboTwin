@@ -1,6 +1,8 @@
 from ._base_task import Base_Task
 from .utils import *
 from ._GLOBAL_CONFIGS import *
+import numpy as np
+from copy import deepcopy
 
 
 class handover_mic(Base_Task):
@@ -95,6 +97,16 @@ class handover_mic(Base_Task):
             "{b}": str(handover_arm_tag),
         }
         return self.info
+
+    def get_tracked_objects(self) -> dict:
+        return {"mic": self.microphone}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        mic_pose = self.microphone.get_pose()
+        obs["object_pose"] = {"mic": np.concatenate([mic_pose.p, mic_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
 
     def check_success(self):
         microphone_pose = self.microphone.get_functional_point(0)

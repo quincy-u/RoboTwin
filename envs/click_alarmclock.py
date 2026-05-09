@@ -77,6 +77,16 @@ class click_alarmclock(Base_Task):
         return self.info
 
 
+    def get_tracked_objects(self) -> dict:
+        return {"alarmclock": self.alarm}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        alarm_pose = self.alarm.get_pose()
+        obs["object_pose"] = {"alarmclock": np.concatenate([alarm_pose.p, alarm_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
+
     def check_success(self):
         if self.stage_success_tag:
             return True

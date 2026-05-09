@@ -1,6 +1,8 @@
 from ._base_task import Base_Task
 from .utils import *
 import sapien
+import numpy as np
+from copy import deepcopy
 from ._GLOBAL_CONFIGS import *
 
 
@@ -78,6 +80,16 @@ class beat_block_hammer(Base_Task):
 
         self.info["info"] = {"{A}": "020_hammer/base0", "{a}": str(arm_tag)}
         return self.info
+
+    def get_tracked_objects(self) -> dict:
+        return {"hammer": self.hammer}
+
+    def get_obs(self):
+        obs = super().get_obs()
+        hammer_pose = self.hammer.get_pose()
+        obs["object_pose"] = {"hammer": np.concatenate([hammer_pose.p, hammer_pose.q])}
+        self.now_obs = deepcopy(obs)
+        return obs
 
     def check_success(self):
         hammer_target_pose = self.hammer.get_functional_point(0, "pose").p
