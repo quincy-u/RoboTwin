@@ -12,16 +12,16 @@ export CUDA_VISIBLE_DEVICES=${gpu_id}
 PYTHONWARNINGS=ignore::UserWarning \
 python script/collect_data.py $task_name $task_config "${extra_args[@]}"
 
-data_root=data
+data_root="${SAVE_PATH:-data}"
 prev=""
 for arg in "${extra_args[@]}"; do
     if [[ "$arg" == "--collect-failure" ]]; then
-        data_root=data_fail
+        data_root="${data_root}_fail"
     elif [[ "$arg" == "--target-noise-std" ]]; then
         prev="--target-noise-std"
     elif [[ "$prev" == "--target-noise-std" ]]; then
         if [[ "$arg" != "0" && "$arg" != "0.0" ]]; then
-            data_root=data_fail
+            data_root="${data_root}_fail"
         fi
         prev=""
     fi

@@ -45,6 +45,13 @@ def main(task_name=None, task_config=None, collect_failure=False, failure_num=No
     with open(config_path, "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    # Allow the dataset root to be overridden via SAVE_PATH env var (e.g.
+    # SAVE_PATH=/shared/perception/datasets/robotwin) without editing the
+    # task config yaml. Per-task / per-config subpath is appended below.
+    _save_path_override = os.environ.get("SAVE_PATH")
+    if _save_path_override:
+        args["save_path"] = _save_path_override
+
     args['task_name'] = task_name
     args["collect_failure"] = collect_failure
     args["target_noise_std"] = float(target_noise_std)

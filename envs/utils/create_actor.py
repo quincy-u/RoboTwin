@@ -222,7 +222,14 @@ def create_box(
         texture_id=texture_id,
     )
     if boxtype == "default":
+        # `actor_utils.get_point` uses `config["scale"]` to map unit-cube
+        # contact points into half-size space, so `scale = half_size` is load-
+        # bearing for grasp planning — DO NOT change it. The `_synthetic_box`
+        # marker tells `Base_Task._box_corners_world` to interpret `extents`
+        # as already-scaled half-size and skip the usual `extents*scale/2`
+        # formula (which would otherwise produce a microscopic OBB).
         data = {
+            "_synthetic_box": True,
             "center": [0, 0, 0],
             "extents":
             half_size,
@@ -281,7 +288,12 @@ def create_box(
             "target_point_description": ["The center point on the bottom of the box."],
         }
     else:
+        # Same `_synthetic_box` marker as the default branch — without it
+        # `_box_corners_world` would compute `extents * scale / 2 = hs² / 2`
+        # (microscopic). The marker tells the OBB consumer to use `extents`
+        # directly as the half-size.
         data = {
+            "_synthetic_box": True,
             "center": [0, 0, 0],
             "extents":
             half_size,
@@ -558,7 +570,9 @@ def create_obj(
     mesh = builder.build(name=modelname)
     mesh.set_pose(pose)
 
-    return Actor(mesh, model_data)
+    a = Actor(mesh, model_data)
+    a.modelname, a.model_id = modelname, model_id
+    return a
 
 
 # create glb model
@@ -606,7 +620,9 @@ def create_glb(
     mesh = builder.build(name=modelname)
     mesh.set_pose(pose)
 
-    return Actor(mesh, model_data)
+    a = Actor(mesh, model_data)
+    a.modelname, a.model_id = modelname, model_id
+    return a
 
 
 def get_glb_or_obj_file(modeldir, model_id):
@@ -681,7 +697,9 @@ def create_actor(
     mesh = builder.build(name=modelname)
     mesh.set_name(modelname)
     mesh.set_pose(pose)
-    return Actor(mesh, model_data)
+    a = Actor(mesh, model_data)
+    a.modelname, a.model_id = modelname, model_id
+    return a
 
 
 # create urdf model
@@ -706,7 +724,9 @@ def create_urdf_obj(scene, pose: sapien.Pose, modelname: str, scale=1.0, fix_roo
 
     object.set_root_pose(pose)
     object.set_name(modelname)
-    return ArticulationActor(object, model_data)
+    a = ArticulationActor(object, model_data)
+    a.modelname = modelname
+    return a
 
 
 def create_sapien_urdf_obj(
@@ -797,4 +817,9 @@ def create_sapien_urdf_obj(
         if revolute_joints:
             model_data["revolute_joints"] = revolute_joints
     object.set_name(modelname)
-    return ArticulationActor(object, model_data)
+    a = ArticulationActor(object, model_data)
+    a.modelname = modelname
+    # `modelid` here is an index into the sorted subdir list; if the actual
+    # subdir name is needed (e.g. "9748"), parse modeldir.name
+    a.model_id = modeldir.name if modelid is not None else None
+    return a

@@ -1,24 +1,16 @@
 #!/bin/bash
+# Generic batch runner: regenerates 2D-projected 3D OBB for every collected task.
+#
+# Replaces the old per-task hardcoded list. Object→asset resolution comes from:
+#   1. observation/object_info/{name} dataset in HDF5 (auto-written by Base_Task.save_obb2d
+#      during new data collections)
+#   2. scene_info.json info {A}/{B}/... matched positionally against tracked objects
+#      (legacy data without object_info)
+#   3. --override flag on save_obb2d_all.py for manual control.
+#
+# Specific tasks or demos:
+#   bash script/run_save_proj_3d_obb.sh adjust_bottle pick_dual_bottles
+#   bash script/run_save_proj_3d_obb.sh --demos demo_clean demo_randomized
 set -e
 cd "$(dirname "$0")/.."
-
-python script/save_obb2d.py data/adjust_bottle/demo_clean/data      assets/objects/001_bottle      data/adjust_bottle/demo_clean/scene_info.json      --object bottle
-
-python script/save_obb2d.py data/beat_block_hammer/demo_clean/data   assets/objects/020_hammer      data/beat_block_hammer/demo_clean/scene_info.json   --object hammer
-
-python script/save_obb2d.py data/click_alarmclock/demo_clean/data    assets/objects/046_alarm-clock data/click_alarmclock/demo_clean/scene_info.json    --object alarmclock
-
-python script/save_obb2d.py data/grab_roller/demo_clean/data         assets/objects/102_roller      data/grab_roller/demo_clean/scene_info.json         --object roller
-
-python script/save_obb2d.py data/handover_mic/demo_clean/data        assets/objects/018_microphone  data/handover_mic/demo_clean/scene_info.json        --object mic
-
-python script/save_obb2d.py data/open_laptop/demo_clean/data         assets/objects/015_laptop      data/open_laptop/demo_clean/scene_info.json         --object laptop
-
-python script/save_obb2d.py data/pick_dual_bottles/demo_clean/data   assets/objects/001_bottle      data/pick_dual_bottles/demo_clean/scene_info.json   --object bottle1
-python script/save_obb2d.py data/pick_dual_bottles/demo_clean/data   assets/objects/001_bottle      data/pick_dual_bottles/demo_clean/scene_info.json   --object bottle2
-
-python script/save_obb2d.py data/turn_switch/demo_clean/data         assets/objects/056_switch      data/turn_switch/demo_clean/scene_info.json         --object switch
-
-python script/save_obb2d.py data/lift_pot/demo_clean/data            assets/objects/060_kitchenpot  data/lift_pot/demo_clean/scene_info.json            --object pot
-
-echo "All done."
+python script/save_obb2d_all.py "$@"

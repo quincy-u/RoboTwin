@@ -24,6 +24,8 @@ class Actor:
     def __init__(self, actor: Entity, actor_data: dict, mass=0.01):
         self.actor = actor
         self.config = actor_data
+        self.modelname = None    # e.g. "001_bottle"  (set by create_*)
+        self.model_id = None     # e.g. 16 or subdir id like "9748"
         self.set_mass(mass)
 
     def get_point(
@@ -110,6 +112,8 @@ class ArticulationActor(Actor):
 
         self.actor = actor
         self.config = actor_data
+        self.modelname = None
+        self.model_id = None
 
         self.link_dict = self.get_link_dict()
         self.set_mass(mass)

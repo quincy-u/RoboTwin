@@ -99,6 +99,13 @@ class Base_Task(gym.Env):
         self.take_action_cnt = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
 
+        # State-machine target log: which actor each arm is currently engaging
+        # with (set by grasp_actor / place_actor wrappers, cleared on release).
+        # `_take_picture` snapshots these per recorded frame into `_target_log`
+        # so save_obb2d can write the canonical per-frame label to HDF5.
+        self._current_target_arm: dict[str, str] = {"left": "", "right": ""}
+        self._target_log: dict[str, list[str]] = {"left": [], "right": []}
+
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
 
@@ -511,18 +518,67 @@ class Base_Task(gym.Env):
         if self.data_type.get("pointcloud", False):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
         # object masks
+        tracked = self.get_tracked_objects()
         if self.data_type.get("object_mask", False):
-            tracked = self.get_tracked_objects()
             if tracked:
                 masks = self.cameras.get_object_masks(tracked)
                 for camera_name, camera_masks in masks.items():
                     pkl_dic["observation"][camera_name]["object_mask"] = camera_masks
 
+        # Auto-record pose (and qpos for articulated) for every tracked object.
+        # Tasks may override get_obs and replace object_pose; that takes precedence.
+        if tracked:
+            obj_pose = {}
+            obj_qpos = {}
+            for name, actor in tracked.items():
+                if actor is None:
+                    continue
+                try:
+                    p = actor.get_pose()
+                    obj_pose[name] = np.concatenate([p.p, p.q])
+                except Exception:
+                    pass
+                # ArticulationActor wraps a PhysxArticulation that has get_qpos()
+                sa = getattr(actor, "actor", None)
+                if sa is not None and hasattr(sa, "get_qpos"):
+                    try:
+                        obj_qpos[name] = np.asarray(sa.get_qpos())
+                    except Exception:
+                        pass
+            if obj_pose:
+                pkl_dic["object_pose"] = obj_pose
+            if obj_qpos:
+                pkl_dic["object_qpos"] = obj_qpos
+
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
 
     def get_tracked_objects(self) -> dict:
-        return {}
+        """Return {name: Actor} for objects whose 3D OBB should be tracked.
+
+        Default implementation: introspect ``self.__dict__`` for any Actor /
+        ArticulationActor instance — either as a direct attribute (e.g.
+        ``self.bottle``) or as an element of a list / tuple / dict attribute
+        (e.g. ``self.bread = [Actor, Actor]`` → ``"bread_0"``, ``"bread_1"``;
+        ``self.bottles = {"a": Actor}`` → ``"bottles_a"``). Override in a
+        subclass for explicit control (e.g. to exclude helper actors).
+        """
+        from .utils.actor_utils import Actor as _Actor
+        tracked: dict = {}
+        for name, value in self.__dict__.items():
+            if name.startswith("_"):
+                continue
+            if isinstance(value, _Actor):
+                tracked[name] = value
+            elif isinstance(value, (list, tuple)):
+                for i, elt in enumerate(value):
+                    if isinstance(elt, _Actor):
+                        tracked[f"{name}_{i}"] = elt
+            elif isinstance(value, dict):
+                for k, elt in value.items():
+                    if isinstance(elt, _Actor):
+                        tracked[f"{name}_{k}"] = elt
+        return tracked
 
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
         self._update_render()
@@ -547,7 +603,64 @@ class Base_Task(gym.Env):
 
         pkl_dic = self.get_obs()
         save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)  # use cache
+        # Snapshot per-arm manipulation target so save_obb2d can write
+        # object_target/{left,right} matching the demo's actual state machine.
+        self._target_log["left"].append(self._current_target_arm.get("left", ""))
+        self._target_log["right"].append(self._current_target_arm.get("right", ""))
         self.FRAME_IDX += 1
+
+    def _resolve_actor_attr_name(self, actor) -> str:
+        """Find the tracked-object name for this actor instance.
+
+        Must return the key that ``get_tracked_objects()`` uses, because
+        downstream consumers (object_target, proj_3d_obb, vjepa2 prep,
+        visualizer) all look up the actor by that key. Some tasks rename
+        the attr in ``get_tracked_objects`` (e.g. ``self.microphone`` →
+        ``"mic"``), so we consult that mapping first and only fall back to
+        the ``self.__dict__`` scan when the actor isn't surfaced there.
+        """
+        if actor is None:
+            return ""
+        try:
+            tracked = self.get_tracked_objects()
+        except Exception:
+            tracked = {}
+        for k, v in (tracked or {}).items():
+            if v is actor:
+                return k
+            if isinstance(v, (list, tuple)):
+                for i, elt in enumerate(v):
+                    if elt is actor:
+                        return f"{k}_{i}"
+            elif isinstance(v, dict):
+                for sk, elt in v.items():
+                    if elt is actor:
+                        return f"{k}_{sk}"
+        for k, v in self.__dict__.items():
+            if k.startswith("_"):
+                continue
+            if v is actor:
+                return k
+            if isinstance(v, (list, tuple)):
+                for i, elt in enumerate(v):
+                    if elt is actor:
+                        return f"{k}_{i}"
+            elif isinstance(v, dict):
+                for sk, elt in v.items():
+                    if elt is actor:
+                        return f"{k}_{sk}"
+        return ""
+
+    def _set_target(self, arm_tag, actor=None, name: str = None) -> None:
+        """Set the active manipulation target for one arm. Pass either an
+        Actor instance (resolved via attribute name) or an explicit name."""
+        arm = str(arm_tag)
+        if name is None:
+            name = self._resolve_actor_attr_name(actor)
+        self._current_target_arm[arm] = name or ""
+
+    def _clear_target(self, arm_tag) -> None:
+        self._current_target_arm[str(arm_tag)] = ""
 
     def save_traj_data(self, idx):
         file_path = os.path.join(self.save_dir, "_traj_data", f"episode{idx}.pkl")
@@ -617,16 +730,25 @@ class Base_Task(gym.Env):
         scale = np.array(model_data["scale"])
         if scale.ndim == 0:
             scale = np.array([scale, scale, scale])
-        # trans_mat translation is baked into get_pose().p by create_sapien_urdf_obj;
-        # undo it so the OBB center aligns with the actual mesh geometry.
-        trans_mat = np.array(model_data.get("transform_matrix", np.eye(4)))
-        pos = pos - trans_mat[:3, 3]
+        # NOTE: do NOT subtract trans_mat[:3, 3] from pos. get_pose() returns
+        # the actor's actual world pose (which already includes the trans_mat
+        # offset that create_sapien_urdf_obj added at set_pose time). The old
+        # subtraction shifted the OBB downward by trans_mat.translation,
+        # putting it below the actual mesh — most visible on the microwave
+        # (~7 cm offset).
         # For URDF articulations, get_pose() returns the root/base link pose but
         # the bounding box is in the body link frame. Apply the fixed joint rotation.
         if "body_q" in model_data:
             R = R @ Base_Task._quat_to_mat(np.array(model_data["body_q"]))
-        center_local = np.array(model_data.get("center", [0, 0, 0])) * scale
-        half = np.array(model_data["extents"]) * scale / 2.0
+        # Synthetic boxes from create_box overload `extents`/`scale` (both
+        # equal `half_size`) for grasp-planning compatibility, so their OBB
+        # half-size IS `extents` directly — skip the usual *scale/2 formula.
+        if model_data.get("_synthetic_box"):
+            center_local = np.array(model_data.get("center", [0, 0, 0]))
+            half = np.array(model_data["extents"])
+        else:
+            center_local = np.array(model_data.get("center", [0, 0, 0])) * scale
+            half = np.array(model_data["extents"]) * scale / 2.0
         center_world = pos + R @ center_local
         return center_world + (Base_Task._SIGNS * half) @ R.T
 
@@ -646,13 +768,17 @@ class Base_Task(gym.Env):
         scale = np.array(model_data["scale"])
         if scale.ndim == 0:
             scale = np.array([scale, scale, scale])
-        trans_mat = np.array(model_data.get("transform_matrix", np.eye(4)))
-        pos_link0 = pos - trans_mat[:3, 3]
+        # See _box_corners_world above — get_pose() returns the actor's
+        # actual world pose; do NOT subtract trans_mat translation here.
+        pos_link0 = pos
         R_link0 = R_root @ Base_Task._quat_to_mat(np.array(model_data["body_q"]))
 
         link_bboxes = model_data["link_bboxes"]
         revolute_joints = model_data["revolute_joints"]
-        only_moving = (obj_name == "laptop")
+        # Articulated objects whose OBB should track the moving link only
+        # (e.g. laptop lid, microwave door) rather than the union envelope of
+        # body + opening part. Add new task object names here as needed.
+        only_moving = obj_name in ("laptop", "microwave")
 
         # first_link is the body link directly connected to the SAPIEN articulation root
         # (the one whose world pose = pos_link0, R_link0 computed above).
@@ -698,7 +824,23 @@ class Base_Task(gym.Env):
 
         if not all_corners:
             return Base_Task._box_corners_world(pose_7, model_data)
-        return np.concatenate(all_corners, axis=0)
+        stacked = np.concatenate(all_corners, axis=0)
+        if only_moving:
+            # Moving-link corners are already a tight 8-corner OBB in the
+            # moving link's own frame — return as-is.
+            return stacked
+        # Unify the per-link corner sets into a single tight 8-corner OBB
+        # in the anchor link's orientation. Returning the raw 16+ corners
+        # would mismatch the (T, 16) projection buffer in save_obb2d below.
+        local = (stacked - pos_link0) @ R_link0
+        bb_min, bb_max = local.min(axis=0), local.max(axis=0)
+        center_l = (bb_min + bb_max) / 2.0
+        half_l = (bb_max - bb_min) / 2.0
+        signs = np.array(
+            [[-1,-1,-1],[-1,-1,1],[-1,1,-1],[-1,1,1],
+             [ 1,-1,-1],[ 1,-1,1],[ 1,1,-1],[ 1,1,1]], dtype=float)
+        obb_local = center_l + signs * half_l
+        return pos_link0 + obb_local @ R_link0.T
 
     @staticmethod
     def _project_points(pts_world, intrinsic, extrinsic):
@@ -713,6 +855,9 @@ class Base_Task(gym.Env):
 
         Stores the 8 corners of the 3D OBB projected to 2D pixel coords,
         flattened to 16 values per timestep: [x0,y0, x1,y1, ..., x7,y7].
+        Also writes ``object_info/{name}`` string datasets mapping each tracked
+        object to its source asset ("modelname/baseN") so post-hoc tools can
+        reload the model_data without parsing scene_info.
         """
         if not self.save_data:
             return
@@ -726,6 +871,58 @@ class Base_Task(gym.Env):
 
         import h5py
         with h5py.File(hdf5_path, "r+") as f:
+            # Per-object asset reference (modelname/baseN). Useful for any
+            # downstream tool that wants to reload model_data.json.
+            for obj_name, actor in tracked.items():
+                if actor is None:
+                    continue
+                modelname = getattr(actor, "modelname", None)
+                model_id = getattr(actor, "model_id", None)
+                if not modelname:
+                    continue
+                if model_id is None or model_id == "":
+                    label = f"{modelname}/base0"
+                else:
+                    label = f"{modelname}/base{model_id}"
+                key = f"object_info/{obj_name}"
+                if key in f:
+                    del f[key]
+                f.create_dataset(key, data=np.bytes_(label))
+
+            # Per-frame, per-arm manipulation target labels. Prefer the
+            # state-machine log produced by grasp_actor / place_actor (the
+            # demo code knows exactly which actor is being engaged). Only
+            # fall back to the heuristic labeler when the log is missing or
+            # length-mismatched (e.g. legacy task code that bypassed the
+            # tagged action API).
+            try:
+                import sys
+                from pathlib import Path as _Path
+                _repo = _Path(__file__).resolve().parents[1]
+                if str(_repo) not in sys.path:
+                    sys.path.insert(0, str(_repo))
+                from script.object_target_labeler import (
+                    compute_object_targets, write_object_targets,
+                )
+                T_expected = None
+                try:
+                    cams_local = [c for c in f["observation"].keys()
+                                  if "rgb" in f[f"observation/{c}"]]
+                    T_expected = int(f[f"observation/{cams_local[0]}/rgb"].shape[0])
+                except Exception:
+                    pass
+                log_L = list(self._target_log.get("left", []))
+                log_R = list(self._target_log.get("right", []))
+                if (T_expected is not None
+                    and len(log_L) == T_expected and len(log_R) == T_expected):
+                    import numpy as _np
+                    targets = {"left": _np.array(log_L, dtype=object),
+                               "right": _np.array(log_R, dtype=object)}
+                else:
+                    targets = compute_object_targets(f)
+                write_object_targets(f, targets)
+            except Exception as _e:  # never let labeler failures abort collection
+                print(f"[warn] object_target labeling failed: {_e}")
             cams = [c for c in f["observation"].keys()
                     if "rgb" in f[f"observation/{c}"]]
             T = f[f"observation/{cams[0]}/rgb"].shape[0]
@@ -1143,6 +1340,16 @@ class Base_Task(gym.Env):
                                                                  and right.arm_tag != "right"):  # check
                 raise ValueError(f"Invalid arm tag: {left.arm_tag} or {right.arm_tag}. Must be 'left' or 'right'.")
 
+            # State-machine target update: BEFORE running each action, set
+            # the current manipulation target for that arm if the action was
+            # tagged with one. grasp_actor / place_actor wrappers do this.
+            for side, action in [("left", left), ("right", right)]:
+                if action is None:
+                    continue
+                tgt_actor = action.args.get("target_actor")
+                if tgt_actor is not None:
+                    self._set_target(side, actor=tgt_actor)
+
             if (left is not None and left.action == "move") and (right is not None
                                                                  and right.action == "move"):  # together move
                 self.together_move_to_pose(  # TODO
@@ -1185,6 +1392,14 @@ class Base_Task(gym.Env):
                         return False
 
             self.take_dense_action(control_seq)
+
+            # AFTER the action lands: clear the arm's target if the action
+            # marked itself as a release (place_actor's final open gripper).
+            for side, action in [("left", left), ("right", right)]:
+                if action is None:
+                    continue
+                if action.args.get("clear_target_after"):
+                    self._clear_target(side)
 
         return True
 
@@ -1397,21 +1612,25 @@ class Base_Task(gym.Env):
         if not self.plan_success:
             return None, []
         if self.need_plan == False:
+            # No-plan replay path (used during actual HDF5 data collection).
+            # Must also tag actions with target_actor so that `move()` updates
+            # the per-frame manipulation-target log.
             if pre_grasp_dis == grasp_dis:
                 return arm_tag, [
-                    Action(arm_tag, "move", target_pose=[0, 0, 0, 0, 0, 0, 0]),
-                    Action(arm_tag, "close", target_gripper_pos=gripper_pos),
+                    Action(arm_tag, "move", target_pose=[0, 0, 0, 0, 0, 0, 0], target_actor=actor),
+                    Action(arm_tag, "close", target_gripper_pos=gripper_pos, target_actor=actor),
                 ]
             else:
                 return arm_tag, [
-                    Action(arm_tag, "move", target_pose=[0, 0, 0, 0, 0, 0, 0]),
+                    Action(arm_tag, "move", target_pose=[0, 0, 0, 0, 0, 0, 0], target_actor=actor),
                     Action(
                         arm_tag,
                         "move",
                         target_pose=[0, 0, 0, 0, 0, 0, 0],
                         constraint_pose=[1, 1, 1, 0, 0, 0],
+                        target_actor=actor,
                     ),
-                    Action(arm_tag, "close", target_gripper_pos=gripper_pos),
+                    Action(arm_tag, "close", target_gripper_pos=gripper_pos, target_actor=actor),
                 ]
 
         pre_grasp_pose, grasp_pose = self.choose_grasp_pose(
@@ -1421,22 +1640,27 @@ class Base_Task(gym.Env):
             target_dis=grasp_dis,
             contact_point_id=contact_point_id,
         )
+        # Tag every action with the target actor — `move()` will set
+        # _current_target_arm[arm] so the per-frame label captured by
+        # `_take_picture` is whatever object this grasp sequence is engaging.
         if pre_grasp_pose == grasp_pose:
-            return arm_tag, [
-                Action(arm_tag, "move", target_pose=pre_grasp_pose),
-                Action(arm_tag, "close", target_gripper_pos=gripper_pos),
+            actions = [
+                Action(arm_tag, "move", target_pose=pre_grasp_pose, target_actor=actor),
+                Action(arm_tag, "close", target_gripper_pos=gripper_pos, target_actor=actor),
             ]
         else:
-            return arm_tag, [
-                Action(arm_tag, "move", target_pose=pre_grasp_pose),
+            actions = [
+                Action(arm_tag, "move", target_pose=pre_grasp_pose, target_actor=actor),
                 Action(
                     arm_tag,
                     "move",
                     target_pose=grasp_pose,
                     constraint_pose=[1, 1, 1, 0, 0, 0],
+                    target_actor=actor,
                 ),
-                Action(arm_tag, "close", target_gripper_pos=gripper_pos),
+                Action(arm_tag, "close", target_gripper_pos=gripper_pos, target_actor=actor),
             ]
+        return arm_tag, actions
 
     def get_place_pose(
         self,
@@ -1560,12 +1784,16 @@ class Base_Task(gym.Env):
             place_pre_pose = [0, 0, 0, 0, 0, 0, 0]
             place_pose = [0, 0, 0, 0, 0, 0, 0]
 
+        # Tag every action with the target actor; the *last* "open" (release)
+        # also carries `clear_target_after=True` so `move()` resets the arm's
+        # current target once the object is no longer being held.
         actions = [
-            Action(arm_tag, "move", target_pose=place_pre_pose),
-            Action(arm_tag, "move", target_pose=place_pose),
+            Action(arm_tag, "move", target_pose=place_pre_pose, target_actor=actor),
+            Action(arm_tag, "move", target_pose=place_pose, target_actor=actor),
         ]
         if is_open:
-            actions.append(Action(arm_tag, "open", target_gripper_pos=1.0))
+            actions.append(Action(arm_tag, "open", target_gripper_pos=1.0,
+                                   target_actor=actor, clear_target_after=True))
         return arm_tag, actions
 
     def move_by_displacement(
@@ -1606,13 +1834,28 @@ class Base_Task(gym.Env):
         return arm_tag, [Action(arm_tag, "close", target_gripper_pos=pos)]
 
     def open_gripper(self, arm_tag: ArmTag, pos: float = 1.0):
-        return arm_tag, [Action(arm_tag, "open", target_gripper_pos=pos)]
+        # Explicit release: clear this arm's manipulation target after the
+        # gripper opens (used by handover-style demos where the first arm
+        # releases the object after the second arm has grasped it).
+        return arm_tag, [
+            Action(arm_tag, "open", target_gripper_pos=pos,
+                    clear_target_after=True)
+        ]
 
     def back_to_origin(self, arm_tag: ArmTag):
+        # Returning to home position implies the arm is no longer engaged
+        # with any object; clear the per-arm target so we don't keep
+        # painting an OBB on a now-irrelevant object during retreat.
         if arm_tag == "left":
-            return arm_tag, [Action(arm_tag, "move", self.robot.left_original_pose)]
+            return arm_tag, [
+                Action(arm_tag, "move", self.robot.left_original_pose,
+                        clear_target_after=True)
+            ]
         elif arm_tag == "right":
-            return arm_tag, [Action(arm_tag, "move", self.robot.right_original_pose)]
+            return arm_tag, [
+                Action(arm_tag, "move", self.robot.right_original_pose,
+                        clear_target_after=True)
+            ]
         return None, []
 
     def get_arm_pose(self, arm_tag: ArmTag):

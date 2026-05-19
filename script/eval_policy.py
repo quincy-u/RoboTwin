@@ -121,7 +121,13 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    # Include seed in the folder name so concurrent runs of the same task
+    # (from a multi-GPU orchestrator) don't collide on the same second-resolution
+    # timestamp and overwrite each other's _result.txt / video files.
+    seed_tag = f"_seed{usr_args.get('seed')}" if usr_args.get("seed") is not None else ""
+    save_dir = Path(
+        f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}{seed_tag}"
+    )
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if args["eval_video_log"]:
@@ -216,6 +222,12 @@ def eval_policy(task_name,
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        # Heartbeat from the eval's own main loop — prints once per seed
+        # attempted (success OR silent reject). Real progress signal: if this
+        # line stops appearing, the loop is truly stuck. Lets outer watchdogs
+        # use a short stuck-timeout even when the expert filter rejects many
+        # consecutive seeds.
+        print(f"[try_seed] now_seed={now_seed} succ_seed={succ_seed}/{test_num}", flush=True)
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 

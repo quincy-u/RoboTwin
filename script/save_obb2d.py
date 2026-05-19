@@ -34,8 +34,11 @@ def box_corners_world(pose_7: np.ndarray, model_data: dict) -> np.ndarray:
     pos = pose_7[:3]
     R = quat_to_mat(pose_7[3:])
     scale = np.array(model_data["scale"])
-    trans_mat = np.array(model_data.get("transform_matrix", np.eye(4)))
-    pos = pos - trans_mat[:3, 3]
+    # NOTE: do NOT subtract trans_mat[:3, 3] from pos — get_pose() returns the
+    # actor's actual world pose, which already accounts for the trans_mat
+    # offset that create_sapien_urdf_obj added at set_pose time. Subtracting
+    # it again would shift the OBB by trans_mat.translation (e.g. ~7 cm for
+    # the microwave, putting the box below the table).
     if "body_q" in model_data:
         R = R @ quat_to_mat(np.array(model_data["body_q"]))
     center_local = np.array(model_data.get("center", [0, 0, 0])) * scale
@@ -141,9 +144,8 @@ def box_corners_world_articulated(pose_7: np.ndarray, qpos: float, model_data: d
     scale_raw = model_data["scale"]
     scale = np.array(scale_raw) if isinstance(scale_raw, list) else np.full(3, float(scale_raw))
 
-    trans_mat = np.array(model_data.get("transform_matrix", np.eye(4)))
-    pos = pos - trans_mat[:3, 3]
-
+    # See box_corners_world above — get_pose() already returns the world pose
+    # including trans_mat offset; do NOT subtract trans_mat translation here.
     R_fixed = quat_to_mat(np.array(model_data["body_q"])) if "body_q" in model_data else np.eye(3)
     R_link0 = R_body @ R_fixed
     pos_link0 = pos  # fixed joint has xyz=[0,0,0]
@@ -154,7 +156,10 @@ def box_corners_world_articulated(pose_7: np.ndarray, qpos: float, model_data: d
     link_bboxes = model_data["link_bboxes"]
     anchor_link = model_data["anchor_link"]
     moving_link = model_data["moving_link"]
-    only_moving = (obj_name == "laptop")
+    # Track the moving link only (door / lid) rather than the union envelope
+    # for articulated objects whose meaningful manipulation target IS the
+    # opening part. Extend as needed.
+    only_moving = obj_name in ("laptop", "microwave")
 
     def corners_for_link(origin_world, R_world, bbox):
         bb_min = np.array(bbox["min"]) * scale

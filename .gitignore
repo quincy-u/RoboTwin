@@ -34,3 +34,6 @@ data_fail/*
 eval_result/*
 **/eval_results/*
 **/training_data/*
+logs/*
+obb_videos_active/*
+obb_visualizations/*
