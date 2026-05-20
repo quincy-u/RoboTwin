@@ -1,4 +1,4 @@
-torch==2.4.1
+torch>=2.7,<3
 torchvision
 transforms3d==0.4.2
 sapien==3.0.0b1
