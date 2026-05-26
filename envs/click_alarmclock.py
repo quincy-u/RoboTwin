@@ -42,7 +42,14 @@ class click_alarmclock(Base_Task):
     def play_once(self):
         # Determine which arm to use based on alarm clock's position (right if positive x, left otherwise)
         arm_tag = ArmTag("right" if self.alarm.get_pose().p[0] > 0 else "left")
-    
+
+        # Tag the alarm as the active manipulation target for this arm so the
+        # per-frame object_target/{left,right} log (and downstream obb_head)
+        # carries the OBB signal across the approach → press → retract phases.
+        # The raw self.move(...) calls below don't go through grasp_actor /
+        # place_actor, so nothing else would populate the target.
+        self._set_target(arm_tag, actor=self.alarm)
+
         # Move the gripper above the top center of the alarm clock and close the gripper to simulate a click
         # Note: although the code structure resembles a grasp, it is used here to simulate a touch/click action
         # You can adjust API parameters to move above the top button and close the gripper (similar to grasp_actor)
@@ -58,16 +65,17 @@ class click_alarmclock(Base_Task):
                 Action(arm_tag, "close", target_gripper_pos=0.0),
             ],
         ))
-    
+
         # Move the gripper downward to press the top button of the alarm clock
         self.move(self.move_by_displacement(arm_tag, z=-0.065))
         # Check whether the simulated click action was successful
         self.check_success()
-    
+
         # Move the gripper back to the original height (not lifting the alarm clock)
         self.move(self.move_by_displacement(arm_tag, z=0.065))
         # Optionally check success again
         self.check_success()
+        self._clear_target(arm_tag)
     
         # Record information about the alarm clock and the arm used
         self.info["info"] = {
