@@ -55,8 +55,9 @@ class Base_Task(gym.Env):
         """
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
-        np.random.seed(kwags.get("seed", 0))
-        torch.manual_seed(kwags.get("seed", 0))
+        self.episode_seed = int(kwags.get("seed", 0))
+        np.random.seed(self.episode_seed)
+        torch.manual_seed(self.episode_seed)
         # random.seed(kwags.get('seed', 0))
 
         self.FRAME_IDX = 0
