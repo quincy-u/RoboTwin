@@ -17,3 +17,7 @@
   a small GT-mask IoU such as `0.01` is intentional.
 - With `CUDA_VISIBLE_DEVICES=6`, the process still addresses that GPU as
   `cuda:0`.
+- A CPU-only SAPIEN physics scene must be created explicitly with
+  `sapien.Scene([sapien.physx.PhysxCpuSystem()])`; the default scene adds a
+  render system. Local llvmpipe cannot satisfy SAPIEN rendering extensions, so
+  it cannot produce the RGB-D observation required by this policy.

@@ -24,4 +24,8 @@
   read-only wait loop was stopped; the training job remains untouched.
 - Resume command once GPU 6 or 7 is safely available:
   `policy/heuristic_baseline/eval.sh shake_bottle heuristic_smoke 0 7 bottle 1`.
+- CUDA-hidden CPU smoke passed all 18 heuristic adapter tests. An explicit
+  PhysX-only SAPIEN scene also passed (a falling box settled at `z=0.5000`).
+- CPU RGB-D rendering is unavailable: Mesa llvmpipe fails SAPIEN device creation
+  with `ErrorExtensionNotPresent`. Real M2T2 and CuRobo are CUDA-only as well.
 - Blockers: none.
