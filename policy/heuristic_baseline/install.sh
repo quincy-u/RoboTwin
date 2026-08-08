@@ -7,6 +7,7 @@ SIMPLE_GRASP_ROOT=${SIMPLE_GRASP_ROOT:-"$HOME/projects/simple-grasp"}
 PYTHON="$REPO_ROOT/.venv/bin/python"
 UV=${UV:-uv}
 HYDRA_VERSION=1.3.2
+OMEGACONF_VERSION=2.3.0
 M2T2_CHECKPOINT_REVISION=a20325dcd19cd1b838274974d0ebe35bfe383796
 M2T2_CHECKPOINT_SHA256=e35c3cb11e06f46c5d406bdfc756bc06f48b256dd6d638408d9a5ff13deb97fb
 CHECKPOINT_DIR="$SIMPLE_GRASP_ROOT/checkpoints"
@@ -21,7 +22,9 @@ if [[ ! -d "$SIMPLE_GRASP_ROOT/third_party/M2T2" ]]; then
     exit 1
 fi
 
-"$UV" pip install --python "$PYTHON" "hydra-core==$HYDRA_VERSION"
+"$UV" pip install --python "$PYTHON" \
+    "hydra-core==$HYDRA_VERSION" \
+    "omegaconf==$OMEGACONF_VERSION"
 CUDA_HOME=${CUDA_HOME:-/software/cuda-13.0} \
     "$UV" pip install --python "$PYTHON" \
     "$SIMPLE_GRASP_ROOT/third_party/M2T2/pointnet2_ops" \
@@ -30,12 +33,18 @@ CUDA_HOME=${CUDA_HOME:-/software/cuda-13.0} \
 mkdir -p "$CHECKPOINT_DIR"
 if [[ ! -f "$CHECKPOINT_PATH" ]]; then
     checkpoint_tmp=$(mktemp "$CHECKPOINT_DIR/.m2t2.pth.XXXXXX")
-    trap "rm -f -- \"$checkpoint_tmp\"" EXIT
+    cleanup_checkpoint_tmp() {
+        if [[ -n "${checkpoint_tmp:-}" ]]; then
+            rm -f -- "$checkpoint_tmp"
+        fi
+    }
+    trap cleanup_checkpoint_tmp EXIT
     curl -L --fail --progress-bar \
         "https://huggingface.co/wentao-yuan/m2t2/resolve/$M2T2_CHECKPOINT_REVISION/m2t2.pth" \
         -o "$checkpoint_tmp"
     printf "%s  %s\n" "$M2T2_CHECKPOINT_SHA256" "$checkpoint_tmp" | sha256sum --check --status
     mv -- "$checkpoint_tmp" "$CHECKPOINT_PATH"
+    checkpoint_tmp=
     trap - EXIT
 fi
 
