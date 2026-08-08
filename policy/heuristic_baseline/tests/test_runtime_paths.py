@@ -33,7 +33,7 @@ class Joint:
 
 class Entity:
     def __init__(self, qpos, joint_names):
-        self.qpos = np.asarray(qpos, dtype=np.float64)
+        self.qpos = np.asarray(qpos, dtype=np.float32)
         self.joints = [Joint(name) for name in joint_names]
 
     def get_qpos(self):
@@ -67,7 +67,7 @@ class Robot:
         return [1.0, 2.0, 3.0, 1.0]
 
     def right_plan_path(self, pose, *, last_qpos=None):
-        self.seeds.append(np.asarray(last_qpos, dtype=np.float64).copy())
+        self.seeds.append(np.asarray(last_qpos).copy())
         return self.results.pop(0)
 
 
@@ -118,6 +118,7 @@ class PlannerPathTest(unittest.TestCase):
         np.testing.assert_allclose(env.robot.seeds[2], [20, 91, 21, 22])
         np.testing.assert_allclose(env.robot.seeds[3], [40, 91, 41, 42])
         self.assertEqual(len(env.robot.seeds), 4)
+        self.assertTrue(all(seed.dtype == np.float32 for seed in env.robot.seeds))
         np.testing.assert_allclose(pregrasp, second["position"][-1, :3])
         np.testing.assert_allclose(grasp, third["position"][-1, :3])
         np.testing.assert_allclose(retreat, fourth["position"][-1, :3])

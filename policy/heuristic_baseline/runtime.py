@@ -79,7 +79,7 @@ class RoboTwinPlannerIK:
 
     def _initial_seed(self, arm: str) -> np.ndarray:
         entity = getattr(self.task_env.robot, f"{arm}_entity")
-        return np.asarray(entity.get_qpos(), dtype=np.float64).copy()
+        return np.asarray(entity.get_qpos()).copy()
 
     def _arm_joint_indices(self, arm: str, arm_dim: int) -> np.ndarray:
         """Map planner arm columns into the full articulation qpos."""
