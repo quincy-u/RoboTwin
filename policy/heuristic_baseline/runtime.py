@@ -31,6 +31,13 @@ M2T2_TO_ROBOTWIN = np.array(
 )
 
 
+CANONICAL_COMMAND_QUATERNIONS = {
+    "right": np.array([-0.353523, 0.61239, -0.353524, -0.61239]),
+    "left": np.array([-0.61239, 0.353523, -0.61239, -0.353524]),
+}
+PARALLEL_JAW_ROLL_SYMMETRY = np.diag([1.0, -1.0, -1.0])
+
+
 class SceneSnapshot:
     def __init__(self) -> None:
         self.scene: SceneObservation | None = None
@@ -158,12 +165,7 @@ class RoboTwinMinkIK:
         self.planner_attempts += 1
         joints = self.solver.solve(arm, mink_target)
         if joints is None and self.relax_orientation_on_failure:
-            canonical_quat = np.asarray(
-                [-0.353523, 0.61239, -0.353524, -0.61239]
-                if arm == "right"
-                else [-0.61239, 0.353523, -0.61239, -0.353524],
-                dtype=np.float64,
-            )
+            canonical_quat = CANONICAL_COMMAND_QUATERNIONS[arm]
             canonical = target.copy()
             canonical[:3, :3] = (
                 t3d.quaternions.quat2mat(canonical_quat)
@@ -272,19 +274,45 @@ class QposActionBuffer:
 
 
 class ReachabilityRankedGrasps:
-    """Filter raw M2T2 confidence before applying a geometric ranking score."""
+    """Rank target-contact grasps by canonical command orientation first."""
 
     def __init__(
         self,
         grasps: M2T2GraspGenerator,
-        task_env: Any,
         arm: str,
+        grasp_to_robotwin: np.ndarray,
         min_confidence: float = 0.0,
     ) -> None:
+        if arm not in CANONICAL_COMMAND_QUATERNIONS:
+            raise ValueError(f"unknown arm {arm!r}")
+        transform = np.asarray(grasp_to_robotwin, dtype=np.float64)
+        if transform.shape != (4, 4):
+            raise ValueError("grasp_to_robotwin must have shape (4, 4)")
         self.grasps = grasps
-        self.task_env = task_env
         self.arm = arm
+        self.command_axis_map = transform[:3, :3].copy()
+        self.canonical_command_rotation = t3d.quaternions.quat2mat(
+            CANONICAL_COMMAND_QUATERNIONS[arm]
+        )
         self.min_confidence = float(min_confidence)
+
+    @staticmethod
+    def _rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
+        relative = np.asarray(first).T @ np.asarray(second)
+        cosine = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
+        return float(np.arccos(cosine))
+
+    def _orientation_error(self, pose: np.ndarray) -> float:
+        command_rotation = pose[:3, :3] @ self.command_axis_map
+        rolled_rotation = command_rotation @ PARALLEL_JAW_ROLL_SYMMETRY
+        return min(
+            self._rotation_distance(
+                self.canonical_command_rotation, command_rotation
+            ),
+            self._rotation_distance(
+                self.canonical_command_rotation, rolled_rotation
+            ),
+        )
 
     def propose(
         self, observation: SceneObservation, target: ObjectState
@@ -294,13 +322,6 @@ class ReachabilityRankedGrasps:
             for candidate in self.grasps.propose(observation, target)
             if candidate.confidence >= self.min_confidence
         ]
-        origin = getattr(self.task_env.robot, f"{self.arm}_entity_origion_pose").p
-        toward_object = target.world_pose[:3, 3] - np.asarray(origin)
-        toward_object[2] = 0.0
-        norm = np.linalg.norm(toward_object)
-        if norm < 1e-8:
-            return candidates
-        toward_object /= norm
 
         ranked = []
         for candidate in candidates:
@@ -309,23 +330,20 @@ class ReachabilityRankedGrasps:
             target_center = target.world_pose[:3, 3]
             if np.linalg.norm(approximate_contact_center - target_center) > 0.08:
                 pose[:3, 3] = target_center - 0.1034 * pose[:3, 2]
-            approach_alignment = float(pose[:3, 2] @ toward_object)
-            robot_side = float(
-                (target.world_pose[:3, 3] - pose[:3, 3]) @ toward_object
-            )
-            geometric_score = (
-                approach_alignment + 1.0
-                + np.clip(robot_side / 0.10, -1.0, 1.0)
-                + 1.0
+
+            orientation_error = self._orientation_error(pose)
+            # Nearest canonical top-down orientation is the primary key. M2T2
+            # confidence breaks ties; a 180-degree roll about the approach axis
+            # is equivalent for the parallel-jaw gripper.
+            ranking_score = (
+                1.0
+                + 10.0 * (np.pi - orientation_error)
+                + 0.01 * candidate.confidence
             )
             ranked.append(
-                GraspCandidate(
-                    pose,
-                    candidate.confidence + geometric_score,
-                    candidate.object_name,
-                )
+                GraspCandidate(pose, ranking_score, candidate.object_name)
             )
-        return ranked
+        return sorted(ranked, key=lambda item: item.confidence, reverse=True)
 
 
 class RoboTwinHeuristicRuntime:
@@ -398,8 +416,8 @@ class RoboTwinHeuristicRuntime:
             self.simulator,
             ReachabilityRankedGrasps(
                 self.grasps,
-                self.task_env,
                 arm,
+                self.ik.grasp_to_robotwin,
                 min_confidence=self.config.min_confidence,
             ),
             self.ik,
@@ -463,7 +481,6 @@ def create_runtime(
         contact_match_distance_m=float(
             usr_args.get("contact_match_distance_m", 1e-5)
         ),
-        min_query_iou=float(usr_args.get("min_query_iou", 0.01)),
         seed=int(getattr(task_env, "episode_seed", usr_args.get("seed", 0))),
     )
     grasps = M2T2GraspGenerator(backend, outputs_in_world=True)

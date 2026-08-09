@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,18 +9,8 @@ import numpy as np
 
 from .errors import NoObjectQueryFailure, NoVisibleTargetFailure
 
-
-@dataclass(frozen=True)
-class QueryMatch:
-    """Association metrics for one M2T2 object query."""
-
-    query_idx: int
-    iou: float
-    intersection: int
-    purity: float
-
 class RoboTwinM2T2Backend:
-    """Load M2T2 once and associate object queries with a target rigid-frame crop."""
+    """Load M2T2 and retain grasps whose contacts lie on the GT target cloud."""
 
     _RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     _RGB_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -40,7 +29,6 @@ class RoboTwinM2T2Backend:
         object_threshold: float = 0.4,
         max_predictions: int | None = 512,
         workspace_bounds: tuple[float, float, float, float, float, float] | None = None,
-        min_query_iou: float = 0.01,
         contact_match_distance_m: float = 1e-5,
         seed: int = 0,
     ) -> None:
@@ -88,9 +76,6 @@ class RoboTwinM2T2Backend:
         self.num_points = int(num_points)
         self.num_object_points = int(num_object_points)
         self.num_runs = int(num_runs)
-        self.min_query_iou = float(min_query_iou)
-        if not 0.0 <= self.min_query_iou <= 1.0:
-            raise ValueError("min_query_iou must be in [0, 1]")
         self.contact_match_distance_m = float(contact_match_distance_m)
         if self.contact_match_distance_m <= 0.0:
             raise ValueError("contact_match_distance_m must be positive")
@@ -114,10 +99,8 @@ class RoboTwinM2T2Backend:
             self._seed = int(seed)
         self.rng = np.random.default_rng(self._seed)
 
-
-
     def _sample_indices(self, target_membership: np.ndarray) -> np.ndarray:
-        """Sample a scene while reserving segmented target points."""
+        """Sample exactly half target points and half non-target context."""
         target_membership = np.asarray(target_membership, dtype=bool)
         total = target_membership.shape[0]
         if total == 0:
@@ -126,11 +109,18 @@ class RoboTwinM2T2Backend:
         if target.size == 0:
             raise NoVisibleTargetFailure("segmented target has no visible depth points")
 
-        target_count = min(target.size, max(1, self.num_points // 4))
-        target_idx = self.rng.choice(target, target_count, replace=False)
-        scene_count = self.num_points - target_count
-        scene_idx = self.rng.choice(total, scene_count, replace=total < scene_count)
-        indices = np.concatenate((target_idx, scene_idx))
+        target_count = (self.num_points + 1) // 2
+        target_idx = self.rng.choice(
+            target, target_count, replace=target.size < target_count
+        )
+        context_count = self.num_points - target_count
+        context = np.flatnonzero(~target_membership)
+        if context.size == 0:
+            context = target
+        context_idx = self.rng.choice(
+            context, context_count, replace=context.size < context_count
+        )
+        indices = np.concatenate((target_idx, context_idx))
         self.rng.shuffle(indices)
         return indices
 
@@ -161,29 +151,6 @@ class RoboTwinM2T2Backend:
             "task_is_pick": torch.ones((1,), dtype=torch.bool, device=self.device),
             "task_is_place": torch.zeros((1,), dtype=torch.bool, device=self.device),
         }
-
-    @staticmethod
-    def _matching_query(masks: Any, target_mask: Any) -> QueryMatch:
-        """Return the best query and diagnostics; thresholding is caller policy."""
-        if getattr(masks, "ndim", 0) != 2:
-            raise ValueError("M2T2 grasping_masks must have shape [queries, points]")
-        if masks.shape[0] == 0:
-            raise NoObjectQueryFailure("M2T2 found no object queries")
-        if target_mask.ndim != 1 or target_mask.shape[0] != masks.shape[1]:
-            raise ValueError("target mask must align with M2T2 mask points")
-        target_mask = target_mask.to(device=masks.device, dtype=masks.dtype)
-        predicted = masks.bool()
-        intersection = (predicted & target_mask.unsqueeze(0)).sum(dim=1).float()
-        union = (predicted | target_mask.unsqueeze(0)).sum(dim=1).clamp_min(1)
-        iou = intersection / union
-        query = int(iou.argmax().item())
-        purity = intersection / predicted.sum(dim=1).clamp_min(1)
-        return QueryMatch(
-            query_idx=query,
-            iou=float(iou[query].item()),
-            intersection=int(intersection[query].item()),
-            purity=float(purity[query].item()),
-        )
 
     @staticmethod
     def _validate_query_alignment(
@@ -224,20 +191,20 @@ class RoboTwinM2T2Backend:
         return query_count
 
     @staticmethod
-    def _sampled_target_contact_membership(
+    def _target_contact_membership(
         contacts: np.ndarray,
-        sampled_target_points: np.ndarray,
+        target_points: np.ndarray,
         tolerance_m: float,
     ) -> np.ndarray:
-        """Keep contacts that match an exact sampled target point within tolerance."""
+        """Keep contacts that match a ground-truth target point within tolerance."""
         contacts = np.asarray(contacts, dtype=np.float64)
-        target_points = np.asarray(sampled_target_points, dtype=np.float64)
+        target_points = np.asarray(target_points, dtype=np.float64)
         if contacts.ndim != 2 or contacts.shape[1:] != (3,):
             raise ValueError("M2T2 grasp contacts must have shape [grasps, 3]")
         if target_points.ndim != 2 or target_points.shape[1:] != (3,):
-            raise ValueError("sampled target points must have shape [points, 3]")
+            raise ValueError("target_points must have shape [points, 3]")
         if len(target_points) == 0:
-            raise NoVisibleTargetFailure("sampled target contains no visible depth points")
+            raise NoVisibleTargetFailure("segmented target contains no visible depth points")
 
         keep = np.zeros(len(contacts), dtype=bool)
         tolerance_sq = float(tolerance_m) ** 2
@@ -292,8 +259,8 @@ class RoboTwinM2T2Backend:
     ) -> tuple[list[np.ndarray], list[float]]:
         poses: list[np.ndarray] = []
         scores: list[float] = []
-        query_matches: list[QueryMatch] = []
         rejected_rotations = 0
+        queries_with_target_contacts = 0
         xyz = np.asarray(xyz, dtype=np.float32)
         rgb = np.asarray(rgb, dtype=np.float32)
         target_pose = np.asarray(target_pose, dtype=np.float64)
@@ -336,57 +303,57 @@ class RoboTwinM2T2Backend:
             grasps = output["grasps"][0]
             confidences = output["grasp_confidence"][0]
             contacts = output["grasp_contacts"][0]
-            self._validate_query_alignment(masks, grasps, confidences, contacts)
-            target_mask = self.torch.from_numpy(target_membership[indices])
-            try:
-                match = self._matching_query(masks, target_mask)
-            except NoObjectQueryFailure:
-                continue
-            query_matches.append(match)
-            if match.iou < self.min_query_iou:
-                continue
-
-            # M2T2 outputs are query-aligned: never pool or fall back to another query.
-            query_poses = grasps[match.query_idx].detach().cpu().numpy()
-            query_scores = confidences[match.query_idx].detach().cpu().numpy()
-            query_contacts = contacts[match.query_idx].detach().cpu().numpy()
-            if len(query_contacts) == 0:
-                continue
-            keep = self._sampled_target_contact_membership(
-                query_contacts,
-                target_points,
-                self.contact_match_distance_m,
+            query_count = self._validate_query_alignment(
+                masks, grasps, confidences, contacts
             )
-            selected_poses = np.asarray(query_poses[keep], dtype=np.float64)
-            selected_contacts = np.asarray(query_contacts[keep], dtype=np.float64)
-            selected_scores = np.asarray(query_scores[keep], dtype=np.float64)
-            for pose, contact, score in zip(
-                selected_poses, selected_contacts, selected_scores
-            ):
-                pose = self._rigid_grasp_pose(pose)
-                if pose is None:
-                    rejected_rotations += 1
+            # Ignore anonymous query masks for association. Retain grasps from
+            # every query only when their contact lies on the GT target cloud.
+            for query_idx in range(query_count):
+                query_poses = grasps[query_idx].detach().cpu().numpy()
+                query_scores = confidences[query_idx].detach().cpu().numpy()
+                query_contacts = contacts[query_idx].detach().cpu().numpy()
+                if len(query_contacts) == 0:
                     continue
+                keep = self._target_contact_membership(
+                    query_contacts,
+                    target_points,
+                    self.contact_match_distance_m,
+                )
+                if not np.any(keep):
+                    continue
+                queries_with_target_contacts += 1
+                selected_poses = np.asarray(query_poses[keep], dtype=np.float64)
+                selected_contacts = np.asarray(
+                    query_contacts[keep], dtype=np.float64
+                )
+                selected_scores = np.asarray(query_scores[keep], dtype=np.float64)
+                for pose, contact, score in zip(
+                    selected_poses, selected_contacts, selected_scores
+                ):
+                    pose = self._rigid_grasp_pose(pose)
+                    if pose is None:
+                        rejected_rotations += 1
+                        continue
 
-                # build_6d_grasp places the wrist at contact - depth * approach
-                # plus a learned half-width along the finger-closing axis. Repair
-                # the rotation first, then clamp that learned lateral offset.
-                anchor = contact - 0.1034 * pose[:3, 2]
-                lateral = pose[:3, 3] - anchor
-                lateral_norm = np.linalg.norm(lateral)
-                max_half_width = 0.045
-                scale = min(1.0, max_half_width / max(lateral_norm, 1e-12))
-                pose[:3, 3] = anchor + lateral * scale
-                poses.append(pose)
-                scores.append(float(score))
+                    # build_6d_grasp places the wrist at contact - depth * approach
+                    # plus a learned half-width along the finger-closing axis.
+                    # Repair rotation before clamping that learned lateral offset.
+                    anchor = contact - 0.1034 * pose[:3, 2]
+                    lateral = pose[:3, 3] - anchor
+                    lateral_norm = np.linalg.norm(lateral)
+                    max_half_width = 0.045
+                    scale = min(
+                        1.0, max_half_width / max(lateral_norm, 1e-12)
+                    )
+                    pose[:3, 3] = anchor + lateral * scale
+                    poses.append(pose)
+                    scores.append(float(score))
 
         if not poses:
-            best_iou = max((match.iou for match in query_matches), default=0.0)
             raise NoObjectQueryFailure(
-                f"M2T2 found no target candidates for the target-pose crop after "
-                f"{self.num_runs} runs (best query IoU={best_iou:.3f}, "
-                f"minimum={self.min_query_iou:.3f}, "
-                f"rejected_rotations={rejected_rotations})"
+                f"M2T2 found no grasp contacts on the segmented target after "
+                f"{self.num_runs} runs "
+                f"(rejected_rotations={rejected_rotations})"
             )
 
         score_range = f"{min(scores):.3f}..{max(scores):.3f}"
@@ -396,9 +363,7 @@ class RoboTwinM2T2Backend:
         distance_range = f"{min(distances):.3f}..{max(distances):.3f}m"
         print(
             f"[heuristic] M2T2 segmented-target candidates={len(poses)} "
-            f"query_iou={max((m.iou for m in query_matches), default=0.0):.3f} "
-            f"intersection={max((m.intersection for m in query_matches), default=0)} "
-            f"purity={max((m.purity for m in query_matches), default=0.0):.3f} "
+            f"target_queries={queries_with_target_contacts} "
             f"confidence={score_range} target_distance={distance_range} "
             f"rejected_rotations={rejected_rotations} "
             f"target_center={np.array2string(target_center, precision=3)}"

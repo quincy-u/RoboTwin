@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import transforms3d as t3d
 
-from policy.heuristic_baseline.runtime import QposActionBuffer, RoboTwinMinkIK
+from policy.heuristic_baseline.runtime import (
+    CANONICAL_COMMAND_QUATERNIONS,
+    M2T2_TO_ROBOTWIN,
+    PARALLEL_JAW_ROLL_SYMMETRY,
+    QposActionBuffer,
+    ReachabilityRankedGrasps,
+    RoboTwinMinkIK,
+)
+from simple_grasp.types import GraspCandidate, ObjectState
 
 I = np.eye(4)
 
@@ -47,6 +55,14 @@ class FakeSolver:
         return self.results.pop(0)
 
 
+class FakeGrasps:
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    def propose(self, observation, target):
+        return list(self.candidates)
+
+
 class MinkRuntimeTest(unittest.TestCase):
     def make_ik(self, results):
         fake = FakeSolver(results)
@@ -85,6 +101,51 @@ class MinkRuntimeTest(unittest.TestCase):
         np.testing.assert_allclose(result, goal)
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(ik.relaxed_successes, 1)
+
+    def test_canonical_orientation_outranks_higher_confidence_sideways_grasp(self):
+        axis_map = M2T2_TO_ROBOTWIN[:3, :3]
+        canonical_command = t3d.quaternions.quat2mat(
+            CANONICAL_COMMAND_QUATERNIONS["right"]
+        )
+        quarter_turn = np.array(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        canonical_pose = I.copy()
+        canonical_pose[:3, :3] = canonical_command @ axis_map.T
+        sideways_pose = I.copy()
+        sideways_pose[:3, :3] = canonical_command @ quarter_turn @ axis_map.T
+        candidates = [
+            GraspCandidate(sideways_pose, 0.99, "target"),
+            GraspCandidate(canonical_pose, 0.40, "target"),
+        ]
+        ranker = ReachabilityRankedGrasps(
+            FakeGrasps(candidates), "right", M2T2_TO_ROBOTWIN
+        )
+        target = ObjectState("target", I, 1)
+
+        ranked = ranker.propose(None, target)
+
+        np.testing.assert_allclose(
+            ranked[0].world_grasp_pose[:3, :3], canonical_pose[:3, :3]
+        )
+
+    def test_parallel_jaw_half_roll_has_same_orientation_error(self):
+        axis_map = M2T2_TO_ROBOTWIN[:3, :3]
+        canonical_command = t3d.quaternions.quat2mat(
+            CANONICAL_COMMAND_QUATERNIONS["left"]
+        )
+        canonical_pose = I.copy()
+        canonical_pose[:3, :3] = canonical_command @ axis_map.T
+        rolled_pose = I.copy()
+        rolled_pose[:3, :3] = (
+            canonical_command @ PARALLEL_JAW_ROLL_SYMMETRY @ axis_map.T
+        )
+        ranker = ReachabilityRankedGrasps(
+            FakeGrasps([]), "left", M2T2_TO_ROBOTWIN
+        )
+
+        self.assertAlmostEqual(ranker._orientation_error(canonical_pose), 0.0)
+        self.assertAlmostEqual(ranker._orientation_error(rolled_pose), 0.0)
 
     def test_qpos_buffer_keeps_inactive_arm_and_uses_joint_waypoints(self):
         goals = [np.full(6, value) for value in (0.1, 0.2, 0.3)]

@@ -12,20 +12,6 @@ from policy.heuristic_baseline.m2t2_backend import RoboTwinM2T2Backend
 
 
 class M2T2TargetAssociationTest(unittest.TestCase):
-    def test_matching_query_retains_index_and_sparse_mask_metrics(self) -> None:
-        masks = torch.tensor(
-            [[True, False, True, False], [True, True, False, False]],
-            dtype=torch.bool,
-        )
-        target_mask = torch.tensor([True, False, True, False], dtype=torch.bool)
-
-        match = RoboTwinM2T2Backend._matching_query(masks, target_mask)
-
-        self.assertEqual(match.query_idx, 0)
-        self.assertAlmostEqual(match.iou, 1.0)
-        self.assertEqual(match.intersection, 2)
-        self.assertAlmostEqual(match.purity, 1.0)
-
     def test_query_alignment_rejects_misaligned_collections(self) -> None:
         masks = torch.zeros((2, 4), dtype=torch.bool)
         poses = [np.zeros((1, 4, 4)), np.zeros((1, 4, 4))]
@@ -37,15 +23,15 @@ class M2T2TargetAssociationTest(unittest.TestCase):
                 masks, poses, scores, contacts
             )
 
-    def test_contact_filter_uses_exact_sampled_target_membership(self) -> None:
+    def test_contact_filter_uses_ground_truth_target_points(self) -> None:
         contacts = np.array(
             [[0.0, 0.0, 0.0], [0.0, 0.0, 9e-6], [0.0, 0.0, 2e-5]],
             dtype=np.float64,
         )
-        sampled_target = np.array([[0.0, 0.0, 0.0]], dtype=np.float64)
+        target_points = np.array([[0.0, 0.0, 0.0]], dtype=np.float64)
 
-        keep = RoboTwinM2T2Backend._sampled_target_contact_membership(
-            contacts, sampled_target, tolerance_m=1e-5
+        keep = RoboTwinM2T2Backend._target_contact_membership(
+            contacts, target_points, tolerance_m=1e-5
         )
 
         self.assertEqual(keep.tolist(), [True, True, False])
@@ -109,6 +95,21 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         np.testing.assert_array_equal(global_state[1], after[1])
         self.assertEqual(global_state[2:], after[2:])
 
+    def test_sampling_is_exactly_half_target_and_half_context(self) -> None:
+        backend = object.__new__(RoboTwinM2T2Backend)
+        backend.num_points = 8
+        backend._seed = 3
+        backend.reset()
+        membership = np.array(
+            [True, True, False, False, False, False, False, False]
+        )
+
+        indices = backend._sample_indices(membership)
+
+        self.assertEqual(len(indices), 8)
+        self.assertEqual(int(membership[indices].sum()), 4)
+        self.assertEqual(int((~membership[indices]).sum()), 4)
+
     def test_sampling_absent_target_is_a_visible_target_failure(self) -> None:
         backend = object.__new__(RoboTwinM2T2Backend)
         backend.num_points = 4
@@ -118,14 +119,13 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         with self.assertRaises(NoVisibleTargetFailure):
             backend._sample_indices(np.zeros(2, dtype=bool))
 
-    def test_predict_consumes_only_the_matched_query(self) -> None:
+    def test_predict_ignores_query_masks_and_uses_target_contact(self) -> None:
         backend = object.__new__(RoboTwinM2T2Backend)
         backend.num_points = 4
         backend.num_runs = 1
         backend._seed = 4
         backend.reset()
         backend.workspace_bounds = None
-        backend.min_query_iou = 0.01
         backend.contact_match_distance_m = 1e-5
         backend.torch = torch
         backend.device = torch.device("cpu")
@@ -146,12 +146,12 @@ class M2T2TargetAssociationTest(unittest.TestCase):
                     "grasping_masks": [
                         torch.tensor([[False] * 4, [True] * 4])
                     ],
-                    "grasps": [[wrong_pose, randomized_pose]],
+                    "grasps": [[randomized_pose, wrong_pose]],
                     "grasp_confidence": [
-                        [torch.tensor([0.1]), torch.tensor([0.9])]
+                        [torch.tensor([0.9]), torch.tensor([0.1])]
                     ],
                     "grasp_contacts": [
-                        [torch.zeros((1, 3)), torch.zeros((1, 3))]
+                        [torch.zeros((1, 3)), torch.tensor([[1.0, 0.0, 0.0]])]
                     ],
                 }
 
