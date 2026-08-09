@@ -25,6 +25,7 @@ fi
 "$UV" pip install --python "$PYTHON" \
     "hydra-core==$HYDRA_VERSION" \
     "omegaconf==$OMEGACONF_VERSION"
+"$UV" pip install --python "$PYTHON" "$SIMPLE_GRASP_ROOT"
 CUDA_HOME=${CUDA_HOME:-/software/cuda-13.0} \
     "$UV" pip install --python "$PYTHON" \
     "$SIMPLE_GRASP_ROOT/third_party/M2T2/pointnet2_ops" \

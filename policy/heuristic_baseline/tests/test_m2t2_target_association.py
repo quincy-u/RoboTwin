@@ -55,13 +55,15 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         backend.num_points = 8
         backend._seed = 17
         backend.reset()
-        labels = np.array([1, 1, 2, 2, 2, 2, 2, 2])
+        xyz = np.zeros((8, 3), dtype=np.float32)
+        xyz[2:] = 1.0
+        target_pose = np.eye(4)
         global_state = np.random.get_state()
 
-        first = backend._sample_indices(labels, instance_id=1)
-        backend._sample_indices(labels, instance_id=1)
+        first = backend._sample_indices(np.array([True, True, False, False, False, False, False, False]))
+        backend._sample_indices(np.array([True, True, False, False, False, False, False, False]))
         backend.reset()
-        replayed = backend._sample_indices(labels, instance_id=1)
+        replayed = backend._sample_indices(np.array([True, True, False, False, False, False, False, False]))
         after = np.random.get_state()
 
         np.testing.assert_array_equal(first, replayed)
@@ -76,7 +78,7 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         backend.reset()
 
         with self.assertRaises(NoVisibleTargetFailure):
-            backend._sample_indices(np.array([1, 1]), instance_id=2)
+            backend._sample_indices(np.zeros(2, dtype=bool))
 
     def test_predict_consumes_only_the_matched_query(self) -> None:
         backend = object.__new__(RoboTwinM2T2Backend)
@@ -120,8 +122,9 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         poses, scores = backend.predict(
             xyz,
             np.zeros((4, 3), dtype=np.float32),
-            np.ones(4, dtype=int),
-            1,
+            np.eye(4),
+            xyz,
+            np.ones(4, dtype=bool),
         )
         np.testing.assert_array_equal(torch.random.get_rng_state(), torch_state)
 
@@ -131,15 +134,19 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         replayed_poses, replayed_scores = backend.predict(
             xyz,
             np.zeros((4, 3), dtype=np.float32),
-            np.ones(4, dtype=int),
-            1,
+            np.eye(4),
+            xyz,
+            np.ones(4, dtype=bool),
         )
         np.testing.assert_array_equal(
             torch.random.get_rng_state(), perturbed_state
         )
 
         self.assertEqual(len(poses), 1)
-        self.assertAlmostEqual(poses[0][0, 3], 1.0)
+        anchor = -0.1034 * poses[0][:3, 2]
+        self.assertLessEqual(
+            np.linalg.norm(poses[0][:3, 3] - anchor), 0.045 + 1e-9
+        )
         np.testing.assert_allclose(scores, [0.9])
         np.testing.assert_allclose(replayed_poses, poses)
         np.testing.assert_allclose(replayed_scores, scores)

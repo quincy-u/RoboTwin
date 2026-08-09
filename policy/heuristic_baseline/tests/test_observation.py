@@ -46,6 +46,8 @@ class _Cameras:
     static_camera_list = [_Camera()]
 
     def get_object_masks(self, tracked):
+        if set(tracked) != {"bottle"}:
+            raise AssertionError(f"expected target-only mask request, got {set(tracked)}")
         return {
             "head_camera": {
                 "bottle": np.array([[True, False]], dtype=bool),
@@ -60,7 +62,7 @@ class _TaskEnv:
         self.actor = _Actor()
 
     def get_tracked_objects(self):
-        return {"bottle": self.actor}
+        return {"bottle": self.actor, "wall": self.actor}
 
 
 class ObservationTest(unittest.TestCase):

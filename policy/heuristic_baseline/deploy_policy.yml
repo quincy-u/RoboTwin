@@ -13,9 +13,16 @@ object_name: auto
 arm: auto
 min_confidence: 0.4
 max_candidates: 256
-pregrasp_offset_m: 0.10
-retreat_offset_m: 0.12
+pregrasp_offset_m: 0.05
+retreat_offset_m: 0.05
 max_waypoints_per_segment: 8
+max_joint_step_rad: 0.12
+mink_solver: daqp
+mink_dt: 0.05
+mink_max_iterations: 100
+mink_position_tolerance_m: 0.001
+mink_orientation_tolerance_rad: 0.01
+relax_orientation_on_failure: true
 
 # M2T2
 m2t2_checkpoint: checkpoints/m2t2.pth
@@ -28,5 +35,5 @@ mask_threshold: 0.4
 object_threshold: 0.4
 max_predictions: 512
 workspace_bounds: [-0.5, -0.5, 0.65, 0.5, 0.5, 1.4]
-min_query_iou: 0.01
+min_query_iou: 0.005
 contact_match_distance_m: 0.00001

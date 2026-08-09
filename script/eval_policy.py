@@ -266,6 +266,13 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        # Preserve the expert task annotation for policies that derive explicit
+        # manipulation targets from {A}, {B}, and {a}.
+        TASK_ENV.heuristic_task_info = dict(episode_info["info"])
+        from policy.heuristic_baseline.task_plan import task_plan_from_task
+        TASK_ENV.heuristic_task_plan = task_plan_from_task(
+            TASK_ENV, args["task_name"], TASK_ENV.heuristic_task_info
+        )
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])

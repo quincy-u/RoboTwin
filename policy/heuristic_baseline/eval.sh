@@ -4,11 +4,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
-task_name=${1:-shake_bottle}
-task_config=${2:-heuristic_smoke}
+task_name=${1}
+task_config=${2}
 seed=${3:-0}
 gpu_id=${4:-0}
-object_name=${5:-bottle}
+object_name=${5:-auto}
 test_num=${6:-1}
 
 if [[ "$task_config" == "heuristic_smoke" ]]; then

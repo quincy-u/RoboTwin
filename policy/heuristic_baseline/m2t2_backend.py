@@ -21,7 +21,7 @@ class QueryMatch:
     purity: float
 
 class RoboTwinM2T2Backend:
-    """Load M2T2 once and associate its object queries with simulator labels."""
+    """Load M2T2 once and associate object queries with a target rigid-frame crop."""
 
     _RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     _RGB_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -114,16 +114,17 @@ class RoboTwinM2T2Backend:
             self._seed = int(seed)
         self.rng = np.random.default_rng(self._seed)
 
-    def _sample_indices(self, labels: np.ndarray, instance_id: int) -> np.ndarray:
-        """Sample a scene while reserving points for the GT target instance."""
-        total = labels.shape[0]
+
+
+    def _sample_indices(self, target_membership: np.ndarray) -> np.ndarray:
+        """Sample a scene while reserving segmented target points."""
+        target_membership = np.asarray(target_membership, dtype=bool)
+        total = target_membership.shape[0]
         if total == 0:
             raise ValueError("cannot run M2T2 on an empty point cloud")
-        target = np.flatnonzero(labels == instance_id)
+        target = np.flatnonzero(target_membership)
         if target.size == 0:
-            raise NoVisibleTargetFailure(
-                f"target instance {instance_id} has no visible depth points"
-            )
+            raise NoVisibleTargetFailure("segmented target has no visible depth points")
 
         target_count = min(target.size, max(1, self.num_points // 4))
         target_idx = self.rng.choice(target, target_count, replace=False)
@@ -252,26 +253,35 @@ class RoboTwinM2T2Backend:
         self,
         xyz: np.ndarray,
         rgb: np.ndarray,
-        instance_labels: np.ndarray,
-        instance_id: int,
+        target_pose: np.ndarray,
+        target_points: np.ndarray,
+        target_membership: np.ndarray,
     ) -> tuple[list[np.ndarray], list[float]]:
         poses: list[np.ndarray] = []
         scores: list[float] = []
         query_matches: list[QueryMatch] = []
         xyz = np.asarray(xyz, dtype=np.float32)
         rgb = np.asarray(rgb, dtype=np.float32)
-        labels = np.asarray(instance_labels)
+        target_pose = np.asarray(target_pose, dtype=np.float64)
+        target_points = np.asarray(target_points, dtype=np.float32)
+        target_membership = np.asarray(target_membership, dtype=bool)
+        if target_pose.shape != (4, 4):
+            raise ValueError("target_pose must have shape (4, 4)")
+        if target_membership.shape != (len(xyz),):
+            raise ValueError("target_membership must align with xyz")
+        if target_points.ndim != 2 or target_points.shape[1:] != (3,):
+            raise ValueError("target_points must have shape (N, 3)")
         if self.workspace_bounds is not None:
             lower, upper = self.workspace_bounds[:3], self.workspace_bounds[3:]
             within = np.all((xyz >= lower) & (xyz <= upper), axis=1)
-            xyz, rgb, labels = xyz[within], rgb[within], labels[within]
-        if not np.any(labels == instance_id):
-            raise NoVisibleTargetFailure(
-                f"target instance {instance_id} has no visible depth points"
+            xyz, rgb, target_membership = (
+                xyz[within], rgb[within], target_membership[within]
             )
+        if not np.any(target_membership):
+            raise NoVisibleTargetFailure("segmented target has no visible depth points")
 
         for run_index in range(self.num_runs):
-            indices = self._sample_indices(labels, instance_id)
+            indices = self._sample_indices(target_membership)
             batch = self._input_batch(xyz, rgb, indices)
             torch_seed = (self._seed + run_index) % (2**63 - 1)
             cuda_devices: list[int] = []
@@ -293,7 +303,7 @@ class RoboTwinM2T2Backend:
             confidences = output["grasp_confidence"][0]
             contacts = output["grasp_contacts"][0]
             self._validate_query_alignment(masks, grasps, confidences, contacts)
-            target_mask = self.torch.from_numpy(labels[indices] == instance_id)
+            target_mask = self.torch.from_numpy(target_membership[indices])
             try:
                 match = self._matching_query(masks, target_mask)
             except NoObjectQueryFailure:
@@ -308,33 +318,46 @@ class RoboTwinM2T2Backend:
             query_contacts = contacts[match.query_idx].detach().cpu().numpy()
             if len(query_contacts) == 0:
                 continue
-            sampled_target_points = xyz[indices][labels[indices] == instance_id]
             keep = self._sampled_target_contact_membership(
                 query_contacts,
-                sampled_target_points,
+                target_points,
                 self.contact_match_distance_m,
             )
-            poses.extend(np.asarray(query_poses[keep], dtype=np.float64))
+            selected_poses = np.asarray(query_poses[keep], dtype=np.float64).copy()
+            selected_contacts = np.asarray(query_contacts[keep], dtype=np.float64)
+            # build_6d_grasp places the wrist at contact - depth * approach
+            # plus a learned half-width along the finger-closing axis.  Clamp
+            # that learned offset to the physical gripper half-width so an
+            # out-of-distribution prediction cannot move a valid contact far
+            # outside the robot workspace.
+            anchor = selected_contacts - 0.1034 * selected_poses[:, :3, 2]
+            lateral = selected_poses[:, :3, 3] - anchor
+            lateral_norm = np.linalg.norm(lateral, axis=1)
+            max_half_width = 0.045
+            scale = np.minimum(1.0, max_half_width / np.maximum(lateral_norm, 1e-12))
+            selected_poses[:, :3, 3] = anchor + lateral * scale[:, None]
+            poses.extend(selected_poses)
             scores.extend(np.asarray(query_scores[keep], dtype=np.float64).tolist())
 
         if not poses:
             best_iou = max((match.iou for match in query_matches), default=0.0)
             raise NoObjectQueryFailure(
-                f"M2T2 found no target candidates for instance {instance_id} after "
+                f"M2T2 found no target candidates for the target-pose crop after "
                 f"{self.num_runs} runs (best query IoU={best_iou:.3f}, "
                 f"minimum={self.min_query_iou:.3f})"
             )
 
         score_range = f"{min(scores):.3f}..{max(scores):.3f}"
-        target_points = xyz[labels == instance_id]
-        target_center = target_points.mean(axis=0)
+        visible_target_points = xyz[target_membership]
+        target_center = visible_target_points.mean(axis=0)
         distances = [np.linalg.norm(pose[:3, 3] - target_center) for pose in poses]
         distance_range = f"{min(distances):.3f}..{max(distances):.3f}m"
         print(
-            f"[heuristic] M2T2 target={instance_id} candidates={len(poses)} "
+            f"[heuristic] M2T2 segmented-target candidates={len(poses)} "
             f"query_iou={max((m.iou for m in query_matches), default=0.0):.3f} "
             f"intersection={max((m.intersection for m in query_matches), default=0)} "
             f"purity={max((m.purity for m in query_matches), default=0.0):.3f} "
-            f"confidence={score_range} target_distance={distance_range}"
+            f"confidence={score_range} target_distance={distance_range} "
+            f"target_center={np.array2string(target_center, precision=3)}"
         )
         return poses, scores

@@ -19,6 +19,40 @@ def _instance_id(actor: Any, fallback: int) -> int:
     return fallback if instance_id is None else int(instance_id)
 
 
+def _actor_dataset_label(actor: Any) -> str | None:
+    modelname = getattr(actor, "modelname", None)
+    model_id = getattr(actor, "model_id", None)
+    if not modelname:
+        return None
+    suffix = 0 if model_id is None or model_id == "" else model_id
+    return f"{modelname}/base{suffix}"
+
+
+def _resolve_target_name(
+    task_env: Any, tracked: dict[str, Any], requested: str
+) -> str | None:
+    if requested != "auto":
+        return requested if requested in tracked else None
+    task_plan = getattr(task_env, "heuristic_task_plan", None)
+    if task_plan is not None:
+        primary_name = task_plan.primary_target
+        if primary_name in tracked:
+            return primary_name
+        primary_label = None
+    else:
+        task_info = getattr(task_env, "heuristic_task_info", {}) or {}
+        primary_label = task_info.get("{A}")
+    if primary_label:
+        matches = [
+            name for name, actor in tracked.items()
+            if _actor_dataset_label(actor) == primary_label
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    candidates = [name for name in tracked if name != "wall"]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _object_states(
     tracked: dict[str, Any], instance_ids: dict[str, int], object_state_type: type
 ) -> dict[str, "ObjectState"]:
@@ -121,8 +155,9 @@ def encode_obs(
     observation: dict,
     *,
     simple_grasp_root: str | Path | None = None,
+    target_name: str = "auto",
 ) -> "SceneObservation":
-    """Build an RGB point cloud with GT instance labels and 6D object poses."""
+    """Build an RGB-D point cloud, GT segmentation, and tracked 6D object poses."""
     ensure_simple_grasp_importable(simple_grasp_root)
     from simple_grasp.types import ObjectState, SceneObservation
 
@@ -146,19 +181,28 @@ def encode_obs(
         for name, actor in (task_env.get_tracked_objects() or {}).items()
         if actor is not None
     }
-    masks = task_env.cameras.get_object_masks(tracked)["head_camera"]
     instance_ids = {
         name: _instance_id(actor, fallback=-(index + 2))
         for index, (name, actor) in enumerate(tracked.items())
     }
+    selected_target = _resolve_target_name(task_env, tracked, target_name)
+
     labels = np.full(depth_m.shape, -1, dtype=np.int64)
-    for name in tracked:
-        labels[np.asarray(masks[name], dtype=bool)] = instance_ids[name]
+    if selected_target is not None:
+        target_only = {selected_target: tracked[selected_target]}
+        target_mask = task_env.cameras.get_object_masks(target_only)["head_camera"]
+        labels[np.asarray(target_mask[selected_target], dtype=bool)] = (
+            instance_ids[selected_target]
+        )
 
     return SceneObservation(
         xyz=xyz,
         rgb=rgb_image.reshape(-1, 3)[valid],
         instance_labels=labels.reshape(-1)[valid],
         camera_pose=camera_to_world,
-        objects=_object_states(tracked, instance_ids, ObjectState),
+        objects=_object_states(
+            ({selected_target: tracked[selected_target]} if selected_target else tracked),
+            instance_ids,
+            ObjectState,
+        ),
     )

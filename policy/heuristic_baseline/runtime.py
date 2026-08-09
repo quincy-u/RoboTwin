@@ -9,6 +9,7 @@ import numpy as np
 import transforms3d as t3d
 
 from simple_grasp.m2t2_adapter import M2T2GraspGenerator
+from simple_grasp.mink_ik import MinkArmConfig, MinkIKConfig, MinkIKSolver
 from simple_grasp.policy import PolicyConfig, SimpleGraspPolicy
 from simple_grasp.types import GraspCandidate, ObjectState, SceneObservation
 
@@ -20,6 +21,9 @@ M2T2_TO_ROBOTWIN = np.array(
     [
         [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
+        # M2T2's pose origin is already shifted 0.1034 m from the predicted
+        # contact by build_6d_grasp().  This is only the remaining calibrated
+        # offset from that wrist frame to RoboTwin's gripper command frame.
         [1.0, 0.0, 0.0, -0.0166],
         [0.0, 0.0, 0.0, 1.0],
     ],
@@ -49,73 +53,86 @@ class SceneSnapshot:
             ) from exc
 
 
-class RoboTwinPlannerIK:
-    """Use RoboTwin's collision-aware planner as the pose feasibility check."""
+class RoboTwinMinkIK:
+    """Mink pose IK with joint-space interpolation for RoboTwin qpos control."""
 
-    def __init__(self, task_env: Any, grasp_to_robotwin: np.ndarray) -> None:
+    def __init__(
+        self,
+        task_env: Any,
+        grasp_to_robotwin: np.ndarray,
+        *,
+        model_path: str | Path,
+        max_joint_step_rad: float = 0.12,
+        max_waypoints_per_segment: int = 8,
+        relax_orientation_on_failure: bool = True,
+        ik_config: MinkIKConfig | None = None,
+    ) -> None:
         self.task_env = task_env
         transform = np.asarray(grasp_to_robotwin, dtype=np.float64)
         if transform.shape != (4, 4):
             raise ValueError("grasp_to_robotwin must have shape (4, 4)")
+        if max_joint_step_rad <= 0.0 or max_waypoints_per_segment < 2:
+            raise ValueError("invalid joint interpolation configuration")
         self.grasp_to_robotwin = transform
-        self.calls = 0
-        self.successes = 0
-        self.failures: dict[str, int] = {}
-        self.first_target: np.ndarray | None = None
-        self._stage = 0
-        self._candidate_seed: np.ndarray | None = None
+        self.max_joint_step_rad = float(max_joint_step_rad)
+        self.max_waypoints_per_segment = int(max_waypoints_per_segment)
+        self.relax_orientation_on_failure = bool(relax_orientation_on_failure)
+        robot = task_env.robot
+        arms = {
+            "left": MinkArmConfig(
+                "fl_link6", tuple(robot.left_arm_joints_name), frame_type="body"
+            ),
+            "right": MinkArmConfig(
+                "fr_link6", tuple(robot.right_arm_joints_name), frame_type="body"
+            ),
+        }
+        self._candidate_seed: dict[str, np.ndarray] = {}
         self._candidate_paths: list[np.ndarray] = []
         self._completed_paths: list[np.ndarray] = []
+        self.solver = MinkIKSolver.from_xml_path(
+            model_path,
+            arms,
+            self._joint_positions,
+            world_from_model=self._world_from_model,
+            config=ik_config or MinkIKConfig(),
+        )
+        self.reset_stats()
+
+    def _joint_positions(self, arm: str) -> np.ndarray:
+        if arm in self._candidate_seed:
+            return self._candidate_seed[arm].copy()
+        state = getattr(self.task_env.robot, f"get_{arm}_arm_jointState")()
+        return np.asarray(state[:-1], dtype=np.float64)
+
+    def _world_from_model(self, arm: str) -> np.ndarray:
+        pose = getattr(self.task_env.robot, f"{arm}_entity_origion_pose")
+        return np.asarray(pose.to_transformation_matrix(), dtype=np.float64)
 
     def reset_stats(self) -> None:
         self.calls = 0
+        self.planner_attempts = 0
         self.successes = 0
-        self.failures = {}
-        self.first_target = None
+        self.relaxed_successes = 0
+        self.over_limit_successes = 0
+        self.failures: dict[str, int] = {}
+        self.first_target: np.ndarray | None = None
         self._stage = 0
-        self._candidate_seed = None
+        self._candidate_seed = {}
         self._candidate_paths = []
         self._completed_paths = []
 
-    def _initial_seed(self, arm: str) -> np.ndarray:
-        entity = getattr(self.task_env.robot, f"{arm}_entity")
-        return np.asarray(entity.get_qpos()).copy()
-
-    def _arm_joint_indices(self, arm: str, arm_dim: int) -> np.ndarray:
-        """Map planner arm columns into the full articulation qpos."""
-        robot = self.task_env.robot
-        entity = getattr(robot, f"{arm}_entity")
-        arm_names = list(getattr(robot, f"{arm}_arm_joints_name", []))
-        all_names: list[str] = []
-        if arm_names and hasattr(entity, "get_active_joints"):
-            all_names = [joint.get_name() for joint in entity.get_active_joints()]
-        if not arm_names or not all_names:
-            planner = getattr(robot, f"{arm}_planner", None)
-            if planner is not None:
-                arm_names = list(getattr(planner, "active_joints_name", []))
-                all_names = list(getattr(planner, "all_joints", []))
-        if not arm_names or not all_names:
-            if len(entity.get_qpos()) == arm_dim:
-                return np.arange(arm_dim)
-            raise ValueError(f"cannot map {arm} planner joints into full qpos")
-        try:
-            indices = np.asarray([all_names.index(name) for name in arm_names])
-        except ValueError as exc:
-            raise ValueError(f"{arm} planner joint names do not match the robot") from exc
-        if len(indices) != arm_dim:
-            raise ValueError(
-                f"{arm} planner returned {arm_dim} joints but maps {len(indices)}"
-            )
-        return indices
+    def _path(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
+        delta = float(np.max(np.abs(target - start)))
+        steps = max(2, int(np.ceil(delta / self.max_joint_step_rad)))
+        steps = min(steps, self.max_waypoints_per_segment)
+        return np.linspace(start, target, steps + 1, dtype=np.float64)[1:]
 
     def consume_path(self, arm: str, target: np.ndarray) -> np.ndarray | None:
-        """Return a path only after all three IK stages have succeeded."""
         if not self._completed_paths:
             return None
         path = self._completed_paths.pop(0)
-        arm_dim = len(getattr(self.task_env.robot, f"get_{arm}_arm_jointState")()) - 1
-        if not np.allclose(path[-1, :arm_dim], target):
-            raise ValueError("planner path endpoint does not match the policy target")
+        if not np.allclose(path[-1], target):
+            raise ValueError("Mink path endpoint does not match the policy target")
         return path
 
     def solve(self, arm: str, world_grasp_pose: np.ndarray) -> np.ndarray | None:
@@ -123,44 +140,56 @@ class RoboTwinPlannerIK:
         stage = self._stage
         self._stage = (self._stage + 1) % 3
         if stage == 0:
-            self._candidate_seed = self._initial_seed(arm)
+            self._candidate_seed = {arm: self._joint_positions(arm)}
             self._candidate_paths = []
             self._completed_paths = []
-        if self._candidate_seed is None:
+        if arm not in self._candidate_seed:
             return None
 
         target = np.asarray(world_grasp_pose, dtype=np.float64) @ self.grasp_to_robotwin
         if self.first_target is None:
             self.first_target = target.copy()
-        quat = t3d.quaternions.mat2quat(target[:3, :3])
-        pose = np.concatenate((target[:3, 3], quat))
-        planner = getattr(self.task_env.robot, f"{arm}_plan_path")
-        result = planner(pose, last_qpos=self._candidate_seed)
-        if result is None or result.get("status") != "Success":
-            status = "None" if result is None else str(result.get("status"))
-            self.failures[status] = self.failures.get(status, 0) + 1
-            self._candidate_seed = None
+        frame_rotation = (
+            np.asarray(getattr(self.task_env.robot, f"{arm}_global_trans_matrix"))
+            @ np.asarray(getattr(self.task_env.robot, f"{arm}_delta_matrix"))
+        )
+        mink_target = target.copy()
+        mink_target[:3, :3] = target[:3, :3] @ np.linalg.inv(frame_rotation)
+        self.planner_attempts += 1
+        joints = self.solver.solve(arm, mink_target)
+        if joints is None and self.relax_orientation_on_failure:
+            canonical_quat = np.asarray(
+                [-0.353523, 0.61239, -0.353524, -0.61239]
+                if arm == "right"
+                else [-0.61239, 0.353523, -0.61239, -0.353524],
+                dtype=np.float64,
+            )
+            canonical = target.copy()
+            canonical[:3, :3] = (
+                t3d.quaternions.quat2mat(canonical_quat)
+                @ np.linalg.inv(frame_rotation)
+            )
+            self.planner_attempts += 1
+            joints = self.solver.solve(arm, canonical)
+            if joints is not None:
+                self.relaxed_successes += 1
+        if joints is None:
+            self.failures["NoSolution"] = self.failures.get("NoSolution", 0) + 1
+            self._candidate_seed = {}
             self._candidate_paths = []
             return None
-        self.successes += 1
 
-        arm_state = getattr(self.task_env.robot, f"get_{arm}_arm_jointState")()
-        arm_dim = len(arm_state) - 1
-        path = np.asarray(result["position"], dtype=np.float64)
-        if path.ndim != 2 or path.shape[0] == 0 or path.shape[1] != arm_dim:
-            raise ValueError("planner returned an invalid position path")
-        if not np.all(np.isfinite(path)):
-            raise ValueError("planner returned non-finite joint positions")
-        self._candidate_paths.append(path.copy())
-        joint_indices = self._arm_joint_indices(arm, arm_dim)
-        next_seed = self._candidate_seed.copy()
-        next_seed[joint_indices] = path[-1]
-        self._candidate_seed = next_seed
+        joints = np.asarray(joints, dtype=np.float64)
+        start = self._candidate_seed[arm]
+        path = self._path(start, joints)
+        self._candidate_paths.append(path)
+        self._candidate_seed[arm] = joints.copy()
+        self.successes += 1
         if stage == 2:
-            self._completed_paths = [path.copy() for path in self._candidate_paths]
+            self._completed_paths = [item.copy() for item in self._candidate_paths]
             self._candidate_paths = []
-            self._candidate_seed = None
-        return path[-1, :arm_dim].copy()
+            self._candidate_seed = {}
+        return joints.copy()
 
 
 class QposActionBuffer:
@@ -169,7 +198,7 @@ class QposActionBuffer:
     def __init__(
         self,
         task_env: Any,
-        planner_ik: RoboTwinPlannerIK,
+        planner_ik: RoboTwinMinkIK,
         *,
         max_waypoints_per_segment: int = 8,
     ) -> None:
@@ -275,7 +304,11 @@ class ReachabilityRankedGrasps:
 
         ranked = []
         for candidate in candidates:
-            pose = candidate.world_grasp_pose
+            pose = np.array(candidate.world_grasp_pose, dtype=np.float64, copy=True)
+            approximate_contact_center = pose[:3, 3] + 0.1034 * pose[:3, 2]
+            target_center = target.world_pose[:3, 3]
+            if np.linalg.norm(approximate_contact_center - target_center) > 0.08:
+                pose[:3, 3] = target_center - 0.1034 * pose[:3, 2]
             approach_alignment = float(pose[:3, 2] @ toward_object)
             robot_side = float(
                 (target.world_pose[:3, 3] - pose[:3, 3]) @ toward_object
@@ -306,6 +339,10 @@ class RoboTwinHeuristicRuntime:
         automatic_arm: bool,
         grasp_to_robotwin: np.ndarray,
         max_waypoints_per_segment: int = 8,
+        max_joint_step_rad: float = 0.12,
+        mink_model_path: str | Path | None = None,
+        mink_config: MinkIKConfig | None = None,
+        relax_orientation_on_failure: bool = True,
     ) -> None:
         self.task_env = task_env
         self.grasps = grasps
@@ -313,7 +350,21 @@ class RoboTwinHeuristicRuntime:
         self.automatic_target = automatic_target
         self.automatic_arm = automatic_arm
         self.simulator = SceneSnapshot()
-        self.ik = RoboTwinPlannerIK(task_env, grasp_to_robotwin)
+        if mink_model_path is None:
+            mink_model_path = (
+                Path(__file__).resolve().parents[2]
+                / "assets" / "embodiments" / "aloha-agilex"
+                / "urdf" / "arx5_description_isaac.urdf"
+            )
+        self.ik = RoboTwinMinkIK(
+            task_env,
+            grasp_to_robotwin,
+            model_path=mink_model_path,
+            max_joint_step_rad=max_joint_step_rad,
+            max_waypoints_per_segment=max_waypoints_per_segment,
+            relax_orientation_on_failure=relax_orientation_on_failure,
+            ik_config=mink_config,
+        )
         self.controller = QposActionBuffer(
             task_env,
             self.ik,
@@ -361,8 +412,11 @@ class RoboTwinHeuristicRuntime:
             if str(exc) != "M2T2 returned no grasp with complete feasible IK solutions":
                 raise
             raise NoFeasiblePlanFailure(
-                f"{exc}; RoboTwin planner accepted {self.ik.successes}/"
-                f"{self.ik.calls} pose checks; failures={self.ik.failures}; "
+                f"{exc}; Mink IK accepted {self.ik.successes}/"
+                f"{self.ik.calls} stages across {self.ik.planner_attempts} attempts "
+                f"({self.ik.relaxed_successes} canonical retries); "
+                f"failures={self.ik.failures}; "
+                f"target_position={np.array2string(target.world_pose[:3, 3], precision=3)}; "
                 f"first_target={np.array2string(self.ik.first_target, precision=3)}"
             ) from exc
         return self.controller.actions
@@ -425,5 +479,21 @@ def create_runtime(
         grasp_to_robotwin=transform,
         max_waypoints_per_segment=int(
             usr_args.get("max_waypoints_per_segment", 8)
+        ),
+        max_joint_step_rad=float(usr_args.get("max_joint_step_rad", 0.12)),
+        mink_model_path=usr_args.get("mink_model_path"),
+        mink_config=MinkIKConfig(
+            solver=str(usr_args.get("mink_solver", "daqp")),
+            dt=float(usr_args.get("mink_dt", 0.05)),
+            max_iterations=int(usr_args.get("mink_max_iterations", 100)),
+            position_tolerance_m=float(
+                usr_args.get("mink_position_tolerance_m", 1e-3)
+            ),
+            orientation_tolerance_rad=float(
+                usr_args.get("mink_orientation_tolerance_rad", 1e-2)
+            ),
+        ),
+        relax_orientation_on_failure=bool(
+            usr_args.get("relax_orientation_on_failure", True)
         ),
     )

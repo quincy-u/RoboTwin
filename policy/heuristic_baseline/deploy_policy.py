@@ -19,6 +19,7 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
                 task_env,
                 observation,
                 simple_grasp_root=model.simple_grasp_root,
+                target_name=str(getattr(model, "usr_args", {}).get("object_name", "auto")),
             ),
             task_env=task_env,
         )
