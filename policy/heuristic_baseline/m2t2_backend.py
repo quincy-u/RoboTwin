@@ -249,6 +249,39 @@ class RoboTwinM2T2Backend:
             keep[start : start + len(chunk)] = np.any(distance_sq <= tolerance_sq, axis=1)
         return keep
 
+    @staticmethod
+    def _rigid_grasp_pose(
+        pose: np.ndarray, *, max_projection_error: float = 1e-3
+    ) -> np.ndarray | None:
+        """Project small float drift to SO(3), rejecting malformed frames."""
+        pose = np.asarray(pose, dtype=np.float64)
+        if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
+            return None
+        if not np.allclose(
+            pose[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8, rtol=0.0
+        ):
+            return None
+
+        rotation = pose[:3, :3]
+        try:
+            u, _, vh = np.linalg.svd(rotation)
+        except np.linalg.LinAlgError:
+            return None
+        handedness = np.eye(3)
+        handedness[-1, -1] = np.sign(np.linalg.det(u @ vh))
+        projected = u @ handedness @ vh
+        if (
+            not np.all(np.isfinite(projected))
+            or np.linalg.norm(rotation - projected, ord="fro")
+            > max_projection_error
+        ):
+            return None
+
+        result = pose.copy()
+        result[:3, :3] = projected
+        result[3] = [0.0, 0.0, 0.0, 1.0]
+        return result
+
     def predict(
         self,
         xyz: np.ndarray,
@@ -260,6 +293,7 @@ class RoboTwinM2T2Backend:
         poses: list[np.ndarray] = []
         scores: list[float] = []
         query_matches: list[QueryMatch] = []
+        rejected_rotations = 0
         xyz = np.asarray(xyz, dtype=np.float32)
         rgb = np.asarray(rgb, dtype=np.float32)
         target_pose = np.asarray(target_pose, dtype=np.float64)
@@ -323,28 +357,36 @@ class RoboTwinM2T2Backend:
                 target_points,
                 self.contact_match_distance_m,
             )
-            selected_poses = np.asarray(query_poses[keep], dtype=np.float64).copy()
+            selected_poses = np.asarray(query_poses[keep], dtype=np.float64)
             selected_contacts = np.asarray(query_contacts[keep], dtype=np.float64)
-            # build_6d_grasp places the wrist at contact - depth * approach
-            # plus a learned half-width along the finger-closing axis.  Clamp
-            # that learned offset to the physical gripper half-width so an
-            # out-of-distribution prediction cannot move a valid contact far
-            # outside the robot workspace.
-            anchor = selected_contacts - 0.1034 * selected_poses[:, :3, 2]
-            lateral = selected_poses[:, :3, 3] - anchor
-            lateral_norm = np.linalg.norm(lateral, axis=1)
-            max_half_width = 0.045
-            scale = np.minimum(1.0, max_half_width / np.maximum(lateral_norm, 1e-12))
-            selected_poses[:, :3, 3] = anchor + lateral * scale[:, None]
-            poses.extend(selected_poses)
-            scores.extend(np.asarray(query_scores[keep], dtype=np.float64).tolist())
+            selected_scores = np.asarray(query_scores[keep], dtype=np.float64)
+            for pose, contact, score in zip(
+                selected_poses, selected_contacts, selected_scores
+            ):
+                pose = self._rigid_grasp_pose(pose)
+                if pose is None:
+                    rejected_rotations += 1
+                    continue
+
+                # build_6d_grasp places the wrist at contact - depth * approach
+                # plus a learned half-width along the finger-closing axis. Repair
+                # the rotation first, then clamp that learned lateral offset.
+                anchor = contact - 0.1034 * pose[:3, 2]
+                lateral = pose[:3, 3] - anchor
+                lateral_norm = np.linalg.norm(lateral)
+                max_half_width = 0.045
+                scale = min(1.0, max_half_width / max(lateral_norm, 1e-12))
+                pose[:3, 3] = anchor + lateral * scale
+                poses.append(pose)
+                scores.append(float(score))
 
         if not poses:
             best_iou = max((match.iou for match in query_matches), default=0.0)
             raise NoObjectQueryFailure(
                 f"M2T2 found no target candidates for the target-pose crop after "
                 f"{self.num_runs} runs (best query IoU={best_iou:.3f}, "
-                f"minimum={self.min_query_iou:.3f})"
+                f"minimum={self.min_query_iou:.3f}, "
+                f"rejected_rotations={rejected_rotations})"
             )
 
         score_range = f"{min(scores):.3f}..{max(scores):.3f}"
@@ -358,6 +400,7 @@ class RoboTwinM2T2Backend:
             f"intersection={max((m.intersection for m in query_matches), default=0)} "
             f"purity={max((m.purity for m in query_matches), default=0.0):.3f} "
             f"confidence={score_range} target_distance={distance_range} "
+            f"rejected_rotations={rejected_rotations} "
             f"target_center={np.array2string(target_center, precision=3)}"
         )
         return poses, scores

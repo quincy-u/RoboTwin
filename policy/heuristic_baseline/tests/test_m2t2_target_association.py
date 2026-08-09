@@ -50,6 +50,44 @@ class M2T2TargetAssociationTest(unittest.TestCase):
 
         self.assertEqual(keep.tolist(), [True, True, False])
 
+    def test_rigid_grasp_pose_projects_m2t2_float_drift(self) -> None:
+        pose = np.eye(4)
+        pose[:3, :3] = np.array(
+            [
+                [0.1125166267, -0.6069677472, 0.7867243290],
+                [-0.9931591153, -0.0438179709, 0.1082058400],
+                [-0.0312226918, -0.7935174108, -0.6077468395],
+            ]
+        )
+        pose[:3, 3] = [0.1, -0.2, 0.3]
+
+        rigid = RoboTwinM2T2Backend._rigid_grasp_pose(pose)
+
+        self.assertIsNotNone(rigid)
+        np.testing.assert_allclose(rigid[:3, :3].T @ rigid[:3, :3], np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(np.linalg.det(rigid[:3, :3]), 1.0)
+        np.testing.assert_array_equal(rigid[:3, 3], pose[:3, 3])
+        np.testing.assert_array_equal(rigid[3], pose[3])
+
+    def test_rigid_grasp_pose_rejects_grossly_invalid_frames(self) -> None:
+        invalid = []
+        reflection = np.eye(4)
+        reflection[0, 0] = -1.0
+        invalid.append(reflection)
+        scaled = np.eye(4)
+        scaled[0, 0] = 2.0
+        invalid.append(scaled)
+        degenerate = np.eye(4)
+        degenerate[2, :3] = 0.0
+        invalid.append(degenerate)
+        nonfinite = np.eye(4)
+        nonfinite[0, 0] = np.nan
+        invalid.append(nonfinite)
+
+        for pose in invalid:
+            with self.subTest(pose=pose):
+                self.assertIsNone(RoboTwinM2T2Backend._rigid_grasp_pose(pose))
+
     def test_reset_replays_private_sampling_without_global_rng(self) -> None:
         backend = object.__new__(RoboTwinM2T2Backend)
         backend.num_points = 8
@@ -102,6 +140,7 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         class FakeModel:
             def infer(self, batch, config):
                 randomized_pose = matched_pose.clone()
+                randomized_pose[0, 0, 1] = 5e-5
                 randomized_pose[0, 1, 3] = torch.randperm(100)[0].float()
                 return {
                     "grasping_masks": [
@@ -143,6 +182,10 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         )
 
         self.assertEqual(len(poses), 1)
+        np.testing.assert_allclose(
+            poses[0][:3, :3].T @ poses[0][:3, :3], np.eye(3), atol=1e-12
+        )
+        self.assertAlmostEqual(np.linalg.det(poses[0][:3, :3]), 1.0)
         anchor = -0.1034 * poses[0][:3, 2]
         self.assertLessEqual(
             np.linalg.norm(poses[0][:3, 3] - anchor), 0.045 + 1e-9
