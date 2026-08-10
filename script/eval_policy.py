@@ -129,6 +129,8 @@ def main(usr_args):
         f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}{seed_tag}"
     )
     save_dir.mkdir(parents=True, exist_ok=True)
+    # Policies can write diagnostics beside this evaluation result file.
+    usr_args["eval_save_dir"] = str(save_dir.resolve())
 
     if args["eval_video_log"]:
         video_save_dir = save_dir

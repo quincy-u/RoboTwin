@@ -9,11 +9,23 @@ import numpy as np
 
 from .errors import NoObjectQueryFailure, NoVisibleTargetFailure
 
+
 class RoboTwinM2T2Backend:
     """Load M2T2 and retain grasps whose contacts lie on the GT target cloud."""
 
     _RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     _RGB_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    @staticmethod
+    def _empty_trace() -> dict[str, np.ndarray]:
+        """Return an empty, shape-stable trace for grasp visualization."""
+        return {
+            "poses": np.empty((0, 4, 4), dtype=np.float64),
+            "scores": np.empty(0, dtype=np.float64),
+            "contacts": np.empty((0, 3), dtype=np.float64),
+            "target_contacts": np.empty(0, dtype=bool),
+            "query_ids": np.empty((0, 2), dtype=np.int64),
+        }
 
     def __init__(
         self,
@@ -98,6 +110,7 @@ class RoboTwinM2T2Backend:
         if seed is not None:
             self._seed = int(seed)
         self.rng = np.random.default_rng(self._seed)
+        self.last_trace = self._empty_trace()
 
     def _sample_indices(self, target_membership: np.ndarray) -> np.ndarray:
         """Sample exactly half target points and half non-target context."""
@@ -259,6 +272,12 @@ class RoboTwinM2T2Backend:
     ) -> tuple[list[np.ndarray], list[float]]:
         poses: list[np.ndarray] = []
         scores: list[float] = []
+        trace_poses: list[np.ndarray] = []
+        trace_scores: list[float] = []
+        trace_contacts: list[np.ndarray] = []
+        trace_target_contacts: list[bool] = []
+        trace_query_ids: list[tuple[int, int]] = []
+        self.last_trace = self._empty_trace()
         rejected_rotations = 0
         queries_with_target_contacts = 0
         xyz = np.asarray(xyz, dtype=np.float32)
@@ -319,25 +338,21 @@ class RoboTwinM2T2Backend:
                     target_points,
                     self.contact_match_distance_m,
                 )
-                if not np.any(keep):
-                    continue
-                queries_with_target_contacts += 1
-                selected_poses = np.asarray(query_poses[keep], dtype=np.float64)
-                selected_contacts = np.asarray(
-                    query_contacts[keep], dtype=np.float64
-                )
-                selected_scores = np.asarray(query_scores[keep], dtype=np.float64)
-                for pose, contact, score in zip(
-                    selected_poses, selected_contacts, selected_scores
+                if np.any(keep):
+                    queries_with_target_contacts += 1
+                for pose, contact, score, is_target_contact in zip(
+                    query_poses, query_contacts, query_scores, keep
                 ):
                     pose = self._rigid_grasp_pose(pose)
                     if pose is None:
-                        rejected_rotations += 1
+                        if is_target_contact:
+                            rejected_rotations += 1
                         continue
 
                     # build_6d_grasp places the wrist at contact - depth * approach
                     # plus a learned half-width along the finger-closing axis.
                     # Repair rotation before clamping that learned lateral offset.
+                    contact = np.asarray(contact, dtype=np.float64)
                     anchor = contact - 0.1034 * pose[:3, 2]
                     lateral = pose[:3, 3] - anchor
                     lateral_norm = np.linalg.norm(lateral)
@@ -346,8 +361,22 @@ class RoboTwinM2T2Backend:
                         1.0, max_half_width / max(lateral_norm, 1e-12)
                     )
                     pose[:3, 3] = anchor + lateral * scale
-                    poses.append(pose)
-                    scores.append(float(score))
+                    trace_poses.append(pose.copy())
+                    trace_scores.append(float(score))
+                    trace_contacts.append(contact.copy())
+                    trace_target_contacts.append(bool(is_target_contact))
+                    trace_query_ids.append((run_index, query_idx))
+                    if is_target_contact:
+                        poses.append(pose)
+                        scores.append(float(score))
+
+        self.last_trace = {
+            "poses": np.asarray(trace_poses, dtype=np.float64).reshape(-1, 4, 4),
+            "scores": np.asarray(trace_scores, dtype=np.float64),
+            "contacts": np.asarray(trace_contacts, dtype=np.float64).reshape(-1, 3),
+            "target_contacts": np.asarray(trace_target_contacts, dtype=bool),
+            "query_ids": np.asarray(trace_query_ids, dtype=np.int64).reshape(-1, 2),
+        }
 
         if not poses:
             raise NoObjectQueryFailure(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -13,8 +15,13 @@ from policy.heuristic_baseline.runtime import (
     QposActionBuffer,
     ReachabilityRankedGrasps,
     RoboTwinMinkIK,
+    save_grasp_visualization,
 )
-from simple_grasp.types import GraspCandidate, ObjectState
+from simple_grasp.types import (
+    GraspCandidate,
+    ObjectState,
+    SceneObservation,
+)
 
 I = np.eye(4)
 
@@ -102,6 +109,24 @@ class MinkRuntimeTest(unittest.TestCase):
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(ik.relaxed_successes, 1)
 
+    def test_records_exact_mink_accepted_grasp_command(self):
+        goals = [np.full(6, value) for value in (0.1, 0.2, 0.3)]
+        ik, _ = self.make_ik([goals[0], None, goals[1], goals[2]])
+
+        actual = [ik.solve("right", I) for _ in range(3)]
+
+        for result, expected in zip(actual, goals):
+            np.testing.assert_allclose(result, expected)
+        accepted = ik.selected_grasp_command_pose
+        self.assertIsNotNone(accepted)
+        np.testing.assert_allclose(
+            accepted[:3, :3],
+            t3d.quaternions.quat2mat(
+                CANONICAL_COMMAND_QUATERNIONS["right"]
+            ),
+        )
+        np.testing.assert_allclose(accepted[:3, 3], np.zeros(3))
+
     def test_canonical_orientation_outranks_higher_confidence_sideways_grasp(self):
         axis_map = M2T2_TO_ROBOTWIN[:3, :3]
         canonical_command = t3d.quaternions.quat2mat(
@@ -128,6 +153,8 @@ class MinkRuntimeTest(unittest.TestCase):
         np.testing.assert_allclose(
             ranked[0].world_grasp_pose[:3, :3], canonical_pose[:3, :3]
         )
+        self.assertEqual(len(ranker.last_candidates), 2)
+        self.assertIs(ranker.last_candidates[0], ranked[0])
 
     def test_parallel_jaw_half_roll_has_same_orientation_error(self):
         axis_map = M2T2_TO_ROBOTWIN[:3, :3]
@@ -146,6 +173,84 @@ class MinkRuntimeTest(unittest.TestCase):
 
         self.assertAlmostEqual(ranker._orientation_error(canonical_pose), 0.0)
         self.assertAlmostEqual(ranker._orientation_error(rolled_pose), 0.0)
+
+    def test_grasp_visualization_writes_png(self):
+        center = np.array([0.02, -0.10, 0.80])
+        offsets = np.linspace(-0.025, 0.025, 5)
+        points = np.array(
+            [center + [x, y, z] for x in offsets for y in offsets for z in offsets]
+        )
+        colors = np.tile([[0.15, 0.65, 0.95]], (len(points), 1))
+        target_pose = I.copy()
+        target_pose[:3, 3] = center
+        target = ObjectState("bottle", target_pose, 7)
+        scene = SceneObservation(
+            xyz=points,
+            rgb=colors,
+            instance_labels=np.full(len(points), 7),
+            camera_pose=I,
+            objects={"bottle": target},
+        )
+        axis_map = M2T2_TO_ROBOTWIN[:3, :3]
+        canonical_command = t3d.quaternions.quat2mat(
+            CANONICAL_COMMAND_QUATERNIONS["right"]
+        )
+        candidates = []
+        for angle in np.linspace(-0.8, 0.8, 9):
+            rotation_z = np.array(
+                [
+                    [np.cos(angle), -np.sin(angle), 0.0],
+                    [np.sin(angle), np.cos(angle), 0.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            )
+            pose = I.copy()
+            pose[:3, :3] = canonical_command @ rotation_z @ axis_map.T
+            pose[:3, 3] = center - 0.1034 * pose[:3, 2]
+            candidates.append(GraspCandidate(pose, 1.0, "bottle"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "grasp_viz.png"
+            raw_trace = {
+                "poses": np.asarray(
+                    [candidate.world_grasp_pose for candidate in candidates]
+                ),
+                "scores": np.linspace(0.4, 0.8, len(candidates)),
+                "contacts": np.tile(center, (len(candidates), 1)),
+                "target_contacts": np.array(
+                    [True] * 6 + [False] * 3
+                ),
+                "query_ids": np.zeros((len(candidates), 2), dtype=int),
+            }
+            executed_command = (
+                candidates[4].world_grasp_pose @ M2T2_TO_ROBOTWIN
+            )
+            saved = save_grasp_visualization(
+                output,
+                scene,
+                target,
+                candidates[:6],
+                candidates[4],
+                arm="right",
+                grasp_to_robotwin=M2T2_TO_ROBOTWIN,
+                rejected_candidates=candidates[6:],
+                executed_command_pose=executed_command,
+                raw_trace=raw_trace,
+            )
+
+            self.assertEqual(saved, output)
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 10_000)
+            self.assertEqual(output.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            data_path = output.with_suffix(".npz")
+            self.assertTrue(data_path.is_file())
+            with np.load(data_path, allow_pickle=False) as data:
+                self.assertEqual(data["raw_world_grasp_poses"].shape, (9, 4, 4))
+                self.assertEqual(data["ranked_world_grasp_poses"].shape, (6, 4, 4))
+                self.assertEqual(data["rejected_world_grasp_poses"].shape, (3, 4, 4))
+                self.assertEqual(data["selected_world_grasp_pose"].shape, (1, 4, 4))
+                self.assertEqual(data["mink_accepted_command_pose"].shape, (1, 4, 4))
+                self.assertEqual(int(data["raw_target_contacts"].sum()), 6)
 
     def test_qpos_buffer_keeps_inactive_arm_and_uses_joint_waypoints(self):
         goals = [np.full(6, value) for value in (0.1, 0.2, 0.3)]

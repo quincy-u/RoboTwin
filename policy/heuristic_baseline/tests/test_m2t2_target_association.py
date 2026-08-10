@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from policy.heuristic_baseline.errors import NoVisibleTargetFailure
+from policy.heuristic_baseline.errors import (
+    NoObjectQueryFailure,
+    NoVisibleTargetFailure,
+)
 from policy.heuristic_baseline.m2t2_backend import RoboTwinM2T2Backend
 
 
@@ -193,6 +196,26 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         np.testing.assert_allclose(scores, [0.9])
         np.testing.assert_allclose(replayed_poses, poses)
         np.testing.assert_allclose(replayed_scores, scores)
+        self.assertEqual(backend.last_trace["poses"].shape, (2, 4, 4))
+        self.assertEqual(backend.last_trace["contacts"].shape, (2, 3))
+        self.assertEqual(
+            backend.last_trace["target_contacts"].tolist(), [True, False]
+        )
+        np.testing.assert_array_equal(
+            backend.last_trace["query_ids"], [[0, 0], [0, 1]]
+        )
+
+        backend.reset(4)
+        with self.assertRaises(NoObjectQueryFailure):
+            backend.predict(
+                xyz,
+                np.zeros((4, 3), dtype=np.float32),
+                np.eye(4),
+                np.full((1, 3), 9.0, dtype=np.float32),
+                np.ones(4, dtype=bool),
+            )
+        self.assertEqual(backend.last_trace["poses"].shape, (2, 4, 4))
+        self.assertFalse(np.any(backend.last_trace["target_contacts"]))
 
 
 if __name__ == "__main__":
