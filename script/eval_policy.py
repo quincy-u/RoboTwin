@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 import subprocess
 
 sys.path.append("./")
@@ -281,9 +282,14 @@ def eval_policy(task_name,
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
+            ffmpeg_executable = shutil.which("ffmpeg")
+            if ffmpeg_executable is None:
+                import imageio_ffmpeg
+
+                ffmpeg_executable = imageio_ffmpeg.get_ffmpeg_exe()
             ffmpeg = subprocess.Popen(
                 [
-                    "ffmpeg",
+                    ffmpeg_executable,
                     "-y",
                     "-loglevel",
                     "error",
@@ -308,6 +314,9 @@ def eval_policy(task_name,
                 stdin=subprocess.PIPE,
             )
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
+            # Base_Task records fresh post-action frames; seed the video with
+            # one initial frame so motion has a visible before/after reference.
+            TASK_ENV._write_eval_video_frame()
 
         succ = False
         reset_func(model)

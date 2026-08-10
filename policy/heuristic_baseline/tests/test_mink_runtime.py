@@ -350,13 +350,52 @@ class MinkRuntimeTest(unittest.TestCase):
         solved = [ik.solve("right", I) for _ in range(3)]
 
         buffer.open_gripper("right")
-        for goal in solved:
-            buffer.move_joints("right", goal)
+        buffer.move_joints("right", solved[0])
+        buffer.move_joints("right", solved[1])
+        buffer.close_gripper("right")
+        buffer.move_joints("right", solved[2])
 
         self.assertTrue(buffer.actions)
         self.assertTrue(all(action.shape == (14,) for action in buffer.actions))
         self.assertTrue(all(np.allclose(action[:6], 0.0) for action in buffer.actions))
         np.testing.assert_allclose(buffer.actions[-1][7:13], goals[-1])
+        self.assertEqual(len(buffer.metadata), len(buffer.actions))
+        endpoints = [item for item in buffer.metadata if item["endpoint"]]
+        self.assertEqual(
+            [item["phase"] for item in endpoints],
+            ["open", "pregrasp", "grasp", "close", "retreat"],
+        )
+        self.assertTrue(
+            all(item["command_pose"] is not None for item in endpoints[1:3])
+        )
+        self.assertIsNotNone(endpoints[-1]["command_pose"])
+
+    def test_mink_and_qpos_buffer_prefer_measured_joint_state(self):
+        class MeasuredRobot(Robot):
+            def get_left_arm_real_jointState(self):
+                return np.r_[np.full(6, 0.25), 0.75]
+
+            def get_right_arm_real_jointState(self):
+                return np.r_[np.full(6, -0.5), 0.60]
+
+        class MeasuredEnv:
+            robot = MeasuredRobot()
+
+        fake = FakeSolver([])
+        with patch(
+            "policy.heuristic_baseline.runtime.MinkIKSolver.from_xml_path",
+            return_value=fake,
+        ):
+            ik = RoboTwinMinkIK(MeasuredEnv(), I, model_path="unused.urdf")
+
+        np.testing.assert_allclose(ik._joint_positions("left"), np.full(6, 0.25))
+        np.testing.assert_allclose(ik._joint_positions("right"), np.full(6, -0.5))
+        buffer = QposActionBuffer(MeasuredEnv(), ik)
+        buffer.reset()
+        np.testing.assert_allclose(buffer.left, np.full(6, 0.25))
+        np.testing.assert_allclose(buffer.right, np.full(6, -0.5))
+        self.assertEqual(buffer.left_gripper, 0.75)
+        self.assertEqual(buffer.right_gripper, 0.60)
 
 
 if __name__ == "__main__":

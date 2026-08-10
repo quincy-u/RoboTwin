@@ -39,6 +39,9 @@ class HeuristicPolicy:
         self.simple_grasp_root = ensure_simple_grasp_importable(configured_root)
         self._runtime_factory = runtime_factory
         self._runtime: HeuristicRuntime | None = None
+        self.last_action_metadata: list[dict[str, Any]] = []
+        self.execution_batch_index = 0
+        self._execution_trace_episode: tuple[int, int] | None = None
 
     def _default_runtime_factory(self) -> RuntimeFactory:
         # ``runtime`` imports simple_grasp at module scope, so configure this
@@ -65,14 +68,24 @@ class HeuristicPolicy:
         task_env: Any,
     ) -> list[np.ndarray]:
         runtime = self._ensure_runtime(task_env)
+        raw_actions = list(runtime.get_action(scene=scene))
         actions = [
             np.asarray(action, dtype=np.float64)
-            for action in runtime.get_action(scene=scene)
+            for action in raw_actions
         ]
         if not actions:
             raise NoFeasiblePlanFailure("no feasible grasp plan")
+        metadata = list(getattr(runtime, "action_metadata", []))
+        if metadata and len(metadata) != len(actions):
+            raise RuntimeError(
+                "heuristic action metadata must align one-to-one with actions"
+            )
+        self.last_action_metadata = [dict(item) for item in metadata]
         return actions
 
     def reset(self) -> None:
         if self._runtime is not None:
             self._runtime.reset()
+        self.last_action_metadata = []
+        self.execution_batch_index = 0
+        self._execution_trace_episode = None

@@ -491,6 +491,18 @@ class SceneSnapshot:
             ) from exc
 
 
+def _arm_joint_state(task_env: Any, arm: str) -> np.ndarray:
+    """Read physical arm joints when RoboTwin exposes them, else drive targets."""
+    robot = task_env.robot
+    getter = getattr(robot, f"get_{arm}_arm_real_jointState", None)
+    if getter is None:
+        getter = getattr(robot, f"get_{arm}_arm_jointState")
+    state = np.asarray(getter(), dtype=np.float64)
+    if state.ndim != 1 or len(state) < 2 or not np.all(np.isfinite(state)):
+        raise ValueError(f"invalid {arm} arm joint state {state}")
+    return state
+
+
 class RoboTwinMinkIK:
     """Mink pose IK with joint-space interpolation for RoboTwin qpos control."""
 
@@ -539,8 +551,7 @@ class RoboTwinMinkIK:
     def _joint_positions(self, arm: str) -> np.ndarray:
         if arm in self._candidate_seed:
             return self._candidate_seed[arm].copy()
-        state = getattr(self.task_env.robot, f"get_{arm}_arm_jointState")()
-        return np.asarray(state[:-1], dtype=np.float64)
+        return _arm_joint_state(self.task_env, arm)[:-1].copy()
 
     def _world_from_model(self, arm: str) -> np.ndarray:
         pose = getattr(self.task_env.robot, f"{arm}_entity_origion_pose")
@@ -567,6 +578,11 @@ class RoboTwinMinkIK:
         if len(self._completed_command_targets) != 3:
             return None
         return self._completed_command_targets[1].copy()
+
+    @property
+    def completed_command_targets(self) -> tuple[np.ndarray, ...]:
+        """Accepted world command poses for pregrasp, grasp, and retreat."""
+        return tuple(item.copy() for item in self._completed_command_targets)
 
     def _path(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
         delta = float(np.max(np.abs(target - start)))
@@ -667,19 +683,52 @@ class QposActionBuffer:
         self.right = np.empty(0)
         self.left_gripper = 1.0
         self.right_gripper = 1.0
+        self.metadata: list[dict[str, Any]] = []
+        self._motion_segment_index = 0
 
     def reset(self) -> None:
-        left = np.asarray(self.task_env.robot.get_left_arm_jointState(), dtype=np.float64)
-        right = np.asarray(self.task_env.robot.get_right_arm_jointState(), dtype=np.float64)
+        left = _arm_joint_state(self.task_env, "left")
+        right = _arm_joint_state(self.task_env, "right")
         self.left, self.left_gripper = left[:-1].copy(), float(left[-1])
         self.right, self.right_gripper = right[:-1].copy(), float(right[-1])
         self.actions = []
+        self.metadata = []
+        self._motion_segment_index = 0
 
-    def _append(self) -> None:
+    def _append(
+        self,
+        *,
+        phase: str,
+        arm: str,
+        endpoint: bool,
+        waypoint_index: int = 1,
+        waypoint_count: int = 1,
+        command_pose: np.ndarray | None = None,
+    ) -> None:
         self.actions.append(
             np.concatenate(
                 (self.left, [self.left_gripper], self.right, [self.right_gripper])
             )
+        )
+        target_qpos = self.left if arm == "left" else self.right
+        target_gripper = (
+            self.left_gripper if arm == "left" else self.right_gripper
+        )
+        self.metadata.append(
+            {
+                "phase": phase,
+                "arm": arm,
+                "endpoint": bool(endpoint),
+                "waypoint_index": int(waypoint_index),
+                "waypoint_count": int(waypoint_count),
+                "target_qpos": target_qpos.copy(),
+                "target_gripper": float(target_gripper),
+                "command_pose": (
+                    None
+                    if command_pose is None
+                    else np.asarray(command_pose, dtype=np.float64).copy()
+                ),
+            }
         )
 
     def _subsample(self, path: np.ndarray) -> np.ndarray:
@@ -703,12 +752,33 @@ class QposActionBuffer:
         if path is None:
             raise RuntimeError("planner path cache is missing for joint target")
 
-        for waypoint in self._subsample(path):
+        phases = ("pregrasp", "grasp", "retreat")
+        if self._motion_segment_index >= len(phases):
+            raise RuntimeError("received more than three grasp motion segments")
+        phase = phases[self._motion_segment_index]
+        command_targets = self.planner_ik.completed_command_targets
+        command_pose = (
+            command_targets[self._motion_segment_index]
+            if len(command_targets) == len(phases)
+            else None
+        )
+        waypoints = self._subsample(path)
+        waypoint_count = len(waypoints)
+        for waypoint_index, waypoint in enumerate(waypoints, start=1):
             if arm == "left":
                 self.left = waypoint[: len(self.left)].copy()
             else:
                 self.right = waypoint[: len(self.right)].copy()
-            self._append()
+            endpoint = waypoint_index == waypoint_count
+            self._append(
+                phase=phase,
+                arm=arm,
+                endpoint=endpoint,
+                waypoint_index=waypoint_index,
+                waypoint_count=waypoint_count,
+                command_pose=command_pose if endpoint else None,
+            )
+        self._motion_segment_index += 1
 
     def open_gripper(self, arm: str) -> None:
         self._set_gripper(arm, 1.0)
@@ -723,7 +793,11 @@ class QposActionBuffer:
             self.right_gripper = value
         else:
             raise ValueError(f"unknown arm {arm!r}")
-        self._append()
+        self._append(
+            phase="open" if value > 0.5 else "close",
+            arm=arm,
+            endpoint=True,
+        )
 
 
 class ConfidenceRankedGrasps:
@@ -959,6 +1033,10 @@ class RoboTwinHeuristicRuntime:
         except Exception as exc:
             print(f"[heuristic] grasp visualization failed: {exc}")
 
+    @property
+    def action_metadata(self) -> list[dict[str, Any]]:
+        return list(self.controller.metadata)
+
     def get_action(self, *, scene: SceneObservation) -> list[np.ndarray]:
         self.simulator.update(scene)
         target_name = self._target_name(scene)
@@ -998,6 +1076,8 @@ class RoboTwinHeuristicRuntime:
         self._save_grasp_visualization(
             scene, target, ranker.last_candidates, selected, arm
         )
+        for metadata in self.controller.metadata:
+            metadata["target_name"] = target_name
         return self.controller.actions
 
     def reset(self) -> None:
@@ -1033,10 +1113,10 @@ def create_runtime(
         device=str(usr_args.get("device", "cuda:0")),
         num_points=int(usr_args.get("num_points", 16_384)),
         num_object_points=int(usr_args.get("num_object_points", 1_024)),
-        num_runs=int(usr_args.get("num_runs", 1)),
+        num_runs=int(usr_args.get("num_runs", 2)),
         mask_threshold=float(usr_args.get("mask_threshold", 0.4)),
         object_threshold=float(usr_args.get("object_threshold", 0.4)),
-        max_predictions=usr_args.get("max_predictions", 512),
+        max_predictions=usr_args.get("max_predictions", 64),
         workspace_bounds=usr_args.get(
             "workspace_bounds", [-0.5, -0.5, 0.65, 0.5, 0.5, 1.4]
         ),

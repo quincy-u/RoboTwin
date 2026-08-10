@@ -990,6 +990,18 @@ class Base_Task(gym.Env):
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
 
+    def _write_eval_video_frame(self):
+        """Capture and write the current rendered head-camera frame."""
+        if self.eval_video_path is None:
+            return
+        self.cameras.update_picture()
+        rgb = np.asarray(self.cameras.get_rgb()["head_camera"]["rgb"])
+        if rgb.dtype != np.uint8:
+            rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+        self.eval_video_ffmpeg.stdin.write(
+            np.ascontiguousarray(rgb).tobytes()
+        )
+
     def close_env(self, clear_cache=False):
         if clear_cache:
             # for actor in self.scene.get_all_actors():
@@ -1941,13 +1953,87 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
+    @staticmethod
+    def _linear_qpos_fallback(
+        path,
+        *,
+        timestep=1 / 250,
+        min_steps=50,
+        max_joint_step=0.02,
+    ):
+        """Return a bounded joint trajectory from the first to last path row."""
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[0] < 2:
+            raise ValueError("qpos fallback path must have at least two rows")
+        if not np.all(np.isfinite(path)):
+            raise ValueError("qpos fallback path contains non-finite values")
+        if timestep <= 0 or min_steps <= 0 or max_joint_step <= 0:
+            raise ValueError("invalid qpos fallback interpolation settings")
+
+        start = path[0]
+        target = path[-1]
+        delta = target - start
+        max_delta = float(np.max(np.abs(delta))) if delta.size else 0.0
+        num_steps = max(
+            int(min_steps),
+            int(np.ceil(max_delta / max_joint_step)),
+        )
+        position = np.linspace(
+            start, target, num_steps + 1, dtype=np.float64
+        )[1:]
+        velocity = np.repeat(
+            (delta / (num_steps * timestep))[None, :], num_steps, axis=0
+        )
+        velocity[-1] = 0.0
+        return {
+            "position": position,
+            "velocity": velocity,
+        }
+
+    def _qpos_arm_trajectory(self, arm, path):
+        """Run TOPP, falling back only when a nonzero command needs motion."""
+        path = np.asarray(path, dtype=np.float64)
+        max_delta = float(np.max(np.abs(path[-1] - path[0])))
+        planner = getattr(self.robot, f"{arm}_mplib_planner")
+        failure = None
+        try:
+            _, position, velocity, _, _ = planner.TOPP(
+                path, 1 / 250, verbose=True
+            )
+            position = np.asarray(position, dtype=np.float64)
+            velocity = np.asarray(velocity, dtype=np.float64)
+            if position.ndim != 2 or velocity.shape != position.shape:
+                raise ValueError(
+                    "TOPP position/velocity arrays have incompatible shapes"
+                )
+            if position.shape[0] > 0:
+                return {
+                    "position": position,
+                    "velocity": velocity,
+                }, position.shape[0], True
+            failure = "returned zero steps"
+        except Exception as exc:
+            detail = " ".join(str(exc).split())
+            failure = f"failed ({type(exc).__name__}: {detail})"
+
+        # An unchanged inactive arm does not need a trajectory. Retain the
+        # existing 50 control steps so its gripper can stay synchronized with
+        # the other arm, without treating the expected TOPP no-op as an error.
+        if max_delta <= 1e-3:
+            return None, 50, False
+
+        result = self._linear_qpos_fallback(path)
+        num_steps = result["position"].shape[0]
+        print(
+            f"\n[qpos] {arm} arm TOPP {failure}; using {num_steps}-step "
+            f"linear fallback (max delta {max_delta:.3f} rad)",
+            flush=True,
+        )
+        return result, num_steps, True
+
     def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
-
-        eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1961,7 +2047,20 @@ class Base_Task(gym.Env):
         right_jointstate = self.robot.get_right_arm_jointState()
         left_arm_dim = len(left_jointstate) - 1 if action_type == 'qpos' else 7
         right_arm_dim = len(right_jointstate) - 1 if action_type == 'qpos' else 7
-        current_jointstate = np.array(left_jointstate + right_jointstate)
+        if action_type == 'qpos':
+            left_state_getter = getattr(
+                self.robot, "get_left_arm_real_jointState",
+                self.robot.get_left_arm_jointState,
+            )
+            right_state_getter = getattr(
+                self.robot, "get_right_arm_real_jointState",
+                self.robot.get_right_arm_jointState,
+            )
+            current_jointstate = np.array(
+                left_state_getter() + right_state_getter()
+            )
+        else:
+            current_jointstate = np.array(left_jointstate + right_jointstate)
 
         left_arm_actions, left_gripper_actions, left_current_qpos, left_path = (
             [],
@@ -2001,40 +2100,12 @@ class Base_Task(gym.Env):
             right_path = np.vstack((right_current_qpos, right_arm_actions))
 
             # ========== TOPP ==========
-            # TODO
-            topp_left_flag, topp_right_flag = True, True
-
-            try:
-                times, left_pos, left_vel, acc, duration = (self.robot.left_mplib_planner.TOPP(left_path,
-                                                                                            1 / 250,
-                                                                                            verbose=True))
-                left_result = dict()
-                left_result["position"], left_result["velocity"] = left_pos, left_vel
-                left_n_step = left_result["position"].shape[0]
-            except Exception as e:
-                # print("left arm TOPP error: ", e)
-                topp_left_flag = False
-                left_n_step = 50  # fixed
-
-            if left_n_step == 0:
-                topp_left_flag = False
-                left_n_step = 50  # fixed
-
-            try:
-                times, right_pos, right_vel, acc, duration = (self.robot.right_mplib_planner.TOPP(right_path,
-                                                                                                1 / 250,
-                                                                                                verbose=True))
-                right_result = dict()
-                right_result["position"], right_result["velocity"] = right_pos, right_vel
-                right_n_step = right_result["position"].shape[0]
-            except Exception as e:
-                # print("right arm TOPP error: ", e)
-                topp_right_flag = False
-                right_n_step = 50  # fixed
-
-            if right_n_step == 0:
-                topp_right_flag = False
-                right_n_step = 50  # fixed
+            left_result, left_n_step, topp_left_flag = (
+                self._qpos_arm_trajectory("left", left_path)
+            )
+            right_result, right_n_step, topp_right_flag = (
+                self._qpos_arm_trajectory("right", right_path)
+            )
         
         elif action_type == 'ee':
 
@@ -2123,10 +2194,12 @@ class Base_Task(gym.Env):
                 self.eval_success = True
                 self.get_obs() # update obs
                 if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                    self._write_eval_video_frame()
                 return
 
         self._update_render()
+        if self.eval_video_path is not None:
+            self._write_eval_video_frame()
         if self.render_freq:  # UI
             self.viewer.render()
 

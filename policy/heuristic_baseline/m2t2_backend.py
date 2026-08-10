@@ -36,10 +36,10 @@ class RoboTwinM2T2Backend:
         device: str = "cuda:0",
         num_points: int = 16_384,
         num_object_points: int = 1_024,
-        num_runs: int = 1,
+        num_runs: int = 2,
         mask_threshold: float = 0.4,
         object_threshold: float = 0.4,
-        max_predictions: int | None = 512,
+        max_predictions: int | None = 64,
         workspace_bounds: tuple[float, float, float, float, float, float] | None = None,
         contact_match_distance_m: float = 1e-5,
         seed: int = 0,
@@ -142,16 +142,10 @@ class RoboTwinM2T2Backend:
         xyz: np.ndarray,
         rgb: np.ndarray,
         indices: np.ndarray,
-        sampled_target_membership: np.ndarray,
     ) -> dict[str, Any]:
         torch = self.torch
         points = np.asarray(xyz[indices], dtype=np.float32)
         colors = np.asarray(rgb[indices], dtype=np.float32)
-        sampled_target_membership = np.asarray(
-            sampled_target_membership, dtype=bool
-        )
-        if sampled_target_membership.shape != (len(points),):
-            raise ValueError("sampled target mask must align with M2T2 points")
         colors = (colors - self._RGB_MEAN) / self._RGB_STD
         inputs = np.concatenate((points - points.mean(axis=0), colors), axis=1)
 
@@ -161,7 +155,6 @@ class RoboTwinM2T2Backend:
         return {
             "inputs": tensor(inputs),
             "points": tensor(points),
-            "grasp_target_mask": tensor(sampled_target_membership),
             "object_inputs": torch.zeros(
                 (1, self.num_object_points, 6), device=self.device
             ),
@@ -171,89 +164,6 @@ class RoboTwinM2T2Backend:
             "task_is_pick": torch.ones((1,), dtype=torch.bool, device=self.device),
             "task_is_place": torch.zeros((1,), dtype=torch.bool, device=self.device),
         }
-
-    @staticmethod
-    def _target_conditioned_confidence(
-        grasp_logits: Any,
-        target_mask: Any,
-        mask_threshold: float,
-    ) -> Any:
-        """Pool anonymous queries and hard-gate contacts to the GT target."""
-        if getattr(grasp_logits, "ndim", 0) != 3:
-            raise ValueError(
-                "M2T2 grasp logits must have shape [batch, queries, points]"
-            )
-        if getattr(target_mask, "ndim", 0) != 2:
-            raise ValueError("M2T2 target mask must have shape [batch, points]")
-        if (
-            grasp_logits.shape[0] != target_mask.shape[0]
-            or grasp_logits.shape[2] != target_mask.shape[1]
-        ):
-            raise ValueError("M2T2 target mask must align with grasp logits")
-        if grasp_logits.shape[1] == 0:
-            raise ValueError("M2T2 returned no anonymous grasp queries")
-        target_mask = target_mask.bool()
-        if not bool(target_mask.any(dim=1).all()):
-            raise NoVisibleTargetFailure(
-                "sampled M2T2 target mask contains no target points"
-            )
-
-        pooled = grasp_logits.sigmoid().amax(dim=1, keepdim=True)
-        confidence_floor = pooled.new_tensor(float(mask_threshold) + 1e-4)
-        return pooled.maximum(confidence_floor).where(
-            target_mask.unsqueeze(1), pooled.new_zeros(())
-        )
-
-    def _target_conditioned_infer(
-        self, batch: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Run M2T2 once while allowing grasp contacts only on the GT target."""
-        model = self.model
-        scene_features = model.backbone(batch["inputs"])
-        object_features = (
-            {}
-            if model.object_encoder is None
-            else model.object_encoder(batch["object_inputs"])
-        )
-        if "task_is_place" in batch:
-            for key in object_features.get("features", {}):
-                object_features["features"][key] = (
-                    object_features["features"][key]
-                    * batch["task_is_place"].view(
-                        batch["task_is_place"].shape[0], 1, 1
-                    )
-                )
-        embedding, decoder_outputs = model.transformer(
-            scene_features, object_features, batch.get("lang_tokens")
-        )
-        outputs = decoder_outputs[-1]
-        if "grasp" not in embedding or embedding["grasp"].shape[1] == 0:
-            raise NoObjectQueryFailure("M2T2 returned no grasp embeddings")
-        if model.grasp_mlp.use_embed:
-            raise RuntimeError(
-                "target-conditioned M2T2 requires action_decoder.use_embed=false"
-            )
-
-        confidence = self._target_conditioned_confidence(
-            outputs["grasping_masks"],
-            batch["grasp_target_mask"],
-            float(self.cfg.eval.mask_thresh),
-        )
-        mask_features = scene_features["features"][
-            model.transformer.mask_feature
-        ]
-        grasp_outputs = model.grasp_mlp(
-            batch["points"],
-            mask_features,
-            list(confidence),
-            float(self.cfg.eval.mask_thresh),
-            [item[:1] for item in embedding["grasp"]],
-        )
-        outputs.update(grasp_outputs)
-        outputs["grasping_masks"] = [
-            mask.unsqueeze(0) for mask in batch["grasp_target_mask"].bool()
-        ]
-        return outputs
 
     @staticmethod
     def _validate_query_alignment(
@@ -392,9 +302,7 @@ class RoboTwinM2T2Backend:
 
         for run_index in range(self.num_runs):
             indices = self._sample_indices(target_membership)
-            batch = self._input_batch(
-                xyz, rgb, indices, target_membership[indices]
-            )
+            batch = self._input_batch(xyz, rgb, indices)
             torch_seed = (self._seed + run_index) % (2**63 - 1)
             cuda_devices: list[int] = []
             if self.device.type == "cuda":
@@ -408,7 +316,7 @@ class RoboTwinM2T2Backend:
                     with self.torch.cuda.device(self.device):
                         self.torch.cuda.manual_seed(torch_seed)
                 with self.torch.inference_mode():
-                    output = self._target_conditioned_infer(batch)
+                    output = self.model.infer(batch, self.cfg.eval)
 
             masks = output["grasping_masks"][0]
             grasps = output["grasps"][0]
@@ -417,8 +325,8 @@ class RoboTwinM2T2Backend:
             query_count = self._validate_query_alignment(
                 masks, grasps, confidences, contacts
             )
-            # Target membership is imposed before the action decoder. This
-            # geometric check is now an invariant, not target selection.
+            # Ignore anonymous query masks for association. Retain grasps from
+            # every query only when their contact lies on the GT target cloud.
             for query_idx in range(query_count):
                 query_poses = grasps[query_idx].detach().cpu().numpy()
                 query_scores = confidences[query_idx].detach().cpu().numpy()
@@ -430,10 +338,6 @@ class RoboTwinM2T2Backend:
                     target_points,
                     self.contact_match_distance_m,
                 )
-                if not np.all(keep):
-                    raise RuntimeError(
-                        "target-conditioned M2T2 emitted a non-target contact"
-                    )
                 if np.any(keep):
                     queries_with_target_contacts += 1
                 for pose, contact, score, is_target_contact in zip(
@@ -476,8 +380,8 @@ class RoboTwinM2T2Backend:
 
         if not poses:
             raise NoObjectQueryFailure(
-                f"M2T2 target-conditioned decoding produced no valid grasp "
-                f"poses after {self.num_runs} runs "
+                f"M2T2 found no grasp contacts on the segmented target after "
+                f"{self.num_runs} runs "
                 f"(rejected_rotations={rejected_rotations})"
             )
 
