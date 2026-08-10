@@ -26,6 +26,7 @@ relax_orientation_on_failure: true
 save_grasp_visualizations: true
 max_visualized_grasps: null  # null renders every candidate
 max_visualized_points: 30000
+grasp_visualization_scale: 4
 
 # M2T2
 m2t2_checkpoint: checkpoints/m2t2.pth
