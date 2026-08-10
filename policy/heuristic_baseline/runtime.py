@@ -36,6 +36,48 @@ CANONICAL_COMMAND_QUATERNIONS = {
     "left": np.array([-0.61239, 0.353523, -0.61239, -0.353524]),
 }
 PARALLEL_JAW_ROLL_SYMMETRY = np.diag([1.0, -1.0, -1.0])
+SELECTED_GRASP_COLOR = "#facc15"
+
+
+def _grasp_glyph_segments(
+    world_grasp_poses: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+) -> np.ndarray:
+    """Return approach and jaw segments for every command-frame grasp."""
+    poses = np.asarray(world_grasp_poses, dtype=np.float64)
+    if poses.size == 0:
+        return np.empty((0, 2, 2, 3), dtype=np.float64)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError("world_grasp_poses must have shape (N, 4, 4)")
+    transform = np.asarray(grasp_to_robotwin, dtype=np.float64)
+    if transform.shape != (4, 4):
+        raise ValueError("grasp_to_robotwin must have shape (4, 4)")
+
+    command_poses = poses @ transform
+    wrist = command_poses[:, :3, 3]
+    approach = command_poses[:, :3, 0]
+    closing = command_poses[:, :3, 1]
+    pregrasp = wrist - 0.05 * approach
+    contact_center = wrist + 0.12 * approach
+    jaw_a = contact_center - 0.035 * closing
+    jaw_b = contact_center + 0.035 * closing
+    stems = np.stack((pregrasp, contact_center), axis=1)
+    jaws = np.stack((jaw_a, jaw_b), axis=1)
+    return np.stack((stems, jaws), axis=1)
+
+
+def _equal_3d_limits(points: np.ndarray) -> np.ndarray:
+    """Return unclipped equal-aspect limits containing every finite point."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) == 0:
+        raise ValueError("cannot determine visualization limits without points")
+    lower = points.min(axis=0)
+    upper = points.max(axis=0)
+    center = 0.5 * (lower + upper)
+    radius = max(0.05, 0.5 * float(np.max(upper - lower)))
+    radius += max(0.01, 0.05 * radius)
+    return np.stack((center - radius, center + radius), axis=1)
 
 
 def save_grasp_visualization(
@@ -50,12 +92,14 @@ def save_grasp_visualization(
     rejected_candidates: list[GraspCandidate] | None = None,
     executed_command_pose: np.ndarray | None = None,
     raw_trace: dict[str, np.ndarray] | None = None,
-    max_grasps: int = 48,
-    max_points: int = 4_000,
+    max_grasps: int | None = None,
+    max_points: int = 30_000,
 ) -> Path:
-    """Save raw/target M2T2 options, source selection, and accepted IK pose."""
-    if max_grasps <= 0 or max_points <= 0:
-        raise ValueError("visualization limits must be positive")
+    """Overlay every policy grasp on full-scene and target-closeup RGB-D views."""
+    if max_grasps is not None and max_grasps <= 0:
+        raise ValueError("max_grasps must be positive or None for all grasps")
+    if max_points <= 0:
+        raise ValueError("max_points must be positive")
     grasp_to_robotwin = np.asarray(grasp_to_robotwin, dtype=np.float64)
     if grasp_to_robotwin.shape != (4, 4):
         raise ValueError("grasp_to_robotwin must have shape (4, 4)")
@@ -69,76 +113,111 @@ def save_grasp_visualization(
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
     output_path = Path(output_path).expanduser()
+    scene_points_full = np.asarray(scene.xyz, dtype=np.float64)
+    scene_colors_full = np.clip(np.asarray(scene.rgb), 0.0, 1.0)
+    if scene_points_full.ndim != 2 or scene_points_full.shape[1] != 3:
+        raise ValueError("scene.xyz must have shape (N, 3)")
+    if scene_colors_full.shape != scene_points_full.shape:
+        raise ValueError("scene.rgb must align with scene.xyz")
     target_mask = scene.instance_labels == target.instance_id
-    target_points = np.asarray(scene.xyz[target_mask], dtype=np.float64)
-    target_colors = np.clip(np.asarray(scene.rgb[target_mask]), 0.0, 1.0)
-    context_points = np.asarray(scene.xyz[~target_mask], dtype=np.float64)
-    target_visible = len(target_points) > 0
+    finite_scene = np.all(np.isfinite(scene_points_full), axis=1)
+    finite_scene &= np.all(np.isfinite(scene_colors_full), axis=1)
+    scene_points_finite = scene_points_full[finite_scene]
+    scene_colors_finite = scene_colors_full[finite_scene]
+    target_points_full = scene_points_full[target_mask & finite_scene]
+    target_colors_full = scene_colors_full[target_mask & finite_scene]
+    target_visible = len(target_points_full) > 0
     center = np.asarray(target.world_pose[:3, 3], dtype=np.float64)
 
-    def subsample(points: np.ndarray, limit: int) -> tuple[np.ndarray, np.ndarray]:
-        if len(points) <= limit:
-            return points, np.arange(len(points))
-        indices = np.linspace(0, len(points) - 1, limit, dtype=int)
-        return points[indices], indices
+    def subsample_indices(length: int, limit: int) -> np.ndarray:
+        if length <= limit:
+            return np.arange(length)
+        return np.linspace(0, length - 1, limit, dtype=int)
 
-    target_points, target_indices = subsample(target_points, max_points)
-    target_colors = target_colors[target_indices]
-    context_points, _ = subsample(context_points, max_points)
-    displayed = list(candidates[:max_grasps])
-    displayed_rejected = sorted(
+    scene_indices = subsample_indices(len(scene_points_finite), max_points)
+    scene_points = scene_points_finite[scene_indices]
+    scene_colors = scene_colors_finite[scene_indices]
+    target_indices = subsample_indices(len(target_points_full), max_points)
+    target_points = target_points_full[target_indices]
+    target_colors = target_colors_full[target_indices]
+
+    displayed = list(
+        candidates if max_grasps is None else candidates[:max_grasps]
+    )
+    rejected_by_score = sorted(
         rejected_candidates,
         key=lambda candidate: candidate.confidence,
         reverse=True,
-    )[:max_grasps]
-    figure = Figure(figsize=(12, 6.5))
-    FigureCanvasAgg(figure)
-    world_axes = figure.add_subplot(1, 2, 1, projection="3d")
-    top_axes = figure.add_subplot(1, 2, 2)
-    figure.subplots_adjust(
-        left=0.06, right=0.97, bottom=0.17, top=0.87, wspace=0.23
     )
-    if len(context_points):
-        world_axes.scatter(
-            context_points[:, 0],
-            context_points[:, 1],
-            context_points[:, 2],
-            c="#94a3b8",
-            s=1,
-            alpha=0.08,
-            depthshade=False,
-        )
-        top_axes.scatter(
-            context_points[:, 0],
-            context_points[:, 1],
-            c="#94a3b8",
-            s=1,
-            alpha=0.08,
-        )
-    if target_visible:
-        world_axes.scatter(
-            target_points[:, 0],
-            target_points[:, 1],
-            target_points[:, 2],
-            c=target_colors,
-            s=4,
-            alpha=0.8,
-            depthshade=False,
-        )
-        top_axes.scatter(
-            target_points[:, 0],
-            target_points[:, 1],
-            c=target_colors,
-            s=4,
-            alpha=0.8,
-        )
-        geometry_points = [target_points]
-    else:
-        world_axes.scatter(*center, marker="x", c="#ef4444", s=80)
-        top_axes.scatter(center[0], center[1], marker="x", c="#ef4444", s=80)
-        geometry_points = [center[None, :]]
+    displayed_rejected = list(
+        rejected_by_score
+        if max_grasps is None
+        else rejected_by_score[:max_grasps]
+    )
+
+    def candidate_poses(items: list[GraspCandidate]) -> np.ndarray:
+        return np.asarray(
+            [item.world_grasp_pose for item in items], dtype=np.float64
+        ).reshape(-1, 4, 4)
+
+    ranked_segments = _grasp_glyph_segments(
+        candidate_poses(displayed), grasp_to_robotwin
+    )
+    rejected_segments = _grasp_glyph_segments(
+        candidate_poses(displayed_rejected), grasp_to_robotwin
+    )
+    selected_segments = _grasp_glyph_segments(
+        candidate_poses([] if selected is None else [selected]),
+        grasp_to_robotwin,
+    )
+    executed_segments = _grasp_glyph_segments(
+        np.empty((0, 4, 4))
+        if executed_command_pose is None
+        else executed_command_pose[None, :, :],
+        np.eye(4),
+    )
+
+    figure = Figure(figsize=(14, 7.2))
+    FigureCanvasAgg(figure)
+    world_axes = figure.add_subplot(
+        1, 2, 1, projection="3d", computed_zorder=False
+    )
+    close_axes = figure.add_subplot(
+        1, 2, 2, projection="3d", computed_zorder=False
+    )
+    figure.subplots_adjust(
+        left=0.04, right=0.98, bottom=0.16, top=0.87, wspace=0.12
+    )
+    for axes in (world_axes, close_axes):
+        if len(scene_points):
+            axes.scatter(
+                scene_points[:, 0],
+                scene_points[:, 1],
+                scene_points[:, 2],
+                c=scene_colors,
+                s=0.8,
+                alpha=0.42,
+                depthshade=False,
+                linewidths=0,
+                zorder=1,
+            )
+        if target_visible:
+            axes.scatter(
+                target_points[:, 0],
+                target_points[:, 1],
+                target_points[:, 2],
+                c=target_colors,
+                s=4,
+                alpha=0.95,
+                depthshade=False,
+                linewidths=0,
+                zorder=3,
+            )
+        else:
+            axes.scatter(*center, marker="x", c="#ef4444", s=80, zorder=3)
 
     trace_contacts = np.asarray(
         raw_trace.get("contacts", np.empty((0, 3))), dtype=np.float64
@@ -146,106 +225,105 @@ def save_grasp_visualization(
     trace_target_contacts = np.asarray(
         raw_trace.get("target_contacts", np.empty(0)), dtype=bool
     )
+    off_target_contacts = np.empty((0, 3), dtype=np.float64)
     if len(trace_contacts) == len(trace_target_contacts):
-        for contact_mask, color, marker, size in (
-            (~trace_target_contacts, "#ef4444", "x", 22),
-            (trace_target_contacts, "#38bdf8", ".", 14),
-        ):
-            contact_points = trace_contacts[contact_mask]
-            if len(contact_points):
-                geometry_points.append(contact_points)
-                world_axes.scatter(
-                    contact_points[:, 0],
-                    contact_points[:, 1],
-                    contact_points[:, 2],
-                    c=color,
-                    marker=marker,
-                    s=size,
-                    alpha=0.9,
+        off_target_contacts = trace_contacts[~trace_target_contacts]
+        if len(off_target_contacts):
+            for axes in (world_axes, close_axes):
+                axes.scatter(
+                    off_target_contacts[:, 0],
+                    off_target_contacts[:, 1],
+                    off_target_contacts[:, 2],
+                    c="#ef4444",
+                    marker="x",
+                    s=22,
+                    alpha=0.95,
                     depthshade=False,
-                )
-                top_axes.scatter(
-                    contact_points[:, 0],
-                    contact_points[:, 1],
-                    c=color,
-                    marker=marker,
-                    s=size,
-                    alpha=0.9,
+                    zorder=12,
                 )
 
-    def draw_grasp(
-        candidate: GraspCandidate, color: str, alpha: float, width: float
+    def add_grasp_layer(
+        axes: Any,
+        segments: np.ndarray,
+        *,
+        colors: Any,
+        linewidths: Any,
+        zorder: int,
+        linestyle: str = "solid",
     ) -> None:
-        pose = (
-            np.asarray(candidate.world_grasp_pose, dtype=np.float64)
-            @ grasp_to_robotwin
-        )
-        wrist = pose[:3, 3]
-        approach = pose[:3, 0]
-        closing = pose[:3, 1]
-        pregrasp = wrist - 0.05 * approach
-        contact_center = wrist + 0.12 * approach
-        jaw_a = contact_center - 0.035 * closing
-        jaw_b = contact_center + 0.035 * closing
-        geometry_points.append(
-            np.stack((pregrasp, wrist, contact_center, jaw_a, jaw_b))
-        )
-        for axes in (world_axes,):
-            axes.plot(
-                *np.stack((pregrasp, contact_center)).T,
-                color=color,
-                alpha=alpha,
-                linewidth=width,
+        if len(segments) == 0:
+            return
+        flat_segments = segments.reshape(-1, 2, 3)
+        layer_colors = colors
+        if not isinstance(colors, str):
+            layer_colors = np.repeat(np.asarray(colors), 2, axis=0)
+        layer_widths = linewidths
+        if not np.isscalar(linewidths):
+            layer_widths = np.repeat(np.asarray(linewidths), 2)
+        axes.add_collection3d(
+            Line3DCollection(
+                flat_segments,
+                colors=layer_colors,
+                linewidths=layer_widths,
+                linestyles=linestyle,
+                zorder=zorder,
             )
-            axes.plot(
-                *np.stack((jaw_a, jaw_b)).T,
-                color=color,
-                alpha=alpha,
-                linewidth=width,
-            )
-        top_axes.plot(
-            [pregrasp[0], contact_center[0]],
-            [pregrasp[1], contact_center[1]],
-            color=color,
-            alpha=alpha,
-            linewidth=width,
-        )
-        top_axes.plot(
-            [jaw_a[0], jaw_b[0]],
-            [jaw_a[1], jaw_b[1]],
-            color=color,
-            alpha=alpha,
-            linewidth=width,
         )
 
-    rejected_strength = float(
-        np.clip(6.0 / max(len(displayed_rejected), 1), 0.18, 0.65)
-    )
-    for candidate in reversed(displayed_rejected):
-        draw_grasp(
-            candidate,
-            "#ef4444",
-            rejected_strength,
-            0.6 + rejected_strength,
+    if len(ranked_segments):
+        importance = np.linspace(1.0, 0.0, len(ranked_segments))
+        rank_colors = np.column_stack(
+            (
+                0.05 + 0.05 * importance,
+                0.35 + 0.50 * importance,
+                0.72 + 0.28 * importance,
+                0.42 + 0.42 * importance,
+            )
         )
-    rank_scale = max(len(displayed) - 1, 1)
-    for rank_index in reversed(range(len(displayed))):
-        importance = 1.0 - rank_index / rank_scale
-        draw_grasp(
-            displayed[rank_index],
-            "#38bdf8",
-            0.12 + 0.50 * importance,
-            0.6 + importance,
+        rank_widths = 0.65 + 0.90 * importance
+    else:
+        rank_colors = np.empty((0, 4), dtype=np.float64)
+        rank_widths = np.empty(0, dtype=np.float64)
+
+    for axes in (world_axes, close_axes):
+        add_grasp_layer(
+            axes,
+            rejected_segments,
+            colors=(0.94, 0.27, 0.27, 0.65),
+            linewidths=0.9,
+            zorder=8,
+            linestyle="dashed",
         )
-    if selected is not None:
-        draw_grasp(selected, "#f97316", 1.0, 3.0)
-    if executed_command_pose is not None:
-        executed_raw_pose = executed_command_pose @ np.linalg.inv(grasp_to_robotwin)
-        draw_grasp(
-            GraspCandidate(executed_raw_pose, 0.0, target.name),
-            "#22c55e",
-            1.0,
-            4.0,
+        add_grasp_layer(
+            axes,
+            ranked_segments,
+            colors=rank_colors,
+            linewidths=rank_widths,
+            zorder=10,
+        )
+        add_grasp_layer(
+            axes,
+            executed_segments,
+            colors="#22c55e",
+            linewidths=3.2,
+            zorder=20,
+            linestyle="dashed",
+        )
+        # A dark halo followed by a saturated stroke keeps the selected grasp
+        # visible even when it coincides with the accepted Mink command pose.
+        add_grasp_layer(
+            axes,
+            selected_segments,
+            colors="#111827",
+            linewidths=7.0,
+            zorder=29,
+        )
+        add_grasp_layer(
+            axes,
+            selected_segments,
+            colors=SELECTED_GRASP_COLOR,
+            linewidths=4.0,
+            zorder=30,
         )
 
     frame_pose = executed_command_pose
@@ -254,41 +332,68 @@ def save_grasp_visualization(
             np.asarray(selected.world_grasp_pose, dtype=np.float64)
             @ grasp_to_robotwin
         )
+    frame_segments = np.empty((0, 2, 3), dtype=np.float64)
     if frame_pose is not None:
         wrist = frame_pose[:3, 3]
-        for axis_index, axis_color in enumerate(("#ef4444", "#22c55e", "#2563eb")):
-            endpoint = wrist + 0.04 * frame_pose[:3, axis_index]
-            world_axes.plot(
-                *np.stack((wrist, endpoint)).T,
-                color=axis_color,
-                linewidth=2.5,
-            )
-            top_axes.plot(
-                [wrist[0], endpoint[0]],
-                [wrist[1], endpoint[1]],
-                color=axis_color,
-                linewidth=2.5,
+        frame_segments = np.stack(
+            [
+                np.stack(
+                    (wrist, wrist + 0.04 * frame_pose[:3, axis_index])
+                )
+                for axis_index in range(3)
+            ]
+        )
+        for axes in (world_axes, close_axes):
+            axes.add_collection3d(
+                Line3DCollection(
+                    frame_segments,
+                    colors=("#ef4444", "#22c55e", "#2563eb"),
+                    linewidths=2.2,
+                    zorder=31,
+                )
             )
 
-    all_geometry = np.concatenate(geometry_points, axis=0)
-    radial_distance = np.linalg.norm(all_geometry - center, axis=1)
-    radius = float(np.clip(np.quantile(radial_distance, 0.98) + 0.03, 0.12, 0.35))
-    world_axes.set_xlim(center[0] - radius, center[0] + radius)
-    world_axes.set_ylim(center[1] - radius, center[1] + radius)
-    world_axes.set_zlim(center[2] - radius, center[2] + radius)
-    world_axes.set_box_aspect((1, 1, 1))
-    world_axes.view_init(elev=24, azim=-58)
-    top_axes.set_xlim(center[0] - radius, center[0] + radius)
-    top_axes.set_ylim(center[1] - radius, center[1] + radius)
-    top_axes.set_aspect("equal", adjustable="box")
-    world_axes.set_xlabel("world x [m]")
-    world_axes.set_ylabel("world y [m]")
-    world_axes.set_zlabel("world z [m]")
-    top_axes.set_xlabel("world x [m]")
-    top_axes.set_ylabel("world y [m]")
-    world_axes.set_title("3D command-frame grasp glyphs")
-    top_axes.set_title("Top view")
-    top_axes.grid(alpha=0.2)
+    grasp_geometry = [
+        segments.reshape(-1, 3)
+        for segments in (
+            ranked_segments,
+            rejected_segments,
+            selected_segments,
+            executed_segments,
+        )
+        if len(segments)
+    ]
+    if len(frame_segments):
+        grasp_geometry.append(frame_segments.reshape(-1, 3))
+    if len(off_target_contacts):
+        grasp_geometry.append(off_target_contacts)
+    close_geometry = [
+        target_points_full if target_visible else center[None, :],
+        *grasp_geometry,
+    ]
+    world_geometry = [
+        scene_points_finite if len(scene_points_finite) else center[None, :],
+        *grasp_geometry,
+    ]
+    world_limits = _equal_3d_limits(np.concatenate(world_geometry, axis=0))
+    close_limits = _equal_3d_limits(np.concatenate(close_geometry, axis=0))
+
+    for axes, limits in (
+        (world_axes, world_limits),
+        (close_axes, close_limits),
+    ):
+        axes.set_xlim(*limits[0])
+        axes.set_ylim(*limits[1])
+        axes.set_zlim(*limits[2])
+        axes.set_box_aspect((1, 1, 1))
+        axes.view_init(elev=24, azim=-58)
+        axes.set_xlabel("world x [m]")
+        axes.set_ylabel("world y [m]")
+        axes.set_zlabel("world z [m]")
+        axes.grid(alpha=0.18)
+    world_axes.set_title("Full RGB-D scene + every grasp")
+    close_axes.set_title("Target close-up + selected grasp")
+
     if executed_command_pose is not None:
         selection_text = "Mink pose accepted"
     elif selected is not None:
@@ -297,7 +402,8 @@ def save_grasp_visualization(
         selection_text = "no feasible IK"
     target_visibility_text = "" if target_visible else " | NO TARGET DEPTH POINTS"
     figure.suptitle(
-        f"{target.name} | {arm} | target {len(displayed)}/{len(candidates)} | "
+        f"{target.name} | {arm} | grasps {len(displayed)}/{len(candidates)} | "
+        f"scene points {len(scene_points)}/{len(scene_points_finite)} | "
         f"off-target {len(displayed_rejected)}/{len(rejected_candidates)} | "
         f"{selection_text}{target_visibility_text}",
         y=0.96,
@@ -310,7 +416,7 @@ def save_grasp_visualization(
                 [0],
                 color="#38bdf8",
                 lw=2,
-                label="ranked target options (opacity = rank)",
+                label="all ranked target options (color = rank)",
             )
         )
     if rejected_candidates:
@@ -328,9 +434,9 @@ def save_grasp_visualization(
             Line2D(
                 [0],
                 [0],
-                color="#f97316",
-                lw=3,
-                label="selected M2T2 source candidate",
+                color=SELECTED_GRASP_COLOR,
+                lw=4,
+                label="selected grasp",
             )
         )
     if executed_command_pose is not None:
@@ -339,7 +445,8 @@ def save_grasp_visualization(
                 [0],
                 [0],
                 color="#22c55e",
-                lw=4,
+                lw=3,
+                linestyle="dashed",
                 label="Mink-accepted command pose",
             )
         )
@@ -404,6 +511,17 @@ def save_grasp_visualization(
         target_world_pose=target.world_pose,
         target_points=np.asarray(scene.xyz[target_mask], dtype=np.float32),
         target_rgb=np.asarray(scene.rgb[target_mask], dtype=np.float32),
+        scene_world_points=np.asarray(scene_points, dtype=np.float32),
+        scene_rgb=np.asarray(scene_colors, dtype=np.float32),
+        scene_point_count=np.asarray(len(scene_points_finite), dtype=np.int64),
+        rendered_grasp_count=np.asarray(len(displayed), dtype=np.int64),
+        ranked_grasp_segments=np.asarray(ranked_segments, dtype=np.float32),
+        selected_grasp_segments=np.asarray(selected_segments, dtype=np.float32),
+        selected_grasp_color=np.asarray(SELECTED_GRASP_COLOR),
+        selected_grasp_zorder=np.asarray(30, dtype=np.int64),
+        executed_grasp_segments=np.asarray(executed_segments, dtype=np.float32),
+        world_axis_limits=np.asarray(world_limits, dtype=np.float32),
+        closeup_axis_limits=np.asarray(close_limits, dtype=np.float32),
         raw_world_grasp_poses=raw_poses,
         raw_confidences=raw_scores,
         raw_contacts=raw_contacts,
@@ -774,8 +892,8 @@ class RoboTwinHeuristicRuntime:
         relax_orientation_on_failure: bool = True,
         save_grasp_visualizations: bool = True,
         visualization_dir: str | Path | None = None,
-        max_visualized_grasps: int = 48,
-        max_visualized_points: int = 4_000,
+        max_visualized_grasps: int | None = None,
+        max_visualized_points: int = 30_000,
     ) -> None:
         self.task_env = task_env
         self.grasps = grasps
@@ -788,9 +906,16 @@ class RoboTwinHeuristicRuntime:
             if visualization_dir is None
             else Path(visualization_dir).expanduser().resolve()
         )
-        self.max_visualized_grasps = int(max_visualized_grasps)
+        self.max_visualized_grasps = (
+            None
+            if max_visualized_grasps is None
+            else int(max_visualized_grasps)
+        )
         self.max_visualized_points = int(max_visualized_points)
-        if self.max_visualized_grasps <= 0 or self.max_visualized_points <= 0:
+        if (
+            self.max_visualized_grasps is not None
+            and self.max_visualized_grasps <= 0
+        ) or self.max_visualized_points <= 0:
             raise ValueError("visualization limits must be positive")
         self._visualization_index = 0
         self.simulator = SceneSnapshot()
@@ -1019,10 +1144,12 @@ def create_runtime(
             usr_args.get("grasp_visualization_dir")
             or usr_args.get("eval_save_dir")
         ),
-        max_visualized_grasps=int(
-            usr_args.get("max_visualized_grasps", 48)
+        max_visualized_grasps=(
+            None
+            if usr_args.get("max_visualized_grasps") in (None, "all")
+            else int(usr_args["max_visualized_grasps"])
         ),
         max_visualized_points=int(
-            usr_args.get("max_visualized_points", 4_000)
+            usr_args.get("max_visualized_points", 30_000)
         ),
     )

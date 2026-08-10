@@ -7,10 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from policy.heuristic_baseline.errors import (
-    NoObjectQueryFailure,
-    NoVisibleTargetFailure,
-)
+from policy.heuristic_baseline.errors import NoVisibleTargetFailure
 from policy.heuristic_baseline.m2t2_backend import RoboTwinM2T2Backend
 
 
@@ -122,9 +119,27 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         with self.assertRaises(NoVisibleTargetFailure):
             backend._sample_indices(np.zeros(2, dtype=bool))
 
-    def test_predict_ignores_query_masks_and_uses_target_contact(self) -> None:
+    def test_target_conditioned_confidence_hard_gates_queries(self) -> None:
+        logits = torch.tensor(
+            [[[8.0, -8.0, 7.0, -7.0], [6.0, 2.0, 5.0, -6.0]]]
+        )
+        target_mask = torch.tensor([[False, True, False, True]])
+
+        confidence = RoboTwinM2T2Backend._target_conditioned_confidence(
+            logits, target_mask, mask_threshold=0.4
+        )
+
+        self.assertEqual(confidence.shape, (1, 1, 4))
+        np.testing.assert_array_equal(
+            (confidence[0, 0] > 0.4).numpy(), target_mask[0].numpy()
+        )
+        self.assertEqual(float(confidence[0, 0, 0]), 0.0)
+        self.assertEqual(float(confidence[0, 0, 2]), 0.0)
+
+    def test_predict_decodes_only_sampled_target_points(self) -> None:
         backend = object.__new__(RoboTwinM2T2Backend)
         backend.num_points = 4
+        backend.num_object_points = 1
         backend.num_runs = 1
         backend._seed = 4
         backend.reset()
@@ -133,89 +148,73 @@ class M2T2TargetAssociationTest(unittest.TestCase):
         backend.torch = torch
         backend.device = torch.device("cpu")
         backend.cfg = SimpleNamespace(eval=object())
-        backend._input_batch = lambda xyz, rgb, indices: {}
+        emit_target = [True]
 
-        wrong_pose = torch.eye(4).unsqueeze(0)
-        wrong_pose[0, 0, 3] = 99.0
-        matched_pose = torch.eye(4).unsqueeze(0)
-        matched_pose[0, 0, 3] = 1.0
+        def fake_target_infer(batch):
+            sampled_points = batch["points"][0]
+            sampled_target = batch["grasp_target_mask"][0]
+            selected = sampled_target if emit_target[0] else ~sampled_target
+            contacts = sampled_points[selected]
+            count = len(contacts)
+            return {
+                "grasping_masks": [sampled_target.unsqueeze(0)],
+                "grasps": [[torch.eye(4).repeat(count, 1, 1)]],
+                "grasp_confidence": [[torch.full((count,), 0.9)]],
+                "grasp_contacts": [[contacts]],
+            }
 
-        class FakeModel:
-            def infer(self, batch, config):
-                randomized_pose = matched_pose.clone()
-                randomized_pose[0, 0, 1] = 5e-5
-                randomized_pose[0, 1, 3] = torch.randperm(100)[0].float()
-                return {
-                    "grasping_masks": [
-                        torch.tensor([[False] * 4, [True] * 4])
-                    ],
-                    "grasps": [[randomized_pose, wrong_pose]],
-                    "grasp_confidence": [
-                        [torch.tensor([0.9]), torch.tensor([0.1])]
-                    ],
-                    "grasp_contacts": [
-                        [torch.zeros((1, 3)), torch.tensor([[1.0, 0.0, 0.0]])]
-                    ],
-                }
-
-        backend.model = FakeModel()
-        xyz = np.zeros((4, 3), dtype=np.float32)
+        backend._target_conditioned_infer = fake_target_infer
+        xyz = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.01, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        target_membership = np.array([True, True, False, False])
+        target_points = xyz[target_membership]
         torch_state = torch.random.get_rng_state()
         poses, scores = backend.predict(
             xyz,
             np.zeros((4, 3), dtype=np.float32),
             np.eye(4),
-            xyz,
-            np.ones(4, dtype=bool),
+            target_points,
+            target_membership,
         )
         np.testing.assert_array_equal(torch.random.get_rng_state(), torch_state)
 
-        torch.randperm(1000)
-        perturbed_state = torch.random.get_rng_state()
         backend.reset(4)
         replayed_poses, replayed_scores = backend.predict(
             xyz,
             np.zeros((4, 3), dtype=np.float32),
             np.eye(4),
-            xyz,
-            np.ones(4, dtype=bool),
-        )
-        np.testing.assert_array_equal(
-            torch.random.get_rng_state(), perturbed_state
+            target_points,
+            target_membership,
         )
 
-        self.assertEqual(len(poses), 1)
-        np.testing.assert_allclose(
-            poses[0][:3, :3].T @ poses[0][:3, :3], np.eye(3), atol=1e-12
-        )
-        self.assertAlmostEqual(np.linalg.det(poses[0][:3, :3]), 1.0)
-        anchor = -0.1034 * poses[0][:3, 2]
-        self.assertLessEqual(
-            np.linalg.norm(poses[0][:3, 3] - anchor), 0.045 + 1e-9
-        )
-        np.testing.assert_allclose(scores, [0.9])
+        self.assertEqual(len(poses), 2)
+        np.testing.assert_allclose(scores, [0.9, 0.9])
         np.testing.assert_allclose(replayed_poses, poses)
         np.testing.assert_allclose(replayed_scores, scores)
         self.assertEqual(backend.last_trace["poses"].shape, (2, 4, 4))
         self.assertEqual(backend.last_trace["contacts"].shape, (2, 3))
-        self.assertEqual(
-            backend.last_trace["target_contacts"].tolist(), [True, False]
-        )
+        self.assertTrue(np.all(backend.last_trace["target_contacts"]))
         np.testing.assert_array_equal(
-            backend.last_trace["query_ids"], [[0, 0], [0, 1]]
+            backend.last_trace["query_ids"], [[0, 0], [0, 0]]
         )
 
+        emit_target[0] = False
         backend.reset(4)
-        with self.assertRaises(NoObjectQueryFailure):
+        with self.assertRaisesRegex(RuntimeError, "emitted a non-target contact"):
             backend.predict(
                 xyz,
                 np.zeros((4, 3), dtype=np.float32),
                 np.eye(4),
-                np.full((1, 3), 9.0, dtype=np.float32),
-                np.ones(4, dtype=bool),
+                target_points,
+                target_membership,
             )
-        self.assertEqual(backend.last_trace["poses"].shape, (2, 4, 4))
-        self.assertFalse(np.any(backend.last_trace["target_contacts"]))
 
 
 if __name__ == "__main__":

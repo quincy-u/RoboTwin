@@ -24,8 +24,8 @@ mink_position_tolerance_m: 0.001
 mink_orientation_tolerance_rad: 0.01
 relax_orientation_on_failure: true
 save_grasp_visualizations: true
-max_visualized_grasps: 48
-max_visualized_points: 4000
+max_visualized_grasps: null  # null renders every candidate
+max_visualized_points: 30000
 
 # M2T2
 m2t2_checkpoint: checkpoints/m2t2.pth
