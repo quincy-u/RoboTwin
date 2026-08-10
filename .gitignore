@@ -37,3 +37,6 @@ eval_result/*
 logs/*
 obb_videos_active/*
 obb_visualizations/*
+
+# agent logs
+*.orig

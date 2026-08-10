@@ -43,14 +43,46 @@ def _execution_guard_failures(
 
 def _execution_guard_settings(
     model: HeuristicPolicy,
-) -> tuple[bool, float, float, float]:
+) -> tuple[bool, float, float, float, float, float]:
     args = getattr(model, "usr_args", {})
     return (
         bool(args.get("execution_guard_enabled", True)),
         float(args.get("execution_guard_qpos_tolerance_rad", 0.10)),
         float(args.get("execution_guard_ee_position_tolerance_m", 0.03)),
         float(args.get("execution_guard_ee_orientation_tolerance_rad", 0.20)),
+        float(args.get("execution_guard_gripper_min_delta", 0.10)),
+        float(args.get("execution_guard_gripper_settle_delta_max", 0.05)),
     )
+
+
+def _gripper_execution_guard_failures(
+    *,
+    initial_state: float | None,
+    states: list[float],
+    min_delta: float,
+    settle_delta_max: float,
+) -> list[str]:
+    """Check that closure responded and stopped moving before retreat."""
+    if not np.isfinite(min_delta) or not 0.0 < min_delta <= 1.0:
+        raise ValueError("execution_guard_gripper_min_delta must be in (0, 1]")
+    if not np.isfinite(settle_delta_max) or not 0.0 < settle_delta_max <= 1.0:
+        raise ValueError(
+            "execution_guard_gripper_settle_delta_max must be in (0, 1]"
+        )
+    if initial_state is None or not np.isfinite(initial_state):
+        return ["gripper_initial_physical_state=missing"]
+    if len(states) < 2 or not all(np.isfinite(value) for value in states[-2:]):
+        return ["gripper_settle_samples<2"]
+    failures: list[str] = []
+    closure_delta = float(initial_state) - float(states[-1])
+    if closure_delta < min_delta:
+        failures.append(f"gripper_closure_delta={closure_delta:.4f}<{min_delta:.4f}")
+    settle_delta = abs(float(states[-1]) - float(states[-2]))
+    if settle_delta > settle_delta_max:
+        failures.append(
+            f"gripper_settle_delta={settle_delta:.4f}>{settle_delta_max:.4f}"
+        )
+    return failures
 
 
 def _robot_measurements(task_env: Any, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -123,6 +155,25 @@ def _robot_measurements(task_env: Any, metadata: dict[str, Any]) -> dict[str, An
             result["target_z_m"] = float(target_pose[2])
         except (AttributeError, KeyError, TypeError, ValueError):
             pass
+        try:
+            actor = (task_env.get_tracked_objects() or {})[target_name]
+            entity = getattr(actor, "actor", actor)
+            actor_name = getattr(entity, "name", None)
+            if actor_name is None:
+                name_getter = getattr(actor, "get_name", None)
+                actor_name = name_getter() if callable(name_getter) else None
+            contact_getter = getattr(
+                task_env, "get_gripper_actor_contact_position", None
+            )
+            if actor_name and callable(contact_getter):
+                contacts = np.asarray(contact_getter(actor_name), dtype=np.float64)
+                result["target_gripper_contact_count"] = int(len(contacts))
+                if contacts.size:
+                    result["target_gripper_contact_positions"] = contacts.reshape(
+                        -1, 3
+                    ).astype(float).tolist()
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
     return result
 
 
@@ -166,6 +217,7 @@ def _print_endpoint(record: dict[str, Any]) -> None:
         f"gripper={record.get('gripper_target')}/"
         f"{record.get('gripper_state', 'n/a')}/"
         f"{record.get('gripper_physical_state', 'n/a')} "
+        f"contacts={record.get('target_gripper_contact_count', 'n/a')} "
         f"target_z={value('target_z_m', 'm')}"
     )
 
@@ -197,6 +249,8 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
         guard_qpos_tolerance,
         guard_position_tolerance,
         guard_orientation_tolerance,
+        guard_gripper_min_delta,
+        guard_gripper_settle_delta_max,
     ) = _execution_guard_settings(model)
     metadata = list(getattr(model, "last_action_metadata", []))
     if not metadata:
@@ -219,9 +273,33 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
         except OSError as exc:
             print(f"[heuristic] execution telemetry disabled: {exc}")
 
+    close_completed = False
+    close_initial_physical_state: float | None = None
+    close_physical_states: list[float] = []
     for action_index, (action, action_metadata) in enumerate(
         zip(actions, metadata)
     ):
+        phase = action_metadata.get("phase", "action")
+        endpoint = bool(action_metadata.get("endpoint", False))
+
+        # A task-level collision can set eval_success during an intermediate
+        # close pulse. Clear it so the remaining settle pulses are actually
+        # executed; validate the final physical response below.
+        if (
+            phase == "close"
+            and not close_completed
+            and task_env.take_action_cnt < task_env.step_lim
+        ):
+            if close_initial_physical_state is None:
+                try:
+                    before_close = _robot_measurements(task_env, action_metadata)
+                    value = before_close.get("gripper_physical_state")
+                    if value is not None and np.isfinite(value):
+                        close_initial_physical_state = float(value)
+                except Exception:
+                    pass
+            task_env.eval_success = False
+
         if getattr(task_env, "eval_success", False):
             status = "skipped_eval_success"
         elif task_env.take_action_cnt >= task_env.step_lim:
@@ -230,41 +308,83 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             task_env.take_action(action, action_type="qpos")
             status = "executed"
 
-        phase = action_metadata.get("phase", "action")
-        endpoint = bool(action_metadata.get("endpoint", False))
-        # A task can report success from a collision while an intermediate
-        # waypoint is still executing. Check that state immediately, before
-        # the next action is skipped because eval_success is already true.
-        guard_required = (
+        eval_success_reported = bool(getattr(task_env, "eval_success", False))
+        premature_success = (
+            eval_success_reported and not close_completed and phase != "close"
+        )
+        motion_guard_required = (
             guard_enabled
             and status == "executed"
             and phase in _MOTION_ENDPOINT_PHASES
-            and (endpoint or bool(getattr(task_env, "eval_success", False)))
+            and (endpoint or premature_success)
+        )
+        close_guard_required = (
+            guard_enabled
+            and status == "executed"
+            and phase == "close"
+            and endpoint
+        )
+        premature_guard_required = (
+            guard_enabled and status == "executed" and premature_success
+        )
+        guard_required = (
+            motion_guard_required
+            or close_guard_required
+            or premature_guard_required
+        )
+        measurement_required = (
+            telemetry_enabled
+            or guard_required
+            or (guard_enabled and status == "executed" and phase == "close")
         )
         measurements: dict[str, Any] = {}
-        if status == "executed" and (telemetry_enabled or guard_required):
+        if status == "executed" and measurement_required:
             try:
                 measurements = _robot_measurements(task_env, action_metadata)
             except Exception as exc:
                 measurements["telemetry_error"] = f"{type(exc).__name__}: {exc}"
 
+        if status == "executed" and phase == "close":
+            physical_state = measurements.get("gripper_physical_state")
+            if physical_state is not None and np.isfinite(physical_state):
+                close_physical_states.append(float(physical_state))
+
         guard_failures: list[str] = []
-        if guard_required:
-            guard_failures = _execution_guard_failures(
-                measurements,
-                qpos_tolerance_rad=guard_qpos_tolerance,
-                ee_position_tolerance_m=guard_position_tolerance,
-                ee_orientation_tolerance_rad=guard_orientation_tolerance,
-            )
-            if guard_failures:
-                task_env.eval_success = False
-                task_env.take_action_cnt = task_env.step_lim
-                status = "execution_guard_failed"
-                print(
-                    f"[heuristic][exec] guard failed phase={phase} "
-                    f"arm={action_metadata.get('arm')}: "
-                    + ", ".join(guard_failures)
+        if motion_guard_required:
+            guard_failures.extend(
+                _execution_guard_failures(
+                    measurements,
+                    qpos_tolerance_rad=guard_qpos_tolerance,
+                    ee_position_tolerance_m=guard_position_tolerance,
+                    ee_orientation_tolerance_rad=guard_orientation_tolerance,
                 )
+            )
+        if premature_guard_required:
+            guard_failures.append("eval_success_before_close")
+        if close_guard_required:
+            guard_failures.extend(
+                _gripper_execution_guard_failures(
+                    initial_state=close_initial_physical_state,
+                    states=close_physical_states,
+                    min_delta=guard_gripper_min_delta,
+                    settle_delta_max=guard_gripper_settle_delta_max,
+                )
+            )
+            if not guard_failures:
+                close_completed = True
+
+        if phase == "close" and not endpoint and eval_success_reported:
+            task_env.eval_success = False
+
+        if guard_failures:
+            task_env.eval_success = False
+            task_env.take_action_cnt = task_env.step_lim
+            status = "execution_guard_failed"
+            print(
+                f"[heuristic][exec] guard failed phase={phase} "
+                f"arm={action_metadata.get('arm')}: "
+                + ", ".join(guard_failures)
+            )
 
         if not telemetry_enabled:
             if status != "executed":
@@ -286,6 +406,7 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             "status": status,
             "sim_step": int(getattr(task_env, "take_action_cnt", 0)),
             "eval_success": bool(getattr(task_env, "eval_success", False)),
+            "eval_success_reported": eval_success_reported,
             "target_qpos": (
                 None
                 if target_qpos is None

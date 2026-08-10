@@ -561,6 +561,7 @@ class RoboTwinMinkIK:
         max_joint_step_rad: float = 0.12,
         max_waypoints_per_segment: int = 64,
         relax_orientation_on_failure: bool = True,
+        canonical_seed_on_failure: bool = False,
         ik_config: MinkIKConfig | None = None,
     ) -> None:
         self.task_env = task_env
@@ -573,6 +574,7 @@ class RoboTwinMinkIK:
         self.max_joint_step_rad = float(max_joint_step_rad)
         self.max_waypoints_per_segment = int(max_waypoints_per_segment)
         self.relax_orientation_on_failure = bool(relax_orientation_on_failure)
+        self.canonical_seed_on_failure = bool(canonical_seed_on_failure)
         robot = task_env.robot
         arms = {
             "left": MinkArmConfig(
@@ -609,6 +611,7 @@ class RoboTwinMinkIK:
         self.planner_attempts = 0
         self.successes = 0
         self.relaxed_successes = 0
+        self.canonical_seed_successes = 0
         self.over_limit_successes = 0
         self.failures: dict[str, int] = {}
         self.first_target: np.ndarray | None = None
@@ -776,18 +779,62 @@ class RoboTwinMinkIK:
             if (
                 joints is None
                 and stage == 0
-                and self.relax_orientation_on_failure
+                and (
+                    self.canonical_seed_on_failure
+                    or self.relax_orientation_on_failure
+                )
             ):
                 canonical_rotation = t3d.quaternions.quat2mat(
                     CANONICAL_COMMAND_QUATERNIONS[arm]
                 )
-                accepted_command_target = self._with_command_rotation(
+                canonical_target = self._with_command_rotation(
                     target, canonical_rotation
                 )
-                joints, path = self._solve_safe_target(
-                    arm, accepted_command_target, start
+                canonical_joints, canonical_path = self._solve_safe_target(
+                    arm, canonical_target, start
                 )
-                if joints is not None:
+                if (
+                    canonical_joints is not None
+                    and canonical_path is not None
+                    and self.canonical_seed_on_failure
+                ):
+                    # Use the canonical pose only as a numerical seed. The
+                    # simulator must move directly from the real start state
+                    # to the exact M2T2 solution, never through the seed pose.
+                    self._candidate_seed[arm] = canonical_joints.copy()
+                    exact_joints, exact_seed_path = self._solve_safe_target(
+                        arm, target, canonical_joints
+                    )
+                    if exact_joints is not None and exact_seed_path is not None:
+                        exact_joints = self._nearest_safe_revolute_solution(
+                            exact_joints, start
+                        )
+                        if exact_joints is None:
+                            self.failures["UnsafeJointBranch"] = (
+                                self.failures.get("UnsafeJointBranch", 0) + 1
+                            )
+                        else:
+                            direct_path = self._path(start, exact_joints)
+                            if len(direct_path) > self.max_waypoints_per_segment:
+                                self.failures["WaypointLimit"] = (
+                                    self.failures.get("WaypointLimit", 0) + 1
+                                )
+                            elif self._path_has_self_collision(arm, direct_path):
+                                self.failures["SelfCollision"] = (
+                                    self.failures.get("SelfCollision", 0) + 1
+                                )
+                            else:
+                                joints, path = exact_joints, direct_path
+                                accepted_command_target = target.copy()
+                                self.canonical_seed_successes += 1
+                if (
+                    joints is None
+                    and canonical_joints is not None
+                    and canonical_path is not None
+                    and self.relax_orientation_on_failure
+                ):
+                    joints, path = canonical_joints, canonical_path
+                    accepted_command_target = canonical_target
                     self.relaxed_successes += 1
             if joints is not None:
                 self._candidate_command_rotation = (
@@ -826,12 +873,16 @@ class QposActionBuffer:
         planner_ik: RoboTwinMinkIK,
         *,
         max_waypoints_per_segment: int = 64,
+        gripper_settle_actions: int = 5,
     ) -> None:
         if max_waypoints_per_segment < 2:
             raise ValueError("max_waypoints_per_segment must be at least 2")
+        if gripper_settle_actions < 1:
+            raise ValueError("gripper_settle_actions must be at least 1")
         self.task_env = task_env
         self.planner_ik = planner_ik
         self.max_waypoints_per_segment = int(max_waypoints_per_segment)
+        self.gripper_settle_actions = int(gripper_settle_actions)
         self.actions: list[np.ndarray] = []
         self.left = np.empty(0)
         self.right = np.empty(0)
@@ -947,11 +998,16 @@ class QposActionBuffer:
             self.right_gripper = value
         else:
             raise ValueError(f"unknown arm {arm!r}")
-        self._append(
-            phase="open" if value > 0.5 else "close",
-            arm=arm,
-            endpoint=True,
-        )
+        phase = "open" if value > 0.5 else "close"
+        repeat_count = 1 if phase == "open" else self.gripper_settle_actions
+        for waypoint_index in range(1, repeat_count + 1):
+            self._append(
+                phase=phase,
+                arm=arm,
+                endpoint=waypoint_index == repeat_count,
+                waypoint_index=waypoint_index,
+                waypoint_count=repeat_count,
+            )
 
 
 class ConfidenceRankedGrasps:
@@ -1029,9 +1085,11 @@ class RoboTwinHeuristicRuntime:
         grasp_to_robotwin: np.ndarray,
         max_waypoints_per_segment: int = 64,
         max_joint_step_rad: float = 0.12,
+        gripper_settle_actions: int = 5,
         mink_model_path: str | Path | None = None,
         mink_config: MinkIKConfig | None = None,
-        relax_orientation_on_failure: bool = True,
+        relax_orientation_on_failure: bool = False,
+        canonical_seed_on_failure: bool = True,
         save_grasp_visualizations: bool = True,
         visualization_dir: str | Path | None = None,
         max_visualized_grasps: int | None = None,
@@ -1079,12 +1137,14 @@ class RoboTwinHeuristicRuntime:
             max_joint_step_rad=max_joint_step_rad,
             max_waypoints_per_segment=max_waypoints_per_segment,
             relax_orientation_on_failure=relax_orientation_on_failure,
+            canonical_seed_on_failure=canonical_seed_on_failure,
             ik_config=mink_config,
         )
         self.controller = QposActionBuffer(
             task_env,
             self.ik,
             max_waypoints_per_segment=max_waypoints_per_segment,
+            gripper_settle_actions=gripper_settle_actions,
         )
         self.backend = grasps.backend
 
@@ -1223,6 +1283,7 @@ class RoboTwinHeuristicRuntime:
                 f"{exc}; Mink IK accepted {self.ik.successes}/"
                 f"{self.ik.calls} stages across {self.ik.planner_attempts} attempts "
                 f"({self.ik.relaxed_successes} canonical retries); "
+                f"canonical_seed_successes={self.ik.canonical_seed_successes}; "
                 f"failures={self.ik.failures}; "
                 f"target_position={np.array2string(target.world_pose[:3, 3], precision=3)}; "
                 f"first_target={np.array2string(self.ik.first_target, precision=3)}"
@@ -1294,6 +1355,7 @@ def create_runtime(
             usr_args.get("max_waypoints_per_segment", 64)
         ),
         max_joint_step_rad=float(usr_args.get("max_joint_step_rad", 0.12)),
+        gripper_settle_actions=int(usr_args.get("gripper_settle_actions", 5)),
         mink_model_path=usr_args.get("mink_model_path"),
         mink_config=MinkIKConfig(
             solver=str(usr_args.get("mink_solver", "daqp")),
@@ -1307,7 +1369,10 @@ def create_runtime(
             ),
         ),
         relax_orientation_on_failure=bool(
-            usr_args.get("relax_orientation_on_failure", True)
+            usr_args.get("relax_orientation_on_failure", False)
+        ),
+        canonical_seed_on_failure=bool(
+            usr_args.get("canonical_seed_on_failure", True)
         ),
         save_grasp_visualizations=bool(
             usr_args.get("save_grasp_visualizations", True)

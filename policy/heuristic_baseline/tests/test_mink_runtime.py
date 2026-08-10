@@ -133,6 +133,49 @@ class MinkRuntimeTest(unittest.TestCase):
             np.array([0.12, 0.0, 0.0]),
         )
 
+    def test_canonical_bridge_ends_at_exact_selected_orientation(self):
+        bridge = np.full(6, -0.10)
+        exact_pregrasp = np.full(6, 0.20)
+        exact_grasp = np.full(6, 0.25)
+        exact_retreat = np.full(6, 0.30)
+        fake = FakeSolver(
+            [None, bridge, exact_pregrasp, exact_grasp, exact_retreat]
+        )
+        with patch(
+            "policy.heuristic_baseline.runtime.MinkIKSolver.from_xml_path",
+            return_value=fake,
+        ):
+            ik = RoboTwinMinkIK(
+                Env(),
+                I,
+                model_path="unused.urdf",
+                max_joint_step_rad=0.1,
+                relax_orientation_on_failure=False,
+                canonical_seed_on_failure=True,
+            )
+
+        actual = [ik.solve("right", I) for _ in range(3)]
+
+        np.testing.assert_allclose(actual[0], exact_pregrasp)
+        np.testing.assert_allclose(actual[1], exact_grasp)
+        np.testing.assert_allclose(actual[2], exact_retreat)
+        self.assertEqual(len(fake.calls), 5)
+        np.testing.assert_allclose(fake.calls[0][1], I)
+        np.testing.assert_allclose(fake.calls[2][1], I)
+        np.testing.assert_allclose(
+            fake.calls[1][1][:3, :3],
+            t3d.quaternions.quat2mat(
+                CANONICAL_COMMAND_QUATERNIONS["right"]
+            ),
+        )
+        self.assertEqual(ik.canonical_seed_successes, 1)
+        self.assertEqual(ik.relaxed_successes, 0)
+        np.testing.assert_allclose(ik.selected_grasp_command_pose, I)
+        pregrasp_path = ik.consume_path("right", exact_pregrasp)
+        self.assertGreaterEqual(len(pregrasp_path), 2)
+        self.assertTrue(np.all(pregrasp_path >= 0.0))
+
+
     def test_latches_mink_accepted_orientation_across_all_stages(self):
         goals = [np.full(6, value) for value in (0.1, 0.2, 0.3)]
         ik, fake = self.make_ik([None, goals[0], goals[1], goals[2]])
@@ -508,6 +551,24 @@ class MinkRuntimeTest(unittest.TestCase):
             all(item["command_pose"] is not None for item in endpoints[1:3])
         )
         self.assertIsNotNone(endpoints[-1]["command_pose"])
+        close_actions = [
+            item for item in buffer.metadata if item["phase"] == "close"
+        ]
+        self.assertEqual(len(close_actions), 5)
+        self.assertEqual(
+            [item["endpoint"] for item in close_actions],
+            [False, False, False, False, True],
+        )
+        self.assertEqual(
+            [item["waypoint_index"] for item in close_actions],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertTrue(
+            all(item["waypoint_count"] == 5 for item in close_actions)
+        )
+        self.assertTrue(
+            all(item["target_gripper"] == 0.0 for item in close_actions)
+        )
 
     def test_mink_and_qpos_buffer_prefer_measured_joint_state(self):
         class MeasuredRobot(Robot):
