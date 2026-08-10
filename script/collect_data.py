@@ -241,37 +241,51 @@ def run(TASK_ENV, args):
         for episode_idx in range(st_idx, target_count):
             print(f"\033[34mTask name: {args['task_name']}\033[0m")
 
-            TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
+            # A seed that was stable during Phase-1 planning can become unstable during Phase-2
+            # replay (physics nondeterminism). Mirror the seed-collection loop's handling so a
+            # single bad seed skips one episode instead of crashing the whole task mid-run
+            # (which previously truncated the dataset, e.g. dump_bin_bigbin -> 475/500).
+            try:
+                TASK_ENV.setup_demo(now_ep_num=episode_idx, seed=seed_list[episode_idx], **args)
 
-            traj_data = TASK_ENV.load_tran_data(episode_idx)
-            args["left_joint_path"] = traj_data["left_joint_path"]
-            args["right_joint_path"] = traj_data["right_joint_path"]
-            TASK_ENV.set_path_lst(args)
+                traj_data = TASK_ENV.load_tran_data(episode_idx)
+                args["left_joint_path"] = traj_data["left_joint_path"]
+                args["right_joint_path"] = traj_data["right_joint_path"]
+                TASK_ENV.set_path_lst(args)
 
-            info_file_path = os.path.join(args["save_path"], "scene_info.json")
+                info_file_path = os.path.join(args["save_path"], "scene_info.json")
 
-            if not os.path.exists(info_file_path):
+                if not os.path.exists(info_file_path):
+                    with open(info_file_path, "w", encoding="utf-8") as file:
+                        json.dump({}, file, ensure_ascii=False)
+
+                with open(info_file_path, "r", encoding="utf-8") as file:
+                    info_db = json.load(file)
+
+                info = TASK_ENV.play_once()
+                info_db[f"episode_{episode_idx}"] = info
+
                 with open(info_file_path, "w", encoding="utf-8") as file:
-                    json.dump({}, file, ensure_ascii=False)
+                    json.dump(info_db, file, ensure_ascii=False, indent=4)
 
-            with open(info_file_path, "r", encoding="utf-8") as file:
-                info_db = json.load(file)
-
-            info = TASK_ENV.play_once()
-            info_db[f"episode_{episode_idx}"] = info
-
-            with open(info_file_path, "w", encoding="utf-8") as file:
-                json.dump(info_db, file, ensure_ascii=False, indent=4)
-
-            TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
-            if getattr(TASK_ENV, "FRAME_IDX", 0) == 0:
-                print(f"\033[93m[skip episode {episode_idx}] no frames captured during replay\033[0m")
+                TASK_ENV.close_env(clear_cache=((episode_idx + 1) % clear_cache_freq == 0))
+                if getattr(TASK_ENV, "FRAME_IDX", 0) == 0:
+                    print(f"\033[93m[skip episode {episode_idx}] no frames captured during replay\033[0m")
+                    continue
+                TASK_ENV.merge_pkl_to_hdf5_video()
+                TASK_ENV.save_obb2d()
+                TASK_ENV.remove_data_cache()
+                if not collect_failure and user_target_noise_std == 0.0:
+                    assert TASK_ENV.check_success(), "Collect Error"
+            except UnStableError as e:
+                print(f"\033[93m[skip episode {episode_idx}] UnStableError on seed "
+                      f"{seed_list[episode_idx]} during replay: {e}\033[0m")
+                try:
+                    TASK_ENV.close_env()
+                except Exception:
+                    pass
+                time.sleep(0.3)
                 continue
-            TASK_ENV.merge_pkl_to_hdf5_video()
-            TASK_ENV.save_obb2d()
-            TASK_ENV.remove_data_cache()
-            if not collect_failure and user_target_noise_std == 0.0:
-                assert TASK_ENV.check_success(), "Collect Error"
 
         if not collect_failure and user_target_noise_std == 0.0:
             command = f"cd description && bash gen_episode_instructions.sh {args['task_name']} {args['task_config']} {args['language_num']}"

@@ -37,3 +37,5 @@ eval_result/*
 logs/*
 obb_videos_active/*
 obb_visualizations/*
+obb_videos/*
+policy/*
