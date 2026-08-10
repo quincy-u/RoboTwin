@@ -14,9 +14,9 @@ from simple_grasp.types import GraspCandidate, ObjectState, SceneObservation
 
 from policy.heuristic_baseline.errors import NoFeasiblePlanFailure, TargetSelectionFailure
 from policy.heuristic_baseline.runtime import (
+    ConfidenceRankedGrasps,
     M2T2_TO_ROBOTWIN,
     QposActionBuffer,
-    ReachabilityRankedGrasps,
     RoboTwinHeuristicRuntime,
     RoboTwinMinkIK,
 )
@@ -228,14 +228,14 @@ class PlannerPathTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-finite"):
             ik.solve("right", I)
 
-    def test_raw_confidence_filter_precedes_geometric_ranking(self):
+    def test_raw_confidence_filter_precedes_confidence_ranking(self):
         target_pose = I.copy()
         target_pose[0, 3] = 1.0
         target = ObjectState("cube", target_pose, 7)
         low = GraspCandidate(I, 0.39, "cube")
         accepted = GraspCandidate(I, 0.4, "cube")
-        ranked = ReachabilityRankedGrasps(
-            Grasps([low, accepted]), Env([]), "right", min_confidence=0.4
+        ranked = ConfidenceRankedGrasps(
+            Grasps([low, accepted]), min_confidence=0.4
         ).propose(scene(objects={"cube": target}), target)
 
         self.assertEqual(len(ranked), 1)

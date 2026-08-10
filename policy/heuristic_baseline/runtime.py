@@ -35,7 +35,6 @@ CANONICAL_COMMAND_QUATERNIONS = {
     "right": np.array([-0.353523, 0.61239, -0.353524, -0.61239]),
     "left": np.array([-0.61239, 0.353523, -0.61239, -0.353524]),
 }
-PARALLEL_JAW_ROLL_SYMMETRY = np.diag([1.0, -1.0, -1.0])
 SELECTED_GRASP_COLOR = "#ff2d95"
 SELECTED_GRASP_RGB = (255, 45, 149)
 M2T2_GRIPPER_POLYLINE = np.array(
@@ -727,47 +726,17 @@ class QposActionBuffer:
         self._append()
 
 
-class ReachabilityRankedGrasps:
-    """Rank target-contact grasps by canonical command orientation first."""
+class ConfidenceRankedGrasps:
+    """Filter target grasps and rank solely by raw M2T2 confidence."""
 
     def __init__(
         self,
         grasps: M2T2GraspGenerator,
-        arm: str,
-        grasp_to_robotwin: np.ndarray,
         min_confidence: float = 0.0,
     ) -> None:
-        if arm not in CANONICAL_COMMAND_QUATERNIONS:
-            raise ValueError(f"unknown arm {arm!r}")
-        transform = np.asarray(grasp_to_robotwin, dtype=np.float64)
-        if transform.shape != (4, 4):
-            raise ValueError("grasp_to_robotwin must have shape (4, 4)")
         self.grasps = grasps
-        self.arm = arm
-        self.command_axis_map = transform[:3, :3].copy()
-        self.canonical_command_rotation = t3d.quaternions.quat2mat(
-            CANONICAL_COMMAND_QUATERNIONS[arm]
-        )
         self.min_confidence = float(min_confidence)
         self.last_candidates: list[GraspCandidate] = []
-
-    @staticmethod
-    def _rotation_distance(first: np.ndarray, second: np.ndarray) -> float:
-        relative = np.asarray(first).T @ np.asarray(second)
-        cosine = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
-        return float(np.arccos(cosine))
-
-    def _orientation_error(self, pose: np.ndarray) -> float:
-        command_rotation = pose[:3, :3] @ self.command_axis_map
-        rolled_rotation = command_rotation @ PARALLEL_JAW_ROLL_SYMMETRY
-        return min(
-            self._rotation_distance(
-                self.canonical_command_rotation, command_rotation
-            ),
-            self._rotation_distance(
-                self.canonical_command_rotation, rolled_rotation
-            ),
-        )
 
     def propose(
         self, observation: SceneObservation, target: ObjectState
@@ -779,30 +748,45 @@ class ReachabilityRankedGrasps:
             if candidate.confidence >= self.min_confidence
         ]
 
-        ranked = []
+        confidence_candidates = []
         for candidate in candidates:
-            pose = np.array(candidate.world_grasp_pose, dtype=np.float64, copy=True)
+            pose = np.array(
+                candidate.world_grasp_pose, dtype=np.float64, copy=True
+            )
             approximate_contact_center = pose[:3, 3] + 0.1034 * pose[:3, 2]
             target_center = target.world_pose[:3, 3]
             if np.linalg.norm(approximate_contact_center - target_center) > 0.08:
                 pose[:3, 3] = target_center - 0.1034 * pose[:3, 2]
+            confidence_candidates.append(
+                GraspCandidate(
+                    pose,
+                    float(candidate.confidence),
+                    candidate.object_name,
+                )
+            )
 
-            orientation_error = self._orientation_error(pose)
-            # Nearest canonical top-down orientation is the primary key. M2T2
-            # confidence breaks ties; a 180-degree roll about the approach axis
-            # is equivalent for the parallel-jaw gripper.
-            ranking_score = (
-                1.0
-                + 10.0 * (np.pi - orientation_error)
-                + 0.01 * candidate.confidence
-            )
-            ranked.append(
-                GraspCandidate(pose, ranking_score, candidate.object_name)
-            )
+        # Python's sort is stable, so equal-confidence M2T2 candidates retain
+        # their generator order. Orientation is neither scored nor used here.
         self.last_candidates = sorted(
-            ranked, key=lambda item: item.confidence, reverse=True
+            confidence_candidates,
+            key=lambda item: item.confidence,
+            reverse=True,
         )
         return list(self.last_candidates)
+
+
+# Backward-compatible name and call signature. The legacy arm and transform
+# arguments are deliberately ignored: they cannot affect confidence ranking.
+class ReachabilityRankedGrasps(ConfidenceRankedGrasps):
+    def __init__(
+        self,
+        grasps: M2T2GraspGenerator,
+        arm: Any | None = None,
+        grasp_to_robotwin: np.ndarray | None = None,
+        min_confidence: float = 0.0,
+    ) -> None:
+        del arm, grasp_to_robotwin
+        super().__init__(grasps, min_confidence=min_confidence)
 
 
 class RoboTwinHeuristicRuntime:
@@ -985,11 +969,8 @@ class RoboTwinHeuristicRuntime:
 
         self.controller.reset()
         self.ik.reset_stats()
-        ranker = ReachabilityRankedGrasps(
-            self.grasps,
-            arm,
-            self.ik.grasp_to_robotwin,
-            min_confidence=self.config.min_confidence,
+        ranker = ConfidenceRankedGrasps(
+            self.grasps, min_confidence=self.config.min_confidence
         )
         policy = SimpleGraspPolicy(
             self.simulator,

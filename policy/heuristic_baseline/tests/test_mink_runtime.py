@@ -10,11 +10,10 @@ import transforms3d as t3d
 
 from policy.heuristic_baseline.runtime import (
     CANONICAL_COMMAND_QUATERNIONS,
+    ConfidenceRankedGrasps,
     M2T2_TO_ROBOTWIN,
     M2T2_GRIPPER_POLYLINE,
-    PARALLEL_JAW_ROLL_SYMMETRY,
     QposActionBuffer,
-    ReachabilityRankedGrasps,
     RoboTwinMinkIK,
     SELECTED_GRASP_COLOR,
     _grasp_wireframes,
@@ -131,7 +130,7 @@ class MinkRuntimeTest(unittest.TestCase):
         )
         np.testing.assert_allclose(accepted[:3, 3], np.zeros(3))
 
-    def test_canonical_orientation_outranks_higher_confidence_sideways_grasp(self):
+    def test_higher_confidence_wins_regardless_of_orientation(self):
         axis_map = M2T2_TO_ROBOTWIN[:3, :3]
         canonical_command = t3d.quaternions.quat2mat(
             CANONICAL_COMMAND_QUATERNIONS["right"]
@@ -144,39 +143,43 @@ class MinkRuntimeTest(unittest.TestCase):
         sideways_pose = I.copy()
         sideways_pose[:3, :3] = canonical_command @ quarter_turn @ axis_map.T
         candidates = [
-            GraspCandidate(sideways_pose, 0.99, "target"),
             GraspCandidate(canonical_pose, 0.40, "target"),
+            GraspCandidate(sideways_pose, 0.99, "target"),
         ]
-        ranker = ReachabilityRankedGrasps(
-            FakeGrasps(candidates), "right", M2T2_TO_ROBOTWIN
+        ranker = ConfidenceRankedGrasps(
+            FakeGrasps(candidates), min_confidence=0.0
         )
         target = ObjectState("target", I, 1)
 
         ranked = ranker.propose(None, target)
 
+        self.assertEqual([item.confidence for item in ranked], [0.99, 0.40])
         np.testing.assert_allclose(
-            ranked[0].world_grasp_pose[:3, :3], canonical_pose[:3, :3]
+            ranked[0].world_grasp_pose[:3, :3], sideways_pose[:3, :3]
         )
         self.assertEqual(len(ranker.last_candidates), 2)
         self.assertIs(ranker.last_candidates[0], ranked[0])
 
-    def test_parallel_jaw_half_roll_has_same_orientation_error(self):
-        axis_map = M2T2_TO_ROBOTWIN[:3, :3]
-        canonical_command = t3d.quaternions.quat2mat(
-            CANONICAL_COMMAND_QUATERNIONS["left"]
+    def test_equal_confidence_preserves_generator_order(self):
+        first_pose = I.copy()
+        second_pose = I.copy()
+        second_pose[:3, :3] = np.array(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
         )
-        canonical_pose = I.copy()
-        canonical_pose[:3, :3] = canonical_command @ axis_map.T
-        rolled_pose = I.copy()
-        rolled_pose[:3, :3] = (
-            canonical_command @ PARALLEL_JAW_ROLL_SYMMETRY @ axis_map.T
-        )
-        ranker = ReachabilityRankedGrasps(
-            FakeGrasps([]), "left", M2T2_TO_ROBOTWIN
-        )
+        candidates = [
+            GraspCandidate(first_pose, 0.75, "target"),
+            GraspCandidate(second_pose, 0.75, "target"),
+        ]
+        ranker = ConfidenceRankedGrasps(FakeGrasps(candidates))
+        target_pose = I.copy()
+        target_pose[2, 3] = 0.1034
+        target = ObjectState("target", target_pose, 1)
 
-        self.assertAlmostEqual(ranker._orientation_error(canonical_pose), 0.0)
-        self.assertAlmostEqual(ranker._orientation_error(rolled_pose), 0.0)
+        ranked = ranker.propose(None, target)
+
+        np.testing.assert_allclose(ranked[0].world_grasp_pose, first_pose)
+        np.testing.assert_allclose(ranked[1].world_grasp_pose, second_pose)
+        self.assertEqual([item.confidence for item in ranked], [0.75, 0.75])
 
     def test_m2t2_wireframe_projects_with_robotwin_cv_camera(self):
         poses = np.repeat(I[None, :, :], 2, axis=0)
