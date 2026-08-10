@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import mujoco
 import numpy as np
 import transforms3d as t3d
 
@@ -16,6 +17,7 @@ from policy.heuristic_baseline.runtime import (
     QposActionBuffer,
     RoboTwinMinkIK,
     SELECTED_GRASP_COLOR,
+    _aloha_self_collision_config,
     _grasp_wireframes,
     _project_world_points_cv,
     save_grasp_visualization,
@@ -86,7 +88,7 @@ class MinkRuntimeTest(unittest.TestCase):
         return ik, fake
 
     def test_chains_mink_solutions_and_builds_bounded_paths(self):
-        goals = [np.full(6, value) for value in (0.2, 0.3, 0.4)]
+        goals = [np.full(6, value) for value in (0.95, 1.05, 1.15)]
         ik, fake = self.make_ik(goals)
 
         actual = [ik.solve("right", I) for _ in range(3)]
@@ -94,15 +96,23 @@ class MinkRuntimeTest(unittest.TestCase):
         for result, expected in zip(actual, goals):
             np.testing.assert_allclose(result, expected)
         self.assertEqual(len(fake.calls), 3)
-        expected_rotation = np.diag([1.0, -1.0, -1.0])
-        np.testing.assert_allclose(fake.calls[0][1][:3, :3], expected_rotation)
+        np.testing.assert_allclose(fake.calls[0][1][:3, :3], np.eye(3))
+        previous = np.zeros(6)
+        paths = []
         for goal in goals:
             path = ik.consume_path("right", goal)
+            paths.append(path)
             self.assertGreaterEqual(len(path), 2)
-            self.assertLessEqual(len(path), 8)
             np.testing.assert_allclose(path[-1], goal)
+            with_start = np.vstack((previous, path))
+            self.assertLessEqual(
+                float(np.max(np.abs(np.diff(with_start, axis=0)))),
+                ik.max_joint_step_rad + 1e-12,
+            )
+            previous = goal
+        self.assertGreater(len(paths[0]), 8)
 
-    def test_retries_with_canonical_orientation(self):
+    def test_retries_with_canonical_orientation_and_preserves_tcp(self):
         goal = np.arange(6, dtype=np.float64) * 0.01
         ik, fake = self.make_ik([None, goal])
 
@@ -111,24 +121,153 @@ class MinkRuntimeTest(unittest.TestCase):
         np.testing.assert_allclose(result, goal)
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(ik.relaxed_successes, 1)
+        canonical = fake.calls[1][1]
+        np.testing.assert_allclose(
+            canonical[:3, :3],
+            t3d.quaternions.quat2mat(
+                CANONICAL_COMMAND_QUATERNIONS["right"]
+            ),
+        )
+        np.testing.assert_allclose(
+            canonical[:3, 3] + 0.12 * canonical[:3, 0],
+            np.array([0.12, 0.0, 0.0]),
+        )
 
-    def test_records_exact_mink_accepted_grasp_command(self):
+    def test_latches_mink_accepted_orientation_across_all_stages(self):
         goals = [np.full(6, value) for value in (0.1, 0.2, 0.3)]
-        ik, _ = self.make_ik([goals[0], None, goals[1], goals[2]])
+        ik, fake = self.make_ik([None, goals[0], goals[1], goals[2]])
 
         actual = [ik.solve("right", I) for _ in range(3)]
 
         for result, expected in zip(actual, goals):
             np.testing.assert_allclose(result, expected)
+        self.assertEqual(len(fake.calls), 4)
+        canonical_rotation = t3d.quaternions.quat2mat(
+            CANONICAL_COMMAND_QUATERNIONS["right"]
+        )
+        for _, target in fake.calls[1:]:
+            np.testing.assert_allclose(target[:3, :3], canonical_rotation)
+            np.testing.assert_allclose(
+                target[:3, 3] + 0.12 * target[:3, 0],
+                np.array([0.12, 0.0, 0.0]),
+            )
         accepted = ik.selected_grasp_command_pose
         self.assertIsNotNone(accepted)
-        np.testing.assert_allclose(
-            accepted[:3, :3],
-            t3d.quaternions.quat2mat(
-                CANONICAL_COMMAND_QUATERNIONS["right"]
-            ),
+        np.testing.assert_allclose(accepted, fake.calls[2][1])
+
+    def test_wraps_revolute_solution_to_nearest_safe_branch(self):
+        raw = np.array(
+            [
+                2.0 * np.pi + 0.25,
+                -2.0 * np.pi - 0.30,
+                0.4,
+                -0.5,
+                4.0 * np.pi + 0.6,
+                -4.0 * np.pi - 0.7,
+            ]
         )
-        np.testing.assert_allclose(accepted[:3, 3], np.zeros(3))
+        ik, _ = self.make_ik([raw])
+
+        actual = ik.solve("right", I)
+
+        np.testing.assert_allclose(
+            actual, np.array([0.25, -0.30, 0.4, -0.5, 0.6, -0.7])
+        )
+        self.assertTrue(np.all(np.abs(actual) <= np.pi))
+
+    def test_aloha_collision_config_contains_both_arm_groups(self):
+        model_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets"
+            / "embodiments"
+            / "aloha-agilex"
+            / "urdf"
+            / "arx5_description_isaac.urdf"
+        )
+        model = mujoco.MjModel.from_xml_path(str(model_path))
+
+        config = _aloha_self_collision_config(model)
+
+        self.assertEqual(len(config.geom_pairs), 2)
+        for geom_group, same_group in config.geom_pairs:
+            self.assertEqual(geom_group, same_group)
+            self.assertGreaterEqual(len(geom_group), 8)
+
+    def test_failed_trace_uses_collision_free_tcp_preserving_chain(self):
+        class WorldPose:
+            def to_transformation_matrix(self):
+                pose = I.copy()
+                pose[:3, :3] = t3d.quaternions.quat2mat(
+                    [0.707, 0.0, 0.0, 0.707]
+                )
+                pose[:3, 3] = [0.0, -0.65, 0.0]
+                return pose
+
+        class RealRobot(Robot):
+            left_entity_origion_pose = WorldPose()
+            right_entity_origion_pose = WorldPose()
+
+            def get_left_arm_real_jointState(self):
+                return np.r_[np.zeros(6), 1.0]
+
+            def get_right_arm_real_jointState(self):
+                return np.r_[np.zeros(6), 1.0]
+
+        class RealEnv:
+            robot = RealRobot()
+
+        rotation = np.array(
+            [
+                [0.0580159845, 0.9808343830, 0.1860055338],
+                [-0.3003783012, 0.1948358701, -0.9337086590],
+                [-0.9520541065, -0.0017019992, 0.3059249606],
+            ]
+        )
+        poses = []
+        for position in (
+            [0.0948227233, -0.0688552869, 0.9386393998],
+            [0.0977235225, -0.0838742020, 0.8910366944],
+            [0.0977235225, -0.0838742020, 0.9410366944],
+        ):
+            pose = I.copy()
+            pose[:3, :3] = rotation
+            pose[:3, 3] = position
+            poses.append(pose)
+        model_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets"
+            / "embodiments"
+            / "aloha-agilex"
+            / "urdf"
+            / "arx5_description_isaac.urdf"
+        )
+        ik = RoboTwinMinkIK(
+            RealEnv(),
+            I,
+            model_path=model_path,
+            max_waypoints_per_segment=64,
+            relax_orientation_on_failure=True,
+        )
+
+        joints = [ik.solve("right", pose) for pose in poses]
+
+        self.assertTrue(all(item is not None for item in joints))
+        self.assertGreaterEqual(ik.failures.get("SelfCollision", 0), 1)
+        self.assertEqual(ik.relaxed_successes, 1)
+        previous = np.zeros(6)
+        for target in joints:
+            path = ik.consume_path("right", target)
+            self.assertFalse(ik._path_has_self_collision("right", path))
+            self.assertLessEqual(
+                np.max(np.abs(np.diff(np.vstack((previous, path)), axis=0))),
+                0.12 + 1e-12,
+            )
+            previous = target
+        accepted = ik.selected_grasp_command_pose
+        np.testing.assert_allclose(
+            accepted[:3, 3] + 0.12 * accepted[:3, 0],
+            poses[1][:3, 3] + 0.12 * poses[1][:3, 0],
+        )
 
     def test_higher_confidence_wins_regardless_of_orientation(self):
         axis_map = M2T2_TO_ROBOTWIN[:3, :3]

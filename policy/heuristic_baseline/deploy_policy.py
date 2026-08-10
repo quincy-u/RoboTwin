@@ -13,6 +13,46 @@ from .model import HeuristicPolicy
 from .observation import encode_obs
 
 
+_MOTION_ENDPOINT_PHASES = frozenset({"pregrasp", "grasp", "retreat"})
+
+
+def _execution_guard_failures(
+    measurements: dict[str, Any],
+    *,
+    qpos_tolerance_rad: float,
+    ee_position_tolerance_m: float,
+    ee_orientation_tolerance_rad: float,
+) -> list[str]:
+    """Return concise reasons why measured execution missed its command."""
+    limits = (
+        ("qpos_max_error_rad", qpos_tolerance_rad),
+        ("ee_position_error_m", ee_position_tolerance_m),
+        ("ee_orientation_error_raw_rad", ee_orientation_tolerance_rad),
+    )
+    failures: list[str] = []
+    for name, limit in limits:
+        if not np.isfinite(limit) or limit <= 0.0:
+            raise ValueError(f"{name} tolerance must be finite and positive")
+        value = measurements.get(name)
+        if value is None or not np.isfinite(value):
+            failures.append(f"{name}=missing")
+        elif float(value) > limit:
+            failures.append(f"{name}={float(value):.4f}>{limit:.4f}")
+    return failures
+
+
+def _execution_guard_settings(
+    model: HeuristicPolicy,
+) -> tuple[bool, float, float, float]:
+    args = getattr(model, "usr_args", {})
+    return (
+        bool(args.get("execution_guard_enabled", True)),
+        float(args.get("execution_guard_qpos_tolerance_rad", 0.10)),
+        float(args.get("execution_guard_ee_position_tolerance_m", 0.03)),
+        float(args.get("execution_guard_ee_orientation_tolerance_rad", 0.20)),
+    )
+
+
 def _robot_measurements(task_env: Any, metadata: dict[str, Any]) -> dict[str, Any]:
     arm = metadata.get("arm")
     robot = task_env.robot
@@ -65,26 +105,12 @@ def _robot_measurements(task_env: Any, metadata: dict[str, Any]) -> dict[str, An
                     (np.trace(delta_rotation) - 1.0) / 2.0, -1.0, 1.0
                 )
                 raw_orientation_error = float(np.arccos(raw_cosine))
-                # ALOHA's SAPIEN and MuJoCo link frames differ by a fixed
-                # half-roll about local X. Report both the raw frame error and
-                # the error after accounting for that representation change.
-                frame_equivalence = np.diag([1.0, -1.0, -1.0])
-                equivalent_rotation = (
-                    target[:3, :3] @ frame_equivalence
-                ).T @ actual_rotation
-                equivalent_cosine = np.clip(
-                    (np.trace(equivalent_rotation) - 1.0) / 2.0,
-                    -1.0,
-                    1.0,
-                )
                 result["actual_ee_pose"] = actual.tolist()
                 result["ee_position_error_m"] = float(
                     np.linalg.norm(target[:3, 3] - actual[:3])
                 )
                 result["ee_orientation_error_raw_rad"] = raw_orientation_error
-                result["ee_orientation_error_rad"] = min(
-                    raw_orientation_error, float(np.arccos(equivalent_cosine))
-                )
+                result["ee_orientation_error_rad"] = raw_orientation_error
 
     target_name = metadata.get("target_name")
     result["target_name"] = target_name
@@ -166,6 +192,12 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
     telemetry_enabled = bool(
         getattr(model, "usr_args", {}).get("execution_telemetry", True)
     )
+    (
+        guard_enabled,
+        guard_qpos_tolerance,
+        guard_position_tolerance,
+        guard_orientation_tolerance,
+    ) = _execution_guard_settings(model)
     metadata = list(getattr(model, "last_action_metadata", []))
     if not metadata:
         metadata = [
@@ -198,6 +230,42 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             task_env.take_action(action, action_type="qpos")
             status = "executed"
 
+        phase = action_metadata.get("phase", "action")
+        endpoint = bool(action_metadata.get("endpoint", False))
+        # A task can report success from a collision while an intermediate
+        # waypoint is still executing. Check that state immediately, before
+        # the next action is skipped because eval_success is already true.
+        guard_required = (
+            guard_enabled
+            and status == "executed"
+            and phase in _MOTION_ENDPOINT_PHASES
+            and (endpoint or bool(getattr(task_env, "eval_success", False)))
+        )
+        measurements: dict[str, Any] = {}
+        if status == "executed" and (telemetry_enabled or guard_required):
+            try:
+                measurements = _robot_measurements(task_env, action_metadata)
+            except Exception as exc:
+                measurements["telemetry_error"] = f"{type(exc).__name__}: {exc}"
+
+        guard_failures: list[str] = []
+        if guard_required:
+            guard_failures = _execution_guard_failures(
+                measurements,
+                qpos_tolerance_rad=guard_qpos_tolerance,
+                ee_position_tolerance_m=guard_position_tolerance,
+                ee_orientation_tolerance_rad=guard_orientation_tolerance,
+            )
+            if guard_failures:
+                task_env.eval_success = False
+                task_env.take_action_cnt = task_env.step_lim
+                status = "execution_guard_failed"
+                print(
+                    f"[heuristic][exec] guard failed phase={phase} "
+                    f"arm={action_metadata.get('arm')}: "
+                    + ", ".join(guard_failures)
+                )
+
         if not telemetry_enabled:
             if status != "executed":
                 break
@@ -210,9 +278,9 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             "seed": int(getattr(task_env, "episode_seed", 0)),
             "batch_index": batch_index,
             "action_index": action_index,
-            "phase": action_metadata.get("phase", "action"),
+            "phase": phase,
             "arm": action_metadata.get("arm"),
-            "endpoint": bool(action_metadata.get("endpoint", False)),
+            "endpoint": endpoint,
             "waypoint_index": int(action_metadata.get("waypoint_index", 1)),
             "waypoint_count": int(action_metadata.get("waypoint_count", 1)),
             "status": status,
@@ -229,17 +297,17 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
                 if command_pose is None
                 else np.asarray(command_pose, dtype=np.float64).tolist()
             ),
+            "execution_guard_failures": guard_failures,
         }
-        try:
-            record.update(_robot_measurements(task_env, action_metadata))
-        except Exception as exc:
-            record["telemetry_error"] = f"{type(exc).__name__}: {exc}"
+        record.update(measurements)
         try:
             _write_execution_record(trace_path, record)
         except OSError as exc:
             print(f"[heuristic] execution trace write failed: {exc}")
             trace_path = None
         _print_endpoint(record)
+        if guard_failures:
+            break
 
 
 def reset_model(model: HeuristicPolicy) -> None:

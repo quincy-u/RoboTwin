@@ -5,11 +5,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import mujoco
 import numpy as np
 import transforms3d as t3d
 
 from simple_grasp.m2t2_adapter import M2T2GraspGenerator
-from simple_grasp.mink_ik import MinkArmConfig, MinkIKConfig, MinkIKSolver
+from simple_grasp.mink_ik import (
+    MinkArmConfig,
+    MinkCollisionConfig,
+    MinkIKConfig,
+    MinkIKSolver,
+)
 from simple_grasp.policy import PolicyConfig, SimpleGraspPolicy
 from simple_grasp.types import GraspCandidate, ObjectState, SceneObservation
 
@@ -503,6 +509,46 @@ def _arm_joint_state(task_env: Any, arm: str) -> np.ndarray:
     return state
 
 
+def _aloha_self_collision_config(model: mujoco.MjModel) -> MinkCollisionConfig:
+    """Replace placeholder limits and constrain non-adjacent arm links."""
+    for prefix in ("fl_joint", "fr_joint"):
+        for index in range(1, 7):
+            joint_name = f"{prefix}{index}"
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+            )
+            if joint_id < 0:
+                raise ValueError(f"Mink model lacks arm joint {joint_name}")
+            # RoboTwin's URDF uses the placeholder range [-10, 10], which
+            # permits multi-turn IK branches the physical arm cannot execute.
+            model.jnt_limited[joint_id] = 1
+            model.jnt_range[joint_id] = (-np.pi, np.pi)
+
+    geom_pairs = []
+    for prefix in ("fl_link", "fr_link"):
+        geom_ids = tuple(
+            geom_id
+            for geom_id in range(model.ngeom)
+            if (
+                mujoco.mj_id2name(
+                    model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    int(model.geom_bodyid[geom_id]),
+                )
+                or ""
+            ).startswith(prefix)
+        )
+        if len(geom_ids) < 2:
+            raise ValueError(f"Mink model has no collision group for {prefix}")
+        geom_pairs.append((geom_ids, geom_ids))
+    return MinkCollisionConfig(
+        geom_pairs=tuple(geom_pairs),
+        minimum_distance_m=0.002,
+        detection_distance_m=0.03,
+        bound_relaxation=0.001,
+    )
+
+
 class RoboTwinMinkIK:
     """Mink pose IK with joint-space interpolation for RoboTwin qpos control."""
 
@@ -513,7 +559,7 @@ class RoboTwinMinkIK:
         *,
         model_path: str | Path,
         max_joint_step_rad: float = 0.12,
-        max_waypoints_per_segment: int = 8,
+        max_waypoints_per_segment: int = 64,
         relax_orientation_on_failure: bool = True,
         ik_config: MinkIKConfig | None = None,
     ) -> None:
@@ -543,6 +589,7 @@ class RoboTwinMinkIK:
             model_path,
             arms,
             self._joint_positions,
+            collision_provider=_aloha_self_collision_config,
             world_from_model=self._world_from_model,
             config=ik_config or MinkIKConfig(),
         )
@@ -569,6 +616,7 @@ class RoboTwinMinkIK:
         self._candidate_seed = {}
         self._candidate_paths = []
         self._completed_paths = []
+        self._candidate_command_rotation: np.ndarray | None = None
         self._candidate_command_targets: list[np.ndarray] = []
         self._completed_command_targets: list[np.ndarray] = []
 
@@ -584,11 +632,107 @@ class RoboTwinMinkIK:
         """Accepted world command poses for pregrasp, grasp, and retreat."""
         return tuple(item.copy() for item in self._completed_command_targets)
 
+    @staticmethod
+    def _with_command_rotation(
+        target: np.ndarray, rotation: np.ndarray
+    ) -> np.ndarray:
+        """Change wrist rotation while preserving the 12 cm logical TCP."""
+        result = np.asarray(target, dtype=np.float64).copy()
+        tcp = result[:3, 3] + 0.12 * result[:3, 0]
+        result[:3, :3] = np.asarray(rotation, dtype=np.float64)
+        result[:3, 3] = tcp - 0.12 * result[:3, 0]
+        return result
+
+    @staticmethod
+    def _nearest_safe_revolute_solution(
+        joints: np.ndarray, reference: np.ndarray
+    ) -> np.ndarray | None:
+        """Use an equivalent [-pi, pi] branch without a >pi stage jump."""
+        joints = np.asarray(joints, dtype=np.float64)
+        reference = np.asarray(reference, dtype=np.float64)
+        if joints.shape != reference.shape or not np.all(np.isfinite(joints)):
+            return None
+        wrapped = (joints + np.pi) % (2.0 * np.pi) - np.pi
+        if np.any(np.abs(reference) > np.pi + 1e-6):
+            return None
+        if np.any(np.abs(wrapped - reference) > np.pi + 1e-6):
+            return None
+        return wrapped
+
     def _path(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
         delta = float(np.max(np.abs(target - start)))
         steps = max(2, int(np.ceil(delta / self.max_joint_step_rad)))
-        steps = min(steps, self.max_waypoints_per_segment)
         return np.linspace(start, target, steps + 1, dtype=np.float64)[1:]
+
+    def _path_has_self_collision(self, arm: str, path: np.ndarray) -> bool:
+        """Return whether any waypoint penetrates non-adjacent active-arm links."""
+        model = getattr(self.solver, "model", None)
+        if model is None:
+            return False
+        prefix = "fl_link" if arm == "left" else "fr_link"
+        arm_body_ids = {
+            body_id
+            for body_id in range(model.nbody)
+            if (
+                mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                )
+                or ""
+            ).startswith(prefix)
+        }
+        joint_names = tuple(
+            getattr(self.task_env.robot, f"{arm}_arm_joints_name")
+        )
+        qpos_indices = []
+        for joint_name in joint_names:
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+            )
+            if joint_id < 0:
+                raise ValueError(f"Mink model lacks arm joint {joint_name}")
+            qpos_indices.append(int(model.jnt_qposadr[joint_id]))
+
+        data = mujoco.MjData(model)
+        for joints in np.asarray(path, dtype=np.float64):
+            data.qpos[:] = model.qpos0
+            data.qpos[qpos_indices] = joints
+            mujoco.mj_forward(model, data)
+            for contact in data.contact[: data.ncon]:
+                first_body = int(model.geom_bodyid[contact.geom1])
+                second_body = int(model.geom_bodyid[contact.geom2])
+                if (
+                    first_body in arm_body_ids
+                    and second_body in arm_body_ids
+                    and contact.dist < -1e-4
+                ):
+                    return True
+        return False
+
+    def _solve_safe_target(
+        self, arm: str, target: np.ndarray, start: np.ndarray
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        self.planner_attempts += 1
+        joints = self.solver.solve(arm, target)
+        if joints is None:
+            return None, None
+        joints = self._nearest_safe_revolute_solution(joints, start)
+        if joints is None:
+            self.failures["UnsafeJointBranch"] = (
+                self.failures.get("UnsafeJointBranch", 0) + 1
+            )
+            return None, None
+        path = self._path(start, joints)
+        if len(path) > self.max_waypoints_per_segment:
+            self.failures["WaypointLimit"] = (
+                self.failures.get("WaypointLimit", 0) + 1
+            )
+            return None, None
+        if self._path_has_self_collision(arm, path):
+            self.failures["SelfCollision"] = (
+                self.failures.get("SelfCollision", 0) + 1
+            )
+            return None, None
+        return joints, path
 
     def consume_path(self, arm: str, target: np.ndarray) -> np.ndarray | None:
         if not self._completed_paths:
@@ -606,6 +750,7 @@ class RoboTwinMinkIK:
             self._candidate_seed = {arm: self._joint_positions(arm)}
             self._candidate_paths = []
             self._completed_paths = []
+            self._candidate_command_rotation = None
             self._candidate_command_targets = []
             self._completed_command_targets = []
         if arm not in self._candidate_seed:
@@ -614,40 +759,48 @@ class RoboTwinMinkIK:
         target = np.asarray(world_grasp_pose, dtype=np.float64) @ self.grasp_to_robotwin
         if self.first_target is None:
             self.first_target = target.copy()
-        frame_rotation = (
-            np.asarray(getattr(self.task_env.robot, f"{arm}_global_trans_matrix"))
-            @ np.asarray(getattr(self.task_env.robot, f"{arm}_delta_matrix"))
-        )
-        mink_target = target.copy()
-        mink_target[:3, :3] = target[:3, :3] @ np.linalg.inv(frame_rotation)
-        self.planner_attempts += 1
-        joints = self.solver.solve(arm, mink_target)
-        accepted_command_target = target
-        if joints is None and self.relax_orientation_on_failure:
-            canonical_quat = CANONICAL_COMMAND_QUATERNIONS[arm]
-            canonical = target.copy()
-            canonical[:3, :3] = (
-                t3d.quaternions.quat2mat(canonical_quat)
-                @ np.linalg.inv(frame_rotation)
+
+        start = self._candidate_seed[arm]
+        accepted_command_target = target.copy()
+        if self._candidate_command_rotation is not None:
+            accepted_command_target = self._with_command_rotation(
+                target, self._candidate_command_rotation
             )
-            self.planner_attempts += 1
-            joints = self.solver.solve(arm, canonical)
-            if joints is not None:
-                accepted_command_target = target.copy()
-                accepted_command_target[:3, :3] = t3d.quaternions.quat2mat(
-                    canonical_quat
+            joints, path = self._solve_safe_target(
+                arm, accepted_command_target, start
+            )
+        else:
+            joints, path = self._solve_safe_target(
+                arm, accepted_command_target, start
+            )
+            if (
+                joints is None
+                and stage == 0
+                and self.relax_orientation_on_failure
+            ):
+                canonical_rotation = t3d.quaternions.quat2mat(
+                    CANONICAL_COMMAND_QUATERNIONS[arm]
                 )
-                self.relaxed_successes += 1
-        if joints is None:
+                accepted_command_target = self._with_command_rotation(
+                    target, canonical_rotation
+                )
+                joints, path = self._solve_safe_target(
+                    arm, accepted_command_target, start
+                )
+                if joints is not None:
+                    self.relaxed_successes += 1
+            if joints is not None:
+                self._candidate_command_rotation = (
+                    accepted_command_target[:3, :3].copy()
+                )
+
+        if joints is None or path is None:
             self.failures["NoSolution"] = self.failures.get("NoSolution", 0) + 1
             self._candidate_seed = {}
             self._candidate_paths = []
+            self._candidate_command_rotation = None
             self._candidate_command_targets = []
             return None
-
-        joints = np.asarray(joints, dtype=np.float64)
-        start = self._candidate_seed[arm]
-        path = self._path(start, joints)
         self._candidate_paths.append(path)
         self._candidate_command_targets.append(accepted_command_target.copy())
         self._candidate_seed[arm] = joints.copy()
@@ -658,6 +811,7 @@ class RoboTwinMinkIK:
                 item.copy() for item in self._candidate_command_targets
             ]
             self._candidate_paths = []
+            self._candidate_command_rotation = None
             self._candidate_command_targets = []
             self._candidate_seed = {}
         return joints.copy()
@@ -671,7 +825,7 @@ class QposActionBuffer:
         task_env: Any,
         planner_ik: RoboTwinMinkIK,
         *,
-        max_waypoints_per_segment: int = 8,
+        max_waypoints_per_segment: int = 64,
     ) -> None:
         if max_waypoints_per_segment < 2:
             raise ValueError("max_waypoints_per_segment must be at least 2")
@@ -732,12 +886,12 @@ class QposActionBuffer:
         )
 
     def _subsample(self, path: np.ndarray) -> np.ndarray:
-        if len(path) <= self.max_waypoints_per_segment:
-            return path
-        indices = np.linspace(
-            0, len(path) - 1, self.max_waypoints_per_segment, dtype=int
-        )
-        return path[indices]
+        if len(path) > self.max_waypoints_per_segment:
+            raise RuntimeError(
+                "Mink path exceeds max_waypoints_per_segment; refusing to "
+                "violate max_joint_step_rad"
+            )
+        return path
 
     def move_joints(self, arm: str, joints: np.ndarray) -> None:
         if arm not in {"left", "right"}:
@@ -873,7 +1027,7 @@ class RoboTwinHeuristicRuntime:
         automatic_target: bool,
         automatic_arm: bool,
         grasp_to_robotwin: np.ndarray,
-        max_waypoints_per_segment: int = 8,
+        max_waypoints_per_segment: int = 64,
         max_joint_step_rad: float = 0.12,
         mink_model_path: str | Path | None = None,
         mink_config: MinkIKConfig | None = None,
@@ -1137,7 +1291,7 @@ def create_runtime(
         automatic_arm=arm == "auto",
         grasp_to_robotwin=transform,
         max_waypoints_per_segment=int(
-            usr_args.get("max_waypoints_per_segment", 8)
+            usr_args.get("max_waypoints_per_segment", 64)
         ),
         max_joint_step_rad=float(usr_args.get("max_joint_step_rad", 0.12)),
         mink_model_path=usr_args.get("mink_model_path"),

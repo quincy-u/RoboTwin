@@ -15,7 +15,7 @@ min_confidence: 0.4
 max_candidates: 256
 pregrasp_offset_m: 0.05
 retreat_offset_m: 0.05
-max_waypoints_per_segment: 8
+max_waypoints_per_segment: 64
 max_joint_step_rad: 0.12
 mink_solver: daqp
 mink_dt: 0.05
@@ -24,6 +24,10 @@ mink_position_tolerance_m: 0.001
 mink_orientation_tolerance_rad: 0.01
 relax_orientation_on_failure: true
 execution_telemetry: true
+execution_guard_enabled: true
+execution_guard_qpos_tolerance_rad: 0.10
+execution_guard_ee_position_tolerance_m: 0.03
+execution_guard_ee_orientation_tolerance_rad: 0.20
 save_grasp_visualizations: true
 max_visualized_grasps: null  # null renders every candidate
 max_visualized_points: 30000
