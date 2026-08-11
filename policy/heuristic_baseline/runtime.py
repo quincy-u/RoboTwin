@@ -616,6 +616,7 @@ class RoboTwinMinkIK:
             ),
         }
         self._candidate_seed: dict[str, np.ndarray] = {}
+        self._joint_start_overrides: dict[str, np.ndarray] = {}
         self._candidate_paths: list[np.ndarray] = []
         self._completed_paths: list[np.ndarray] = []
         self.solver = MinkIKSolver.from_xml_path(
@@ -646,7 +647,23 @@ class RoboTwinMinkIK:
     def _joint_positions(self, arm: str) -> np.ndarray:
         if arm in self._candidate_seed:
             return self._candidate_seed[arm].copy()
+        if arm in self._joint_start_overrides:
+            return self._joint_start_overrides[arm].copy()
         return _arm_joint_state(self.task_env, arm)[:-1].copy()
+
+    def set_joint_start_override(
+        self, arm: str, joints: np.ndarray | None
+    ) -> None:
+        """Override the measured seed for independently planned future motion."""
+        if arm not in {"left", "right"}:
+            raise ValueError(f"unknown arm {arm!r}")
+        if joints is None:
+            self._joint_start_overrides.pop(arm, None)
+            return
+        values = np.asarray(joints, dtype=np.float64)
+        if values.shape != (6,) or not np.all(np.isfinite(values)):
+            raise ValueError("joint start override must be a finite 6-vector")
+        self._joint_start_overrides[arm] = values.copy()
 
     def _world_from_model(self, arm: str) -> np.ndarray:
         pose = getattr(self.task_env.robot, f"{arm}_entity_origion_pose")
@@ -966,6 +983,7 @@ class RoboTwinMinkIK:
         model: mujoco.MjModel,
         data: mujoco.MjData,
         monitored_body_ids: set[int],
+        allowed_body_pairs: frozenset[tuple[int, int]] = frozenset(),
     ) -> bool:
         """Reject new arm penetrations while preserving neutral mount overlap."""
         for contact in data.contact[: data.ncon]:
@@ -973,6 +991,9 @@ class RoboTwinMinkIK:
                 continue
             first_body = int(model.geom_bodyid[contact.geom1])
             second_body = int(model.geom_bodyid[contact.geom2])
+            body_pair = tuple(sorted((first_body, second_body)))
+            if body_pair in allowed_body_pairs:
+                continue
             if (
                 first_body not in monitored_body_ids
                 and second_body not in monitored_body_ids
@@ -1009,6 +1030,8 @@ class RoboTwinMinkIK:
         data = mujoco.MjData(model)
         for joints in np.asarray(path, dtype=np.float64):
             data.qpos[:] = model.qpos0
+            for other_arm, override in self._joint_start_overrides.items():
+                data.qpos[list(self._arm_qpos_indices(other_arm))] = override
             data.qpos[qpos_indices] = joints
             mujoco.mj_forward(model, data)
             if self._has_disallowed_arm_contact(model, data, arm_body_ids):
@@ -1098,6 +1121,7 @@ class RoboTwinMinkIK:
         actions: list[np.ndarray],
         *,
         max_joint_step_rad: float = 0.03,
+        allowed_body_pairs: frozenset[tuple[int, int]] = frozenset(),
     ) -> bool:
         """Check dense paired-arm motion against all robot/fixed geometry."""
         if max_joint_step_rad <= 0.0:
@@ -1155,11 +1179,58 @@ class RoboTwinMinkIK:
                 data.qpos[arm_indices["right"]] = joints[6:]
                 mujoco.mj_forward(model, data)
                 if self._has_disallowed_arm_contact(
-                    model, data, arm_body_ids
+                    model, data, arm_body_ids, allowed_body_pairs
                 ):
                     return True
             current = target
         return False
+
+    def handoff_path_has_self_collision(
+        self,
+        actions: list[np.ndarray],
+        *,
+        max_joint_step_rad: float = 0.03,
+    ) -> bool:
+        """Check a handoff while allowing terminal-link rendezvous contact."""
+        model = getattr(self.solver, "model", None)
+        if model is None:
+            return False
+        terminal_roots = []
+        for name in ("fl_link6", "fr_link6"):
+            body_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, name
+            )
+            if body_id < 0:
+                raise ValueError(f"Mink model lacks handoff body {name}")
+            terminal_roots.append(int(body_id))
+
+        def descendants(root: int) -> frozenset[int]:
+            bodies = set()
+            for body_id in range(model.nbody):
+                current = body_id
+                visited = set()
+                while current not in visited:
+                    if current == root:
+                        bodies.add(body_id)
+                        break
+                    if current == 0:
+                        break
+                    visited.add(current)
+                    current = int(model.body_parentid[current])
+            return frozenset(bodies)
+
+        left_terminal = descendants(terminal_roots[0])
+        right_terminal = descendants(terminal_roots[1])
+        allowed = frozenset(
+            tuple(sorted((left, right)))
+            for left in left_terminal
+            for right in right_terminal
+        )
+        return self.full_robot_path_has_self_collision(
+            actions,
+            max_joint_step_rad=max_joint_step_rad,
+            allowed_body_pairs=allowed,
+        )
 
     def consume_path(self, arm: str, target: np.ndarray) -> np.ndarray | None:
         if not self._completed_paths:
@@ -1777,12 +1848,54 @@ def _aligned_place_reference_pose(
             kwargs["actor_axis"] = grasp[:3, 2].copy()
             kwargs["align_axis"] = [0.0, 1.0, 0.0]
 
-    result = get_place_pose(
-        _pose7_from_matrix(source),
-        _pose7_from_matrix(destination),
-        constrain=resolved_constrain,
-        **kwargs,
-    )
+    try:
+        with np.errstate(invalid="raise", divide="raise"):
+            result = get_place_pose(
+                _pose7_from_matrix(source),
+                _pose7_from_matrix(destination),
+                constrain=resolved_constrain,
+                **kwargs,
+            )
+    except (FloatingPointError, np.linalg.LinAlgError):
+        if resolved_constrain != "free":
+            raise
+
+        # Free placement only constrains the reference Z direction. The
+        # shared helper computes arccos(dot) without clipping and can turn a
+        # numerically valid, nearly parallel pair into NaNs. Keep that
+        # numerical recovery local to the heuristic policy.
+        actor2world = np.array(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
+        ).T
+        source_axis = source[:3, :3] @ (
+            actor2world[:3, 2]
+            if z_transform
+            else np.array([0.0, 0.0, 1.0])
+        )
+        destination_axis = destination[:3, 2]
+        source_axis /= np.linalg.norm(source_axis)
+        destination_axis /= np.linalg.norm(destination_axis)
+        cross = np.cross(source_axis, destination_axis)
+        sine = float(np.linalg.norm(cross))
+        cosine = float(
+            np.clip(np.dot(source_axis, destination_axis), -1.0, 1.0)
+        )
+        if sine < 1e-8:
+            if cosine >= 0.0:
+                alignment = np.eye(3)
+            else:
+                basis = np.eye(3)[np.argmin(np.abs(source_axis))]
+                axis = np.cross(source_axis, basis)
+                axis /= np.linalg.norm(axis)
+                alignment = t3d.axangles.axangle2mat(axis, np.pi)
+        else:
+            alignment = t3d.axangles.axangle2mat(
+                cross / sine, np.arctan2(sine, cosine)
+            )
+        recovered = source.copy()
+        recovered[:3, :3] = alignment @ source[:3, :3]
+        recovered[:3, 3] = destination[:3, 3]
+        result = _pose7_from_matrix(recovered)
     return _pose_matrix(np.asarray(result), name="aligned_place_reference_pose")
 
 
@@ -3226,13 +3339,14 @@ class RoboTwinHeuristicRuntime:
         ]
         if len(picks) != 2 or len(places) != 2 or len(stages) != 4:
             return None
-        if (
-            getattr(picks[0], "group_id", None)
-            != getattr(picks[1], "group_id", None)
-            or getattr(places[0], "group_id", None)
-            != getattr(places[1], "group_id", None)
+        pick_group = getattr(picks[0], "group_id", None)
+        if pick_group is None or (
+            getattr(picks[1], "group_id", None) != pick_group
         ):
             return None
+        # Terminal placements may be recorded in separate expert move()
+        # calls. Pair them structurally by object instead of requiring their
+        # execution groups to match the simultaneous Pick group.
         place_by_object = {place.object: place for place in places}
         if len(place_by_object) != 2 or set(place_by_object) != {
             pick.target for pick in picks
@@ -3260,6 +3374,35 @@ class RoboTwinHeuristicRuntime:
                 zip(arms, pairs), key=lambda item: item[0]
             )
         )
+
+    @staticmethod
+    def _sequential_place_stages(
+        task_env: Any,
+    ) -> tuple[tuple[Pick, Place], ...] | None:
+        """Return three ordered Pick/Place chains from a recorded plan."""
+        task_plan = getattr(task_env, "heuristic_task_plan", None)
+        stages = tuple(getattr(task_plan, "stages", ()))
+        picks = [
+            stage for stage in stages
+            if getattr(stage, "target", None) is not None
+        ]
+        if len(picks) != 3 or len({pick.target for pick in picks}) != 3:
+            return None
+        terminal_places = {}
+        for stage in stages:
+            object_name = getattr(stage, "object", None)
+            if (
+                object_name is not None
+                and hasattr(stage, "preplace_offset_m")
+                and hasattr(stage, "place_offset_m")
+                and bool(getattr(stage, "release", False))
+            ):
+                terminal_places[object_name] = stage
+        if set(terminal_places) != {pick.target for pick in picks}:
+            return None
+        # Preserve expert object order while allowing intermediate Handoff or
+        # transport stages between each initial Pick and terminal Place.
+        return tuple((pick, terminal_places[pick.target]) for pick in picks)
 
     def _place_reference_poses(
         self,
@@ -3306,6 +3449,19 @@ class RoboTwinHeuristicRuntime:
                         f"{destination_name!r} lacks functional point "
                         f"{place.destination_functional_point_id}"
                     )
+            destination_offset = getattr(place, "destination_offset", None)
+            if destination_offset is not None:
+                destination_reference = _pose_matrix(
+                    destination_reference, name="destination_reference"
+                ).copy()
+                # A procedural 3-vector is converted by RoboTwin to a pose
+                # with an identity quaternion.  Anchor only its translation;
+                # the destination actor's randomized rotation is not part of
+                # the requested place goal.
+                destination_reference[:3, :3] = np.eye(3, dtype=np.float64)
+                destination_reference[:3, 3] += np.asarray(
+                    destination_offset, dtype=np.float64
+                )
         return (
             _pose_matrix(source_reference, name="source_reference"),
             _pose_matrix(destination_reference, name="destination_reference"),
@@ -3730,7 +3886,7 @@ class RoboTwinHeuristicRuntime:
             ))
             - support_rejections_before
         )
-        if not plans:
+        if not plans and getattr(place, "destination_offset", None) is None:
             plans = grasp_lift_plans
         return plans, list(ranker.last_candidates), trace, failures
 
@@ -4160,9 +4316,38 @@ class RoboTwinHeuristicRuntime:
                         local_contact,
                         adjusted,
                     ))
+        giver_aligned_variants = []
+        for candidate in ranked:
+            source_tcp = _grasp_command_tcp(
+                candidate.world_grasp_pose, self.ik.grasp_to_robotwin
+            )
+            source_local_tcp = (
+                world_from_object[:3, :3] @ source_tcp
+                + world_from_object[:3, 3]
+            )
+            anchor = giver_region[
+                int(np.argmin(
+                    np.linalg.norm(giver_region - source_local_tcp, axis=1)
+                ))
+            ]
+            giver_aligned_variants.append((
+                "recorded_contact_alignment",
+                candidate,
+                tuple(float(value) for value in anchor),
+                _align_grasp_pose_to_local_contact(
+                    candidate.world_grasp_pose,
+                    world_object,
+                    anchor,
+                    self.ik.grasp_to_robotwin,
+                ),
+            ))
 
         giver_plans: list[_HandoffArmPlan] = []
-        for variants in (giver_raw_variants, giver_fallback_variants):
+        for variants in (
+            giver_raw_variants,
+            giver_fallback_variants,
+            giver_aligned_variants,
+        ):
             for (
                 orientation_source, candidate, local_contact, grasp_pose
             ) in variants:
@@ -4250,9 +4435,38 @@ class RoboTwinHeuristicRuntime:
                         local_contact,
                         adjusted,
                     ))
+        receiver_aligned_variants = []
+        for candidate in ranked:
+            source_tcp = _grasp_command_tcp(
+                candidate.world_grasp_pose, self.ik.grasp_to_robotwin
+            )
+            source_local_tcp = (
+                world_from_object[:3, :3] @ source_tcp
+                + world_from_object[:3, 3]
+            )
+            anchor = receiver_region[
+                int(np.argmin(
+                    np.linalg.norm(receiver_region - source_local_tcp, axis=1)
+                ))
+            ]
+            receiver_aligned_variants.append((
+                "recorded_contact_alignment",
+                candidate,
+                tuple(float(value) for value in anchor),
+                _align_grasp_pose_to_local_contact(
+                    candidate.world_grasp_pose,
+                    world_object,
+                    anchor,
+                    self.ik.grasp_to_robotwin,
+                ),
+            ))
 
         receiver_plans: list[_HandoffArmPlan] = []
-        for variants in (receiver_raw_variants, receiver_fallback_variants):
+        for variants in (
+            receiver_raw_variants,
+            receiver_fallback_variants,
+            receiver_aligned_variants,
+        ):
             for (
                 orientation_source, candidate, local_contact,
                 source_grasp_pose,
@@ -4509,11 +4723,16 @@ class RoboTwinHeuristicRuntime:
         selected: tuple[_HandoffArmPlan, _HandoffArmPlan] | None = None
         actions: list[np.ndarray] = []
         collision_rejections = 0
+        collision_check = getattr(
+            self.ik,
+            "handoff_path_has_self_collision",
+            self.ik.full_robot_path_has_self_collision,
+        )
         for giver, receiver in pairs:
             candidate_actions = self._build_handoff_action_pair(
                 giver, receiver, release=place.release
             )
-            if self.ik.full_robot_path_has_self_collision(
+            if collision_check(
                 candidate_actions,
                 max_joint_step_rad=self.bimanual_collision_step_rad,
             ):
@@ -5158,6 +5377,15 @@ class RoboTwinHeuristicRuntime:
                 arm_source=arm_source,
                 plan_limit=self.bimanual_max_plans_per_arm,
             )
+            plans = [
+                plan
+                for plan in plans
+                if plan.completion_level == "place"
+                and len(plan.paths) >= (6 if place.release else 5)
+                and len(plan.command_targets) >= (
+                    6 if place.release else 5
+                )
+            ]
             if not plans:
                 self._save_grasp_visualization(
                     scene,
@@ -5171,7 +5399,8 @@ class RoboTwinHeuristicRuntime:
                 )
                 raise NoFeasiblePlanFailure(
                     "M2T2/Mink produced no complete grouped bimanual "
-                    f"placement plan for arm={arm}; failures={failures}; "
+                    f"placement plan for arm={arm} target={target.name}; "
+                    f"failures={failures}; "
                     f"ik_failures={self.ik.failures}"
                 )
             if arm in records:
@@ -5354,6 +5583,187 @@ class RoboTwinHeuristicRuntime:
         )
         return actions
 
+    def _get_sequential_place_action(
+        self,
+        scene: SceneObservation,
+        target_names: tuple[str, ...],
+        stage_pairs: tuple[tuple[Pick, Place], ...],
+    ) -> list[np.ndarray]:
+        """Plan and compose three recorded placements in expert order."""
+        if len(stage_pairs) != 3 or {
+            pick.target for pick, _ in stage_pairs
+        } != set(target_names):
+            raise TargetSelectionFailure(
+                "three-target manipulation requires matching Pick/Place chains"
+            )
+
+        planned = []
+        composed_joints = {
+            arm: _arm_joint_state(self.task_env, arm)[:-1].copy()
+            for arm in ("left", "right")
+        }
+        for stage_index, (pick, place) in enumerate(stage_pairs):
+            target = self.simulator.object_state(pick.target)
+            arm, arm_source = self._select_arm(target)
+            expected_arm = str(getattr(pick, "arm", "")).strip().lower()
+            if expected_arm in {"left", "right"} and arm != expected_arm:
+                raise TargetSelectionFailure(
+                    "recorded sequential Pick arm differs from selected arm"
+                )
+            self._configure_support_plane(scene, target, (arm,))
+            for composed_arm in ("left", "right"):
+                self.ik.set_joint_start_override(
+                    composed_arm, composed_joints[composed_arm]
+                )
+            try:
+                plans, ranked, trace, failures = self._plan_single_arm_place(
+                    scene,
+                    target,
+                    pick=pick,
+                    place=place,
+                    arm=arm,
+                    arm_source=arm_source,
+                    plan_limit=self.bimanual_max_plans_per_arm,
+                )
+            finally:
+                for composed_arm in ("left", "right"):
+                    self.ik.set_joint_start_override(composed_arm, None)
+            selected = plans[0] if plans else None
+            if selected is None or selected.completion_level != "place":
+                raise NoFeasiblePlanFailure(
+                    "M2T2/Mink produced no complete sequential placement "
+                    f"for target={target.name}; failures={failures}; "
+                    f"ik_failures={self.ik.failures}"
+                )
+            if not place.release:
+                raise TargetSelectionFailure(
+                    "sequential three-target placements must release each object"
+                )
+            clearance = None
+            if stage_index < len(stage_pairs) - 1:
+                for candidate_plan in plans:
+                    if candidate_plan.completion_level != "place":
+                        continue
+                    clearance_command = candidate_plan.command_targets[-1].copy()
+                    clearance_command[:3, 3] += np.array(
+                        [0.0, 0.0, self.config.retreat_offset_m],
+                        dtype=np.float64,
+                    )
+                    for composed_arm in ("left", "right"):
+                        self.ik.set_joint_start_override(
+                            composed_arm, composed_joints[composed_arm]
+                        )
+                    try:
+                        candidate_clearance = self.ik.solve_command_target(
+                            arm,
+                            clearance_command,
+                            candidate_plan.paths[-1][-1],
+                        )
+                    finally:
+                        for composed_arm in ("left", "right"):
+                            self.ik.set_joint_start_override(composed_arm, None)
+                    if candidate_clearance is not None:
+                        selected = candidate_plan
+                        clearance = candidate_clearance
+                        break
+                if clearance is None:
+                    raise NoFeasiblePlanFailure(
+                        "Mink found no collision-free world-Z clearance move "
+                        f"after target={target.name}"
+                    )
+            planned.append(
+                (target, pick, selected, clearance, ranked, trace, failures)
+            )
+            composed_joints[arm] = (
+                clearance[0].copy()
+                if clearance is not None
+                else selected.paths[-1][-1].copy()
+            )
+
+        controller = self.staged_controller
+        controller.reset()
+        for target, pick, selected, clearance, _, _, _ in planned:
+            arm = selected.arm
+            names = {arm: target.name}
+            sources = {arm: selected.arm_source}
+            controller.gripper_phase("open", {arm: 1.0}, 1, names, sources)
+            for phase, index in (("pregrasp", 0), ("grasp", 1)):
+                controller.move_phase(
+                    phase, {arm: selected.paths[index]},
+                    {arm: selected.command_targets[index]}, names, sources,
+                )
+            controller.gripper_phase(
+                "close",
+                {arm: float(getattr(pick, "gripper_target", 0.0))},
+                self.gripper_settle_actions,
+                names,
+                sources,
+            )
+            for phase, index in (
+                ("lift", 2), ("preplace", 3), ("place", 4)
+            ):
+                controller.move_phase(
+                    phase, {arm: selected.paths[index]},
+                    {arm: selected.command_targets[index]}, names, sources,
+                )
+            controller.gripper_phase(
+                "open", {arm: 1.0}, self.gripper_settle_actions, names, sources
+            )
+            controller.move_phase(
+                "retreat", {arm: selected.paths[5]},
+                {arm: selected.command_targets[5]}, names, sources,
+            )
+            if clearance is not None:
+                _, clearance_path, clearance_target = clearance
+                controller.move_phase(
+                    "clearance_z",
+                    {arm: clearance_path},
+                    {arm: clearance_target},
+                    names,
+                    sources,
+                )
+
+        actions = [action.copy() for action in controller.actions]
+        if self.ik.full_robot_path_has_self_collision(actions):
+            collision_stage = None
+            for index, metadata in enumerate(controller.metadata):
+                if (
+                    metadata.get("endpoint")
+                    and self.ik.full_robot_path_has_self_collision(
+                        actions[:index + 1]
+                    )
+                ):
+                    collision_stage = metadata
+                    break
+            details = ""
+            if collision_stage is not None:
+                details = (
+                    f"; phase={collision_stage.get('phase')} "
+                    f"arm={collision_stage.get('arm')} "
+                    f"target={collision_stage.get('target_name')}"
+                )
+            raise NoFeasiblePlanFailure(
+                "composed sequential three-target path has a robot collision"
+                + details
+            )
+        self._action_metadata_override = list(controller.metadata)
+        for target, _, selected, _, ranked, trace, failures in planned:
+            self._save_grasp_visualization(
+                scene, target, ranked, selected.candidate, selected.arm,
+                raw_trace_override=trace,
+                executed_command_pose_override=selected.command_targets[1],
+                use_default_executed_pose=False,
+            )
+            print(
+                "[heuristic] sequential placement selected "
+                f"target={target.name} arm={selected.arm} "
+                f"confidence={selected.candidate.confidence:.3f} "
+                f"orientation_source={selected.orientation_source} "
+                f"support_clearance_rejections="
+                f"{failures.get('support_clearance', 0)}"
+            )
+        return actions
+
 
     @property
     def action_metadata(self) -> list[dict[str, Any]]:
@@ -5410,6 +5820,17 @@ class RoboTwinHeuristicRuntime:
                 )
             return self._get_grouped_bimanual_place_action(
                 scene, target_names, grouped_stages
+            )
+        if len(target_names) == 3:
+            sequential_stages = self._sequential_place_stages(self.task_env)
+            if sequential_stages is None:
+                raise TargetSelectionFailure(
+                    "three-target manipulation requires three recorded "
+                    "sequential Pick/Place chains"
+                )
+            self.ik.reset_stats()
+            return self._get_sequential_place_action(
+                scene, target_names, sequential_stages
             )
         if len(target_names) != 1:
             raise TargetSelectionFailure(
@@ -5519,6 +5940,10 @@ class RoboTwinHeuristicRuntime:
             staged_controller.reset()
         self.bimanual_controller.reset()
         self.ik.reset_stats()
+        clear_start = getattr(self.ik, "set_joint_start_override", None)
+        if clear_start is not None:
+            for arm in ("left", "right"):
+                clear_start(arm, None)
         clear_support = getattr(self.ik, "clear_support_planes", None)
         if clear_support is not None:
             clear_support()

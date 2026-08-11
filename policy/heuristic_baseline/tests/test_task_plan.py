@@ -196,6 +196,22 @@ class TaskPlanTest(unittest.TestCase):
         self.assertIsNone(place_stage.destination_functional_point_id)
         np.testing.assert_allclose(place_stage.target_pose, target_pose)
 
+    def test_position_target_is_anchored_to_nearest_tracked_object(self):
+        source = Actor(pose(-0.2, 0.1, 0.75))
+        destination = Actor(pose(0.1, -0.1, 0.8))
+        env = Env({"object": source, "target_object": destination})
+
+        with ProceduralTaskRecorder(env) as recorder:
+            env.move(env.grasp_actor(source, "left"))
+            env.move(env.place_actor(source, "left", [-0.03, -0.1, 0.8]))
+
+        _, place_stage = task_plan_from_trace(
+            env, "place_a2b_left", recorder.trace
+        ).stages
+        self.assertEqual(place_stage.destination, "target_object")
+        self.assertEqual(place_stage.destination_offset, (-0.13, 0.0, 0.0))
+        self.assertIsNone(place_stage.target_pose)
+
     def test_actor_alias_is_not_misclassified_as_destination(self):
         source = Actor(pose(-0.2, 0.1, 0.75))
         env = Env({"source": source, "source_alias": source})
@@ -299,6 +315,48 @@ class TaskPlanTest(unittest.TestCase):
         self.assertEqual(place_stage.destination, "goal")
         self.assertEqual(place_stage.destination_functional_point_id, 1)
         self.assertEqual(place_stage.preplace_axis, "fp")
+
+    def test_terminal_handoff_displacement_becomes_nonrelease_place(self):
+        actor = Actor(pose(-0.15, 0.0, 0.8), functional=(local_pose(),))
+        env = Env({"object": actor})
+        rendezvous = pose(0.0, -0.05, 0.98)
+
+        with ProceduralTaskRecorder(env) as recorder:
+            env.move(env.grasp_actor(actor, "left"))
+            env.move(
+                env.place_actor(
+                    actor,
+                    "left",
+                    rendezvous,
+                    functional_point_id=0,
+                    pre_dis=0.0,
+                    dis=0.0,
+                    is_open=False,
+                    constrain="free",
+                )
+            )
+            env.move(env.grasp_actor(actor, "right"))
+            env.move(env.open_gripper("left"))
+            env.move(env.move_by_displacement("right", x=0.05))
+            env.move(env.move_by_displacement("right", y=-0.02))
+
+        plan = task_plan_from_trace(env, "terminal_transfer", recorder.trace)
+
+        self.assertEqual(plan.family, "handoff")
+        self.assertEqual(len(plan.stages), 3)
+        pick, handoff, terminal_place = plan.stages
+        self.assertIsInstance(pick, Pick)
+        self.assertIsInstance(handoff, Handoff)
+        self.assertIsInstance(terminal_place, Place)
+        self.assertEqual(terminal_place.arm, "right")
+        self.assertFalse(terminal_place.release)
+        self.assertEqual(terminal_place.constrain, "free")
+        self.assertEqual(terminal_place.preplace_offset_m, 0.0)
+        self.assertEqual(terminal_place.place_offset_m, 0.0)
+        expected = rendezvous.copy()
+        expected[0, 3] += 0.05
+        expected[1, 3] -= 0.02
+        np.testing.assert_allclose(terminal_place.target_pose, expected)
 
     def test_grouped_dual_pick_and_nonrelease_places_are_preserved(self):
         first = Actor(pose(-0.15, 0.1, 0.8), functional=(local_pose(),))

@@ -44,6 +44,7 @@ class Place:
     preplace_axis: str | Point3 = "grasp"
     release: bool = True
     target_pose: PoseMatrix | None = None
+    destination_offset: Point3 | None = None
     group_id: int | None = None
 
 
@@ -121,6 +122,7 @@ class PrimitiveCall:
     destination: str | None = None
     object_functional_point_id: int | None = None
     destination_functional_point_id: int | None = None
+    destination_offset: Point3 | None = None
     constrain: str | None = None
     preplace_axis: str | Point3 | None = None
     release: bool | None = None
@@ -211,6 +213,31 @@ def _match_destination(
     return matches[0]
 
 
+def _match_position_destination(
+    tracked: dict[str, Any], source_actor: Any, target_position: Any
+) -> tuple[str, Point3]:
+    """Anchor a position-only placement on the nearest tracked object."""
+    position = np.asarray(target_position, dtype=np.float64)
+    if position.shape != (3,) or not np.all(np.isfinite(position)):
+        raise ValueError("procedural position must be a finite 3-vector")
+    candidates: list[tuple[float, str, np.ndarray]] = []
+    for name, actor in tracked.items():
+        if actor is source_actor:
+            continue
+        try:
+            anchor = _pose_matrix(actor.get_pose())[:3, 3]
+        except (AttributeError, TypeError, ValueError):
+            continue
+        candidates.append((float(np.linalg.norm(position - anchor)), name, anchor))
+    if not candidates:
+        raise ValueError(
+            "procedural position requires another tracked object as its anchor"
+        )
+    _, name, anchor = min(candidates, key=lambda item: (item[0], item[1]))
+    offset = position - anchor
+    return name, tuple(float(value) for value in offset)  # type: ignore[return-value]
+
+
 def _allowed_contacts_local(
     actor: Any, contact_point_id: Any
 ) -> tuple[Point3, ...] | None:
@@ -239,6 +266,7 @@ class ProceduralTaskRecorder:
         "grasp_actor",
         "place_actor",
         "move_by_displacement",
+        "move_to_pose",
         "open_gripper",
         "move",
     )
@@ -253,6 +281,7 @@ class ProceduralTaskRecorder:
         self._execution_order: list[int] = []
         self._group_id = 0
         self._restore: dict[str, tuple[bool, Any]] = {}
+        self._held_object_by_arm: dict[str, str] = {}
 
     @property
     def trace(self) -> tuple[PrimitiveCall, ...]:
@@ -298,17 +327,21 @@ class ProceduralTaskRecorder:
         grasp = getattr(self.task_env, "grasp_actor")
         place = getattr(self.task_env, "place_actor")
         displacement = getattr(self.task_env, "move_by_displacement")
+        move_to_pose = getattr(self.task_env, "move_to_pose")
         open_gripper = getattr(self.task_env, "open_gripper")
         move = getattr(self.task_env, "move")
 
         def record_grasp(*args: Any, **kwargs: Any) -> Any:
             values = self._arguments(grasp, args, kwargs)
             actor = values["actor"]
+            arm = _normalize_arm(values["arm_tag"])
+            object_name = self._object_name(actor)
+            self._held_object_by_arm[arm] = object_name
             index = self._append(
                 PrimitiveCall(
                     "grasp",
-                    object_name=self._object_name(actor),
-                    arm=_normalize_arm(values["arm_tag"]),
+                    object_name=object_name,
+                    arm=arm,
                     pre_offset_m=float(values["pre_grasp_dis"]),
                     final_offset_m=float(values["grasp_dis"]),
                     gripper_target=float(values["gripper_pos"]),
@@ -327,9 +360,21 @@ class ProceduralTaskRecorder:
             if not isinstance(extras, dict):
                 extras = {}
             target_pose = values["target_pose"]
-            destination, destination_fp = _match_destination(
-                self._tracked, actor, target_pose
-            )
+            target_values = None
+            if not hasattr(target_pose, "to_transformation_matrix"):
+                target_values = np.asarray(target_pose, dtype=np.float64)
+            if target_values is not None and target_values.shape == (3,):
+                destination, destination_offset = _match_position_destination(
+                    self._tracked, actor, target_values
+                )
+                destination_fp = None
+                frozen_target_pose = None
+            else:
+                destination, destination_fp = _match_destination(
+                    self._tracked, actor, target_pose
+                )
+                destination_offset = None
+                frozen_target_pose = _freeze_pose(target_pose)
             index = self._append(
                 PrimitiveCall(
                     "place",
@@ -337,10 +382,11 @@ class ProceduralTaskRecorder:
                     arm=_normalize_arm(values["arm_tag"]),
                     pre_offset_m=float(values["pre_dis"]),
                     final_offset_m=float(values["dis"]),
-                    target_pose=_freeze_pose(target_pose),
+                    target_pose=frozen_target_pose,
                     destination=destination,
                     object_functional_point_id=values["functional_point_id"],
                     destination_functional_point_id=destination_fp,
+                    destination_offset=destination_offset,
                     constrain=str(extras.get("constrain", "auto")),
                     preplace_axis=_freeze_axis(
                         extras.get("pre_dis_axis", "grasp")
@@ -368,12 +414,52 @@ class ProceduralTaskRecorder:
                 index, displacement(*args, **kwargs)
             )
 
+        def record_move_to_pose(*args: Any, **kwargs: Any) -> Any:
+            values = self._arguments(move_to_pose, args, kwargs)
+            arm_tag = values["arm_tag"]
+            arm = _normalize_arm(arm_tag)
+            object_name = self._held_object_by_arm.get(arm)
+            if object_name is None:
+                return move_to_pose(*args, **kwargs)
+            held = self._tracked[object_name]
+            world_object = _pose_matrix(held.get_pose())
+            world_gripper = _pose_matrix(self.task_env.get_arm_pose(arm_tag))
+            desired_gripper = _pose_matrix(values["target_pose"])
+            desired_object = (
+                desired_gripper @ np.linalg.inv(world_gripper) @ world_object
+            )
+            index = self._append(
+                PrimitiveCall(
+                    "place",
+                    object_name=object_name,
+                    arm=arm,
+                    pre_offset_m=0.0,
+                    final_offset_m=0.0,
+                    target_pose=_freeze_pose(desired_object),
+                    constrain="free",
+                    preplace_axis="grasp",
+                    release=False,
+                )
+            )
+            return self._remember_result(
+                index, move_to_pose(*args, **kwargs)
+            )
+
         def record_open(*args: Any, **kwargs: Any) -> Any:
             values = self._arguments(open_gripper, args, kwargs)
+            arm = _normalize_arm(values["arm_tag"])
+            object_name = self._held_object_by_arm.get(arm)
+            target_pose = (
+                None
+                if object_name is None
+                else _freeze_pose(self._tracked[object_name].get_pose())
+            )
             index = self._append(
                 PrimitiveCall(
                     "open",
-                    arm=_normalize_arm(values["arm_tag"]),
+                    arm=arm,
+                    object_name=object_name,
+                    target_pose=target_pose,
                     gripper_target=float(values["pos"]),
                 )
             )
@@ -399,6 +485,7 @@ class ProceduralTaskRecorder:
         self._patch("grasp_actor", record_grasp)
         self._patch("place_actor", record_place)
         self._patch("move_by_displacement", record_displacement)
+        self._patch("move_to_pose", record_move_to_pose)
         self._patch("open_gripper", record_open)
         self._patch("move", record_move)
         return self
@@ -417,7 +504,11 @@ class ProceduralTaskRecorder:
 
 
 def _place_from_call(call: PrimitiveCall, *, release: bool | None = None) -> Place:
-    if call.object_name is None or call.arm is None or call.target_pose is None:
+    if (
+        call.object_name is None
+        or call.arm is None
+        or (call.target_pose is None and call.destination is None)
+    ):
         raise ValueError("incomplete recorded place primitive")
     return Place(
         object=call.object_name,
@@ -431,6 +522,7 @@ def _place_from_call(call: PrimitiveCall, *, release: bool | None = None) -> Pla
         preplace_axis=call.preplace_axis or "grasp",
         release=bool(call.release if release is None else release),
         target_pose=call.target_pose,
+        destination_offset=call.destination_offset,
         group_id=call.group_id,
     )
 
@@ -453,6 +545,8 @@ def task_plan_from_trace(
     active_object_by_arm: dict[str, str] = {}
     owner_by_object: dict[str, str] = {}
     active_pick_by_arm: dict[str, int] = {}
+    active_handoff_by_arm: dict[str, int] = {}
+    terminal_place_by_arm: dict[str, int] = {}
     pending_places: dict[str, tuple[int, PrimitiveCall]] = {}
 
     def flush_pending(object_name: str, *, release: bool | None = None) -> None:
@@ -497,6 +591,8 @@ def task_plan_from_trace(
                 owner_by_object[call.object_name] = call.arm
                 active_object_by_arm[call.arm] = call.object_name
                 active_pick_by_arm.pop(call.arm, None)
+                active_handoff_by_arm[call.arm] = len(stages) - 1
+                terminal_place_by_arm.pop(call.arm, None)
                 continue
 
             if pending is not None:
@@ -514,6 +610,8 @@ def task_plan_from_trace(
             active_object_by_arm[call.arm] = call.object_name
             owner_by_object[call.object_name] = call.arm
             active_pick_by_arm[call.arm] = len(stages) - 1
+            active_handoff_by_arm.pop(call.arm, None)
+            terminal_place_by_arm.pop(call.arm, None)
             continue
 
         if call.kind == "displacement" and call.arm is not None:
@@ -537,6 +635,52 @@ def task_plan_from_trace(
                         for first, second in zip(previous, call.displacement)
                     ),
                 )
+            handoff_index = active_handoff_by_arm.get(call.arm)
+            if (
+                object_name is not None
+                and owner_by_object.get(object_name) == call.arm
+                and handoff_index is not None
+                and call.move_axis == "world"
+                and call.displacement is not None
+            ):
+                handoff = stages[handoff_index]
+                if not isinstance(handoff, Handoff):
+                    raise RuntimeError("recorded handoff index is invalid")
+                terminal_index = terminal_place_by_arm.get(call.arm)
+                if terminal_index is None:
+                    rendezvous = handoff.rendezvous_pose
+                    if rendezvous is None:
+                        raise ValueError("recorded handoff lacks rendezvous pose")
+                    target = np.asarray(rendezvous, dtype=np.float64).copy()
+                else:
+                    terminal = stages[terminal_index]
+                    if not isinstance(terminal, Place):
+                        raise RuntimeError(
+                            "recorded terminal Place index is invalid"
+                        )
+                    target = np.asarray(
+                        terminal.target_pose, dtype=np.float64
+                    ).copy()
+                target[:3, 3] += np.asarray(call.displacement, dtype=np.float64)
+                terminal = Place(
+                    object=object_name,
+                    destination=None,
+                    arm=call.arm,
+                    object_functional_point_id=(
+                        handoff.object_functional_point_id
+                    ),
+                    target_pose=_freeze_pose(target),
+                    preplace_offset_m=0.0,
+                    place_offset_m=0.0,
+                    constrain="free",
+                    release=False,
+                    group_id=call.group_id,
+                )
+                if terminal_index is None:
+                    stages.append(terminal)
+                    terminal_place_by_arm[call.arm] = len(stages) - 1
+                else:
+                    stages[terminal_index] = terminal
             continue
 
         if call.kind == "place":
@@ -547,6 +691,8 @@ def task_plan_from_trace(
                 stages.append(_place_from_call(call))
                 active_object_by_arm.pop(call.arm, None)
                 active_pick_by_arm.pop(call.arm, None)
+                active_handoff_by_arm.pop(call.arm, None)
+                terminal_place_by_arm.pop(call.arm, None)
                 if owner_by_object.get(call.object_name) == call.arm:
                     owner_by_object.pop(call.object_name, None)
             else:
@@ -556,11 +702,30 @@ def task_plan_from_trace(
         if call.kind == "open" and call.arm is not None:
             object_name = active_object_by_arm.pop(call.arm, None)
             active_pick_by_arm.pop(call.arm, None)
+            active_handoff_by_arm.pop(call.arm, None)
+            terminal_place_by_arm.pop(call.arm, None)
             if object_name is None:
                 continue
             pending = pending_places.get(object_name)
             if pending is not None and pending[1].arm == call.arm:
                 flush_pending(object_name, release=True)
+            elif (
+                owner_by_object.get(object_name) == call.arm
+                and call.target_pose is not None
+            ):
+                stages.append(
+                    Place(
+                        object=object_name,
+                        destination=None,
+                        arm=call.arm,
+                        target_pose=call.target_pose,
+                        preplace_offset_m=0.0,
+                        place_offset_m=0.0,
+                        constrain="free",
+                        release=True,
+                        group_id=call.group_id,
+                    )
+                )
             if owner_by_object.get(object_name) == call.arm:
                 owner_by_object.pop(object_name, None)
 

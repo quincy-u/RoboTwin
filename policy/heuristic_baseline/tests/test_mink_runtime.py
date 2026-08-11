@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -100,6 +101,45 @@ class FakeGrasps:
 
 
 class MinkRuntimeTest(unittest.TestCase):
+    def test_position_relative_place_anchors_translation_not_rotation(self):
+        destination_pose = t3d.affines.compose(
+            [0.2, -0.1, 0.75],
+            t3d.axangles.axangle2mat([0.0, 0.0, 1.0], np.pi / 3.0),
+            [1.0, 1.0, 1.0],
+        )
+
+        class Actor:
+            def __init__(self, matrix):
+                self.matrix = matrix
+
+            def get_pose(self):
+                return SimpleNamespace(
+                    to_transformation_matrix=lambda: self.matrix.copy()
+                )
+
+        source_pose = I.copy()
+        source = Actor(source_pose)
+        destination = Actor(destination_pose)
+        runtime = object.__new__(RoboTwinHeuristicRuntime)
+        runtime.task_env = SimpleNamespace(
+            get_tracked_objects=lambda: {
+                "object": source,
+                "target_object": destination,
+            }
+        )
+        target = ObjectState("object", source_pose, 1)
+        place = Place(
+            "object",
+            "target_object",
+            "left",
+            destination_offset=(-0.13, 0.0, 0.0),
+        )
+
+        _, reference = runtime._place_reference_poses(target, place)
+
+        np.testing.assert_allclose(reference[:3, :3], np.eye(3), atol=1e-12)
+        np.testing.assert_allclose(reference[:3, 3], [0.07, -0.1, 0.75])
+
     def make_ik(self, results, **kwargs):
         fake = FakeSolver(results)
         with patch(
@@ -366,6 +406,27 @@ class MinkRuntimeTest(unittest.TestCase):
             paired_joints[:6], 0.0, paired_joints[6:], 0.0
         ]
         self.assertTrue(ik.full_robot_path_has_self_collision([full_action]))
+
+    def test_handoff_collision_filter_allows_only_named_body_pair(self):
+        ik = RoboTwinMinkIK.__new__(RoboTwinMinkIK)
+        ik._neutral_contact_depths = {}
+        model = SimpleNamespace(geom_bodyid=np.array([4, 9, 12]))
+        data = SimpleNamespace(
+            ncon=1,
+            contact=[SimpleNamespace(
+                dist=-0.01, geom1=0, geom2=1
+            )],
+        )
+
+        self.assertTrue(ik._has_disallowed_arm_contact(
+            model, data, {4, 9, 12}
+        ))
+        self.assertFalse(ik._has_disallowed_arm_contact(
+            model, data, {4, 9, 12}, frozenset({(4, 9)})
+        ))
+        self.assertTrue(ik._has_disallowed_arm_contact(
+            model, data, {4, 9, 12}, frozenset({(4, 12)})
+        ))
 
     def test_collision_checks_reject_failed_handoff_arm_world_contact(self):
         model_path = (
@@ -1805,6 +1866,26 @@ class MinkRuntimeTest(unittest.TestCase):
         self.assertEqual(giver_close["target_gripper"], 0.25)
         self.assertEqual(receiver_close["target_gripper"], 0.35)
 
+        grasps.candidates = [receiver_best, receiver_second]
+        runtime.ik = ExactIK()
+        with patch(
+            "policy.heuristic_baseline.runtime._target_m2t2_palm_depth",
+            return_value=0.08,
+        ):
+            giver_plans, receiver_plans, *_ = runtime._plan_handoff_sides(
+                scene, target, pick=pick, handoff=handoff, place=place
+            )
+
+        self.assertTrue(giver_plans)
+        self.assertTrue(receiver_plans)
+        self.assertTrue(all(
+            plan.orientation_source == "recorded_contact_alignment"
+            for plan in giver_plans
+        ))
+        self.assertTrue(all(
+            plan.contact_local_point[2] > 0.0 for plan in giver_plans
+        ))
+
     def test_handoff_pca_fallback_is_axis_sign_invariant(self):
         local_target = np.array([
             [-0.12, 0.00, 0.00], [-0.10, 0.01, 0.00],
@@ -1986,6 +2067,33 @@ class MinkRuntimeTest(unittest.TestCase):
         self.assertEqual(buffer.left_gripper, 0.75)
         self.assertEqual(buffer.right_gripper, 0.60)
 
+    def test_mink_joint_start_override_preempts_measured_state(self):
+        fake = FakeSolver([])
+        with patch(
+            "policy.heuristic_baseline.runtime.MinkIKSolver.from_xml_path",
+            return_value=fake,
+        ):
+            ik = RoboTwinMinkIK(Env(), I, model_path="unused.urdf")
+
+        override = np.linspace(0.1, 0.6, 6)
+        ik.set_joint_start_override("left", override)
+        np.testing.assert_allclose(ik._joint_positions("left"), override)
+        np.testing.assert_allclose(ik._joint_positions("right"), np.zeros(6))
+
+        ik.set_joint_start_override("left", None)
+        np.testing.assert_allclose(ik._joint_positions("left"), np.zeros(6))
+
+    def test_mink_joint_start_override_rejects_invalid_shape(self):
+        fake = FakeSolver([])
+        with patch(
+            "policy.heuristic_baseline.runtime.MinkIKSolver.from_xml_path",
+            return_value=fake,
+        ):
+            ik = RoboTwinMinkIK(Env(), I, model_path="unused.urdf")
+
+        with self.assertRaisesRegex(ValueError, "finite 6-vector"):
+            ik.set_joint_start_override("left", np.zeros(5))
+
     def test_place_dispatch_is_structural_across_module_namespaces(self):
         foreign_pick = SimpleNamespace(target="shoe", arm="right")
         foreign_place = SimpleNamespace(
@@ -2005,6 +2113,42 @@ class MinkRuntimeTest(unittest.TestCase):
         self.assertIsNotNone(actual)
         self.assertIs(actual[0], foreign_pick)
         self.assertIs(actual[1], foreign_place)
+
+    def test_three_sequential_places_are_task_name_independent(self):
+        pairs = tuple(
+            (
+                Pick(f"box_{index}", "left" if index == 0 else "right"),
+                Place(f"box_{index}", None, target_pose=I),
+            )
+            for index in range(3)
+        )
+        env = SimpleNamespace(
+            heuristic_task_plan=TaskPlan(
+                "blocks_ranking_size",
+                "pick_place",
+                tuple(stage for pair in pairs for stage in pair),
+            )
+        )
+
+        actual = RoboTwinHeuristicRuntime._sequential_place_stages(env)
+
+        self.assertEqual(actual, pairs)
+
+    def test_three_sequential_places_reject_mismatched_objects(self):
+        stages = (
+            Pick("red", "left"), Place("red", None, target_pose=I),
+            Pick("green", "right"), Place("blue", None, target_pose=I),
+            Pick("blue", "right"), Place("blue", None, target_pose=I),
+        )
+        env = SimpleNamespace(
+            heuristic_task_plan=TaskPlan(
+                "blocks_ranking_rgb", "pick_place", stages
+            )
+        )
+
+        self.assertIsNone(
+            RoboTwinHeuristicRuntime._sequential_place_stages(env)
+        )
 
 
     def test_auto_arm_prefers_robotwin_ground_truth_over_geometry(self):
@@ -2179,6 +2323,15 @@ class MinkRuntimeTest(unittest.TestCase):
                 make_plan("right", "object_b", 1.0, 0.75),
             ],
         }
+        plans["left"].insert(
+            0,
+            replace(
+                plans["left"][0],
+                paths=plans["left"][0].paths[:3],
+                command_targets=plans["left"][0].command_targets[:3],
+                completion_level="grasp_lift",
+            ),
+        )
         runtime = RoboTwinHeuristicRuntime.__new__(RoboTwinHeuristicRuntime)
         runtime._grasp_attempted = False
         runtime._action_metadata_override = None
