@@ -937,5 +937,127 @@ class ExecutionGuardTest(unittest.TestCase):
         self.assertTrue(env.eval_success)
         self.assertLess(env.take_action_cnt, env.step_lim)
 
+    def test_required_release_grasp_lift_runs_guards_but_cannot_succeed(
+        self,
+    ) -> None:
+        metadata = [
+            _arm_gripper_metadata("open", "right", endpoint=True),
+            _metadata("pregrasp", endpoint=True),
+            _metadata("grasp", endpoint=True),
+            *[
+                _arm_gripper_metadata(
+                    "close", "right", endpoint=index == 2
+                )
+                for index in range(3)
+            ],
+            _metadata("lift", endpoint=True),
+        ]
+        for record in metadata:
+            record["completion_level"] = "grasp_lift"
+            record["required_release"] = True
+        model = _Model(metadata)
+
+        class PositionSuccessEnv(_TaskEnv):
+            def take_action(self, action, *, action_type):
+                super().take_action(action, action_type=action_type)
+                self.eval_success = len(self.actions) >= 6
+
+        env = PositionSuccessEnv()
+        good_motion = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+
+        def measured(_task_env, _action_metadata):
+            physical = {3: 1.0, 4: 0.84, 5: 0.82, 6: 0.82}
+            return {
+                **good_motion,
+                "gripper_physical_state": physical.get(
+                    len(env.actions), 0.82
+                ),
+            }
+
+        output = io.StringIO()
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+            patch.object(
+                deploy_policy,
+                "_execution_guard_failures",
+                wraps=deploy_policy._execution_guard_failures,
+            ) as motion_guard,
+            patch.object(
+                deploy_policy,
+                "_gripper_execution_guard_failures",
+                wraps=deploy_policy._gripper_execution_guard_failures,
+            ) as gripper_guard,
+            redirect_stdout(output),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), len(metadata))
+        self.assertGreaterEqual(motion_guard.call_count, 3)
+        self.assertEqual(gripper_guard.call_count, 1)
+        self.assertFalse(env.eval_success)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
+        self.assertIn(
+            "one-shot rollout complete without task success",
+            output.getvalue(),
+        )
+
+    def test_nonrelease_grasp_lift_preserves_terminal_pick_success(self) -> None:
+        metadata = [
+            _arm_gripper_metadata("open", "right", endpoint=True),
+            _metadata("pregrasp", endpoint=True),
+            _metadata("grasp", endpoint=True),
+            *[
+                _arm_gripper_metadata(
+                    "close", "right", endpoint=index == 2
+                )
+                for index in range(3)
+            ],
+            _metadata("lift", endpoint=True),
+        ]
+        for record in metadata:
+            record["completion_level"] = "grasp_lift"
+            record["required_release"] = False
+        model = _Model(metadata)
+
+        class PickSuccessEnv(_TaskEnv):
+            def take_action(self, action, *, action_type):
+                super().take_action(action, action_type=action_type)
+                self.eval_success = len(self.actions) == len(metadata)
+
+        env = PickSuccessEnv()
+        good_motion = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+
+        def measured(_task_env, _action_metadata):
+            physical = {3: 1.0, 4: 0.84, 5: 0.82, 6: 0.82}
+            return {
+                **good_motion,
+                "gripper_physical_state": physical.get(
+                    len(env.actions), 0.82
+                ),
+            }
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), len(metadata))
+        self.assertTrue(env.eval_success)
+        self.assertLess(env.take_action_cnt, env.step_lim)
+
 if __name__ == "__main__":
     unittest.main()

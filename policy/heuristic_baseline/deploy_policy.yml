@@ -26,10 +26,11 @@ bimanual_max_target_width_m: 0.10
 mink_solver: daqp
 mink_dt: 0.05
 mink_max_iterations: 100
-mink_position_tolerance_m: 0.001
-mink_orientation_tolerance_rad: 0.01
+mink_position_tolerance_m: 0.01
+mink_orientation_tolerance_rad: 0.10
 relax_orientation_on_failure: false
 canonical_seed_on_failure: true
+support_collision_filter_enabled: false
 execution_telemetry: true
 execution_guard_enabled: true
 execution_guard_qpos_tolerance_rad: 0.10

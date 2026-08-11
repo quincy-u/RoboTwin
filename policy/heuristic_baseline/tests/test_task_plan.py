@@ -354,6 +354,92 @@ class TaskPlanTest(unittest.TestCase):
         self.assertIsNone(first_place.destination)
         self.assertIsNone(second_place.destination)
 
+    def test_grouped_dual_pick_of_one_object_preserves_both_arm_intents(self):
+        contacts = (
+            local_point(-0.11, 0.01, 0.02),
+            local_point(0.12, -0.01, 0.03),
+        )
+        roller = Actor(
+            pose(0.07, -0.18, 0.76),
+            contacts=contacts,
+        )
+        env = Env({"roller": roller})
+
+        with ProceduralTaskRecorder(env) as recorder:
+            env.move(
+                env.grasp_actor(
+                    roller,
+                    "left",
+                    pre_grasp_dis=0.06,
+                    grasp_dis=0.01,
+                    gripper_pos=0.25,
+                    contact_point_id=0,
+                ),
+                env.grasp_actor(
+                    roller,
+                    "right",
+                    pre_grasp_dis=0.09,
+                    grasp_dis=0.02,
+                    gripper_pos=0.35,
+                    contact_point_id=1,
+                ),
+            )
+            env.move(
+                env.move_by_displacement("left", x=0.01, z=0.11),
+                env.move_by_displacement("right", y=-0.02, z=0.12),
+            )
+
+        self.assertEqual(
+            [(call.kind, call.arm, call.group_id) for call in recorder.trace],
+            [
+                ("grasp", "left", 0),
+                ("grasp", "right", 0),
+                ("displacement", "left", 1),
+                ("displacement", "right", 1),
+            ],
+        )
+
+        plan = task_plan_from_trace(env, "generic_shared_pick", recorder.trace)
+
+        self.assertEqual(plan.family, "pick")
+        self.assertEqual(plan.manipulation_targets, ("roller",))
+        self.assertEqual(len(plan.stages), 2)
+        left, right = plan.stages
+        self.assertEqual(
+            (
+                left.target,
+                left.arm,
+                left.pregrasp_offset_m,
+                left.postgrasp_displacement,
+                left.grasp_offset_m,
+                left.gripper_target,
+                left.group_id,
+            ),
+            ("roller", "left", 0.06, (0.01, 0.0, 0.11), 0.01, 0.25, 0),
+        )
+        self.assertEqual(
+            (
+                right.target,
+                right.arm,
+                right.pregrasp_offset_m,
+                right.postgrasp_displacement,
+                right.grasp_offset_m,
+                right.gripper_target,
+                right.group_id,
+            ),
+            ("roller", "right", 0.09, (0.0, -0.02, 0.12), 0.02, 0.35, 0),
+        )
+        np.testing.assert_allclose(
+            left.allowed_contact_points_local,
+            ((-0.11, 0.01, 0.02),),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            right.allowed_contact_points_local,
+            ((0.12, -0.01, 0.03),),
+            atol=1e-12,
+        )
+
     def test_terminal_nonrelease_place_plus_open_becomes_release(self):
         item = Actor(pose(), functional=(local_pose(),))
         env = Env({"item": item})

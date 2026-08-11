@@ -56,6 +56,10 @@ M2T2_GRIPPER_POLYLINE = np.array(
     ],
     dtype=np.float64,
 )
+# The M2T2 gripper's finger-base plane is local +Z=0.059 m. Keep a
+# 4 mm tolerance for segmented-point noise while preventing target geometry
+# from extending into the gripper palm/body after an orientation transform.
+M2T2_MIN_TARGET_PALM_DEPTH_M = 0.055
 
 
 def _grasp_wireframes(world_grasp_poses: np.ndarray) -> np.ndarray:
@@ -622,6 +626,7 @@ class RoboTwinMinkIK:
             world_from_model=self._world_from_model,
             config=ik_config or MinkIKConfig(),
         )
+        self._support_planes: dict[str, tuple[float, float, float]] = {}
         self._neutral_contact_depths: dict[tuple[int, int], float] = {}
         model = getattr(self.solver, "model", None)
         if model is not None:
@@ -647,6 +652,248 @@ class RoboTwinMinkIK:
         pose = getattr(self.task_env.robot, f"{arm}_entity_origion_pose")
         return np.asarray(pose.to_transformation_matrix(), dtype=np.float64)
 
+    def set_support_plane(
+        self,
+        arm: str,
+        support_z: float | None,
+        *,
+        clearance_m: float = 0.003,
+        max_joint_step_rad: float = 0.03,
+    ) -> None:
+        """Set or clear one arm's horizontal world support plane."""
+        if arm not in {"left", "right"}:
+            raise ValueError(f"unknown arm {arm!r}")
+        clearance = float(clearance_m)
+        step = float(max_joint_step_rad)
+        if (
+            not np.isfinite(clearance)
+            or clearance < 0.0
+            or not np.isfinite(step)
+            or step <= 0.0
+        ):
+            raise ValueError("invalid support collision configuration")
+        if support_z is None:
+            self._support_planes.pop(arm, None)
+            return
+        plane = float(support_z)
+        if not np.isfinite(plane):
+            raise ValueError("support_z must be finite or None")
+        self._support_planes[arm] = (plane, clearance, step)
+
+    def clear_support_planes(self) -> None:
+        self._support_planes.clear()
+
+    def support_plane_z(self, arm: str) -> float | None:
+        setting = self._support_planes.get(arm)
+        return None if setting is None else float(setting[0])
+
+    def _arm_qpos_indices(self, arm: str) -> tuple[int, ...]:
+        if arm not in {"left", "right"}:
+            raise ValueError(f"unknown arm {arm!r}")
+        model = self.solver.model
+        indices: list[int] = []
+        for joint_name in getattr(
+            self.task_env.robot, f"{arm}_arm_joints_name"
+        ):
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+            )
+            if joint_id < 0:
+                raise ValueError(f"Mink model lacks arm joint {joint_name}")
+            indices.append(int(model.jnt_qposadr[joint_id]))
+        return tuple(indices)
+
+    def active_arm_body_ids(self, arm: str) -> frozenset[int]:
+        """Return kinematic descendants of the controlled arm root body."""
+        model = self.solver.model
+        joint_names = tuple(
+            getattr(self.task_env.robot, f"{arm}_arm_joints_name")
+        )
+        if not joint_names:
+            raise ValueError(f"{arm} arm has no controlled joints")
+        root_joint = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, joint_names[0]
+        )
+        if root_joint < 0:
+            raise ValueError(f"Mink model lacks arm joint {joint_names[0]}")
+        root_body = int(model.jnt_bodyid[root_joint])
+        descendants: set[int] = set()
+        for body_id in range(model.nbody):
+            current = body_id
+            visited: set[int] = set()
+            while current not in visited:
+                if current == root_body:
+                    descendants.add(body_id)
+                    break
+                if current == 0:
+                    break
+                visited.add(current)
+                current = int(model.body_parentid[current])
+        if root_body not in descendants:
+            descendants.add(root_body)
+        return frozenset(descendants)
+
+    def active_arm_geom_ids(self, arm: str) -> tuple[int, ...]:
+        bodies = self.active_arm_body_ids(arm)
+        return tuple(
+            geom_id
+            for geom_id in range(self.solver.model.ngeom)
+            if int(self.solver.model.geom_bodyid[geom_id]) in bodies
+        )
+
+    @staticmethod
+    def _geom_minimum_world_z(
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        geom_id: int,
+        world_from_model: np.ndarray,
+    ) -> float:
+        """Exact primitive/mesh minimum along world Z."""
+        world_model = _pose_matrix(
+            world_from_model, name="world_from_model"
+        )
+        model_rotation = np.asarray(
+            data.geom_xmat[geom_id], dtype=np.float64
+        ).reshape(3, 3)
+        world_rotation = world_model[:3, :3] @ model_rotation
+        world_position = (
+            world_model[:3, :3]
+            @ np.asarray(data.geom_xpos[geom_id], dtype=np.float64)
+            + world_model[:3, 3]
+        )
+        z_row = world_rotation[2]
+        size = np.asarray(model.geom_size[geom_id], dtype=np.float64)
+        geom_type = int(model.geom_type[geom_id])
+        sphere = int(mujoco.mjtGeom.mjGEOM_SPHERE)
+        capsule = int(mujoco.mjtGeom.mjGEOM_CAPSULE)
+        ellipsoid = int(mujoco.mjtGeom.mjGEOM_ELLIPSOID)
+        cylinder = int(mujoco.mjtGeom.mjGEOM_CYLINDER)
+        box = int(mujoco.mjtGeom.mjGEOM_BOX)
+        mesh = int(mujoco.mjtGeom.mjGEOM_MESH)
+        if geom_type == sphere:
+            extent = float(size[0])
+        elif geom_type == capsule:
+            extent = float(size[0] + abs(z_row[2]) * size[1])
+        elif geom_type == ellipsoid:
+            extent = float(np.linalg.norm(z_row * size))
+        elif geom_type == cylinder:
+            radial = float(np.linalg.norm(z_row[:2])) * size[0]
+            extent = float(radial + abs(z_row[2]) * size[1])
+        elif geom_type == box:
+            extent = float(np.dot(np.abs(z_row), size))
+        elif geom_type == mesh:
+            mesh_id = int(model.geom_dataid[geom_id])
+            start = int(model.mesh_vertadr[mesh_id])
+            stop = start + int(model.mesh_vertnum[mesh_id])
+            vertices = np.asarray(
+                model.mesh_vert[start:stop], dtype=np.float64
+            )
+            if len(vertices) == 0:
+                return float(world_position[2])
+            return float(np.min(
+                vertices @ world_rotation[2] + world_position[2]
+            ))
+        else:
+            # Active robot geoms should be standard primitives or meshes.
+            # A bounding sphere remains conservative for an unusual type.
+            extent = float(np.linalg.norm(size))
+        return float(world_position[2] - extent)
+
+    def path_has_support_collision(
+        self,
+        arm: str,
+        path: np.ndarray,
+        support_z: float,
+        *,
+        clearance_m: float = 0.003,
+        max_joint_step_rad: float = 0.03,
+        start: np.ndarray | None = None,
+    ) -> bool:
+        """Densely reject active-arm URDF geometry near a support plane."""
+        plane = float(support_z)
+        clearance = float(clearance_m)
+        step = float(max_joint_step_rad)
+        if (
+            not np.isfinite(plane)
+            or not np.isfinite(clearance)
+            or clearance < 0.0
+            or not np.isfinite(step)
+            or step <= 0.0
+        ):
+            raise ValueError("invalid support collision configuration")
+        rows = np.asarray(path, dtype=np.float64)
+        joint_count = len(self._arm_qpos_indices(arm))
+        if rows.size == 0:
+            return False
+        if (
+            rows.ndim != 2
+            or rows.shape[1] != joint_count
+            or not np.all(np.isfinite(rows))
+        ):
+            raise ValueError(
+                f"path must be a finite Nx{joint_count} joint array"
+            )
+        current = (
+            _arm_joint_state(self.task_env, arm)[:-1]
+            if start is None
+            else np.asarray(start, dtype=np.float64)
+        )
+        if current.shape != (joint_count,) or not np.all(np.isfinite(current)):
+            raise ValueError("support path start has invalid joint shape")
+        model = self.solver.model
+        qpos_indices = self._arm_qpos_indices(arm)
+        active_geoms = self.active_arm_geom_ids(arm)
+        if not active_geoms:
+            return False
+        world_model = self._world_from_model(arm)
+        data = mujoco.MjData(model)
+        self.support_collision_checks += 1
+        for target in rows:
+            steps = max(
+                1,
+                int(np.ceil(
+                    float(np.max(np.abs(target - current))) / step
+                )),
+            )
+            for alpha in np.linspace(0.0, 1.0, steps + 1):
+                joints = current + float(alpha) * (target - current)
+                data.qpos[:] = model.qpos0
+                data.qpos[list(qpos_indices)] = joints
+                mujoco.mj_forward(model, data)
+                if any(
+                    self._geom_minimum_world_z(
+                        model, data, geom_id, world_model
+                    )
+                    < plane + clearance
+                    for geom_id in active_geoms
+                ):
+                    return True
+            current = target
+        return False
+
+    def _path_is_safe(
+        self, arm: str, path: np.ndarray, start: np.ndarray
+    ) -> bool:
+        support = self._support_planes.get(arm)
+        if support is not None and self.path_has_support_collision(
+            arm,
+            path,
+            support[0],
+            clearance_m=support[1],
+            max_joint_step_rad=support[2],
+            start=start,
+        ):
+            self.failures["SupportClearance"] = (
+                self.failures.get("SupportClearance", 0) + 1
+            )
+            return False
+        if self._path_has_self_collision(arm, path):
+            self.failures["SelfCollision"] = (
+                self.failures.get("SelfCollision", 0) + 1
+            )
+            return False
+        return True
+
     def reset_stats(self) -> None:
         self.calls = 0
         self.planner_attempts = 0
@@ -654,6 +901,7 @@ class RoboTwinMinkIK:
         self.relaxed_successes = 0
         self.canonical_seed_successes = 0
         self.over_limit_successes = 0
+        self.support_collision_checks = 0
         self.failures: dict[str, int] = {}
         self.first_target: np.ndarray | None = None
         self._stage = 0
@@ -745,17 +993,7 @@ class RoboTwinMinkIK:
         model = getattr(self.solver, "model", None)
         if model is None:
             return False
-        prefix = "fl_link" if arm == "left" else "fr_link"
-        arm_body_ids = {
-            body_id
-            for body_id in range(model.nbody)
-            if (
-                mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                )
-                or ""
-            ).startswith(prefix)
-        }
+        arm_body_ids = set(self.active_arm_body_ids(arm))
         joint_names = tuple(
             getattr(self.task_env.robot, f"{arm}_arm_joints_name")
         )
@@ -796,10 +1034,7 @@ class RoboTwinMinkIK:
                 self.failures.get("WaypointLimit", 0) + 1
             )
             return None, None
-        if self._path_has_self_collision(arm, path):
-            self.failures["SelfCollision"] = (
-                self.failures.get("SelfCollision", 0) + 1
-            )
+        if not self._path_is_safe(arm, path, start):
             return None, None
         return joints, path
 
@@ -846,8 +1081,8 @@ class RoboTwinMinkIK:
                         direct_path = self._path(start, exact_joints)
                         if (
                             len(direct_path) <= self.max_waypoints_per_segment
-                            and not self._path_has_self_collision(
-                                arm, direct_path
+                            and self._path_is_safe(
+                                arm, direct_path, start
                             )
                         ):
                             joints, path = exact_joints, direct_path
@@ -881,7 +1116,7 @@ class RoboTwinMinkIK:
 
         arm_indices: dict[str, list[int]] = {}
         arm_body_ids: set[int] = set()
-        for arm, prefix in (("left", "fl_link"), ("right", "fr_link")):
+        for arm in ("left", "right"):
             indices: list[int] = []
             for joint_name in getattr(
                 self.task_env.robot, f"{arm}_arm_joints_name"
@@ -893,16 +1128,7 @@ class RoboTwinMinkIK:
                     raise ValueError(f"Mink model lacks arm joint {joint_name}")
                 indices.append(int(model.jnt_qposadr[joint_id]))
             arm_indices[arm] = indices
-            arm_body_ids.update(
-                body_id
-                for body_id in range(model.nbody)
-                if (
-                    mujoco.mj_id2name(
-                        model, mujoco.mjtObj.mjOBJ_BODY, body_id
-                    )
-                    or ""
-                ).startswith(prefix)
-            )
+            arm_body_ids.update(self.active_arm_body_ids(arm))
 
         current = np.concatenate(
             (
@@ -1017,10 +1243,10 @@ class RoboTwinMinkIK:
                                 self.failures["WaypointLimit"] = (
                                     self.failures.get("WaypointLimit", 0) + 1
                                 )
-                            elif self._path_has_self_collision(arm, direct_path):
-                                self.failures["SelfCollision"] = (
-                                    self.failures.get("SelfCollision", 0) + 1
-                                )
+                            elif not self._path_is_safe(
+                                arm, direct_path, start
+                            ):
+                                pass
                             else:
                                 joints, path = exact_joints, direct_path
                                 accepted_command_target = target.copy()
@@ -1384,7 +1610,7 @@ class StagedQposActionBuffer:
 
 @dataclass(frozen=True)
 class _SingleArmPlacePlan:
-    """A fully prevalidated grasp, placement, release, and retreat chain."""
+    """A prevalidated full placement or safe grasp-and-lift attempt."""
 
     arm: str
     target_name: str
@@ -1393,6 +1619,8 @@ class _SingleArmPlacePlan:
     paths: tuple[np.ndarray, ...]
     command_targets: tuple[np.ndarray, ...]
     desired_object_pose: np.ndarray
+    orientation_source: str = "m2t2"
+    completion_level: str = "place"
 
 
 @dataclass(frozen=True)
@@ -1406,6 +1634,21 @@ class _HandoffArmPlan:
     candidate: GraspCandidate
     paths: tuple[np.ndarray, ...]
     command_targets: tuple[np.ndarray, ...]
+    contact_local_point: tuple[float, float, float]
+    gripper_target: float = 0.0
+    orientation_source: str = "m2t2"
+
+
+@dataclass(frozen=True)
+class _SimultaneousPickArmPlan:
+    """One arm's prevalidated role in a same-object simultaneous pick."""
+
+    arm: str
+    target_name: str
+    arm_source: str
+    candidate: GraspCandidate
+    paths: tuple[np.ndarray, np.ndarray, np.ndarray]
+    command_targets: tuple[np.ndarray, np.ndarray, np.ndarray]
     contact_local_point: tuple[float, float, float]
     gripper_target: float = 0.0
     orientation_source: str = "m2t2"
@@ -1693,6 +1936,32 @@ def _grasp_command_tcp(
     return command[:3, 3] + 0.12 * command[:3, 0]
 
 
+def _align_grasp_pose_to_local_contact(
+    world_grasp_pose: np.ndarray,
+    world_object_pose: np.ndarray,
+    contact_local_point: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+) -> np.ndarray:
+    """Translate a source grasp so its logical TCP reaches a local contact."""
+    grasp = _pose_matrix(
+        world_grasp_pose, name="world_grasp_pose"
+    ).copy()
+    world_object = _pose_matrix(
+        world_object_pose, name="world_object_pose"
+    )
+    local_contact = np.asarray(contact_local_point, dtype=np.float64)
+    if local_contact.shape != (3,) or not np.all(np.isfinite(local_contact)):
+        raise ValueError("contact_local_point must be a finite 3-vector")
+    desired_world_tcp = (
+        world_object[:3, :3] @ local_contact
+        + world_object[:3, 3]
+    )
+    grasp[:3, 3] += desired_world_tcp - _grasp_command_tcp(
+        grasp, grasp_to_robotwin
+    )
+    return grasp
+
+
 def _approach_offset_command_pose(
     world_command_pose: np.ndarray, distance_m: float
 ) -> np.ndarray:
@@ -1770,6 +2039,54 @@ def _robot_facing_grasp_pose(
     )
     adjusted_command[:3, 3] = tcp - 0.12 * approach
     return adjusted_command @ np.linalg.inv(transform)
+
+
+def _approach_roll_grasp_pose(
+    world_grasp_pose: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+    angle_rad: float,
+) -> np.ndarray:
+    """Roll the command about its approach axis without moving its TCP.
+
+    The calibrated transform maps M2T2 local +Z to RoboTwin command +X.
+    Right-multiplying the command rotation by ``Rx`` therefore preserves the
+    command origin/+X and, after mapping back, the M2T2 origin/+Z as well.
+    """
+    grasp = _pose_matrix(world_grasp_pose, name="world_grasp_pose")
+    transform = _pose_matrix(
+        grasp_to_robotwin, name="grasp_to_robotwin"
+    )
+    angle = float(angle_rad)
+    if not np.isfinite(angle):
+        raise ValueError("approach roll angle must be finite")
+    command = grasp @ transform
+    rolled_command = command.copy()
+    rolled_command[:3, :3] = (
+        command[:3, :3]
+        @ t3d.axangles.axangle2mat([1.0, 0.0, 0.0], angle)
+    )
+    return rolled_command @ np.linalg.inv(transform)
+
+
+def _closest_approach_roll_angle(
+    current_rotation: np.ndarray, target_rotation: np.ndarray
+) -> float:
+    """Return the command-local +X roll closest to a target rotation."""
+    current = np.asarray(current_rotation, dtype=np.float64)
+    target = np.asarray(target_rotation, dtype=np.float64)
+    for value, name in ((current, "current"), (target, "target")):
+        if (
+            value.shape != (3, 3)
+            or not np.all(np.isfinite(value))
+            or not np.allclose(value.T @ value, np.eye(3), atol=1e-6)
+            or not np.isclose(np.linalg.det(value), 1.0, atol=1e-6)
+        ):
+            raise ValueError(f"{name} rotation must be a rigid 3x3 matrix")
+    relative = current.T @ target
+    return float(np.arctan2(
+        relative[2, 1] - relative[1, 2],
+        relative[1, 1] + relative[2, 2],
+    ))
 
 
 def _place_facing_grasp_pose(
@@ -2051,6 +2368,129 @@ def _target_width_along_axis(
         return None
     projections = points @ direction
     return float(np.ptp(projections))
+
+
+def _estimate_target_support_plane_z(
+    scene: SceneObservation,
+    target: ObjectState,
+    *,
+    maximum_gap_m: float = 0.020,
+    minimum_points: int = 24,
+    mode_bin_m: float = 0.002,
+    maximum_plane_spread_m: float = 0.0035,
+) -> float | None:
+    """Estimate a nearby horizontal support from non-target RGB-D points."""
+    if (
+        not np.isfinite(maximum_gap_m)
+        or maximum_gap_m <= 0.0
+        or minimum_points < 3
+        or not np.isfinite(mode_bin_m)
+        or mode_bin_m <= 0.0
+        or not np.isfinite(maximum_plane_spread_m)
+        or maximum_plane_spread_m <= 0.0
+    ):
+        raise ValueError("invalid support-plane estimator configuration")
+    points = np.asarray(scene.xyz, dtype=np.float64).reshape(-1, 3)
+    labels = np.asarray(scene.instance_labels).reshape(-1)
+    if len(points) != len(labels):
+        raise ValueError("scene points and instance labels must have equal length")
+    finite = np.all(np.isfinite(points), axis=1)
+    target_mask = finite & (labels == target.instance_id)
+    target_points = points[target_mask]
+    if len(target_points) < 4:
+        return None
+
+    lower_z = float(np.quantile(target_points[:, 2], 0.01))
+    xy_low, xy_high = np.quantile(
+        target_points[:, :2], [0.01, 0.99], axis=0
+    )
+    xy_span = np.maximum(xy_high - xy_low, 0.0)
+    margin = float(
+        np.clip(0.5 * max(float(np.max(xy_span)), 0.02), 0.025, 0.08)
+    )
+    near_xy = np.all(
+        (points[:, :2] >= xy_low - margin)
+        & (points[:, :2] <= xy_high + margin),
+        axis=1,
+    )
+    below_target = (
+        (points[:, 2] >= lower_z - maximum_gap_m)
+        & (points[:, 2] <= lower_z + 0.001)
+    )
+    candidates = points[finite & ~target_mask & near_xy & below_target]
+    if len(candidates) < minimum_points:
+        return None
+
+    bins = np.rint(candidates[:, 2] / mode_bin_m).astype(np.int64)
+    values, counts = np.unique(bins, return_counts=True)
+    peak_count = int(np.max(counts))
+    peak_values = values[counts == peak_count]
+    # When equal-size surfaces are present, prefer the one closest below the
+    # target rather than a lower shelf or background patch.
+    peak = int(np.max(peak_values))
+    center_z = float(peak) * mode_bin_m
+    plane_points = candidates[
+        np.abs(candidates[:, 2] - center_z) <= mode_bin_m
+    ]
+    if len(plane_points) < minimum_points:
+        return None
+    spread = float(
+        np.quantile(plane_points[:, 2], 0.90)
+        - np.quantile(plane_points[:, 2], 0.10)
+    )
+    centered_xy = plane_points[:, :2] - np.mean(
+        plane_points[:, :2], axis=0
+    )
+    if (
+        spread > maximum_plane_spread_m
+        or np.linalg.matrix_rank(centered_xy, tol=1e-4) < 2
+    ):
+        return None
+    support_z = float(np.median(plane_points[:, 2]))
+    gap = lower_z - support_z
+    if gap < -0.001 or gap > maximum_gap_m:
+        return None
+    return support_z
+
+
+def _target_m2t2_palm_depth(
+    scene: SceneObservation,
+    target: ObjectState,
+    world_grasp_pose: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+    *,
+    quantile: float = 0.01,
+) -> float | None:
+    """Return the target's robust minimum +Z depth in the M2T2 frame.
+
+    M2T2's gripper geometry is defined in the source grasp frame, while Mink
+    consumes ``world_grasp_pose @ grasp_to_robotwin``. Reconstructing that
+    source frame from the calibrated command transform makes the frame
+    convention explicit and keeps this check correct for non-default rigid
+    command transforms. Only GT-segmented target points contribute.
+    """
+    q = float(quantile)
+    if not np.isfinite(q) or not 0.0 <= q <= 0.5:
+        raise ValueError("quantile must be finite and in [0, 0.5]")
+    source_grasp = _pose_matrix(
+        world_grasp_pose, name="world_grasp_pose"
+    )
+    command_transform = _pose_matrix(
+        grasp_to_robotwin, name="grasp_to_robotwin"
+    )
+    world_command = source_grasp @ command_transform
+    world_m2t2 = world_command @ np.linalg.inv(command_transform)
+    labels = np.asarray(scene.instance_labels)
+    points = np.asarray(scene.xyz, dtype=np.float64)[
+        labels == target.instance_id
+    ]
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) < 2:
+        return None
+    local_points = (
+        points - world_m2t2[:3, 3]
+    ) @ world_m2t2[:3, :3]
+    return float(np.quantile(local_points[:, 2], q))
 
 
 class BimanualQposActionBuffer:
@@ -2435,6 +2875,7 @@ class RoboTwinHeuristicRuntime:
         bimanual_collision_step_rad: float = 0.03,
         bimanual_max_jaw_axis_alignment: float = 0.75,
         bimanual_max_target_width_m: float = 0.10,
+        support_collision_filter_enabled: bool = False,
     ) -> None:
         self.task_env = task_env
         self.grasps = grasps
@@ -2464,6 +2905,9 @@ class RoboTwinHeuristicRuntime:
         )
         self.bimanual_max_target_width_m = float(
             bimanual_max_target_width_m
+        )
+        self.support_collision_filter_enabled = bool(
+            support_collision_filter_enabled
         )
         if (
             self.max_visualized_grasps is not None
@@ -2518,6 +2962,29 @@ class RoboTwinHeuristicRuntime:
             gripper_settle_actions=gripper_settle_actions,
         )
         self.backend = grasps.backend
+
+    def _configure_support_plane(
+        self,
+        scene: SceneObservation,
+        target: ObjectState,
+        arms: tuple[str, ...],
+    ) -> float | None:
+        support_z = (
+            _estimate_target_support_plane_z(scene, target)
+            if getattr(self, "support_collision_filter_enabled", False)
+            and hasattr(scene, "xyz")
+            and hasattr(scene, "instance_labels")
+            else None
+        )
+        setter = getattr(self.ik, "set_support_plane", None)
+        if setter is not None:
+            for arm in arms:
+                setter(arm, support_z)
+        return support_z
+
+    def _support_plane_for_arm(self, arm: str) -> float | None:
+        getter = getattr(self.ik, "support_plane_z", None)
+        return None if getter is None else getter(arm)
 
     def _target_names(self, scene: SceneObservation) -> tuple[str, ...]:
         if not self.automatic_target:
@@ -2699,6 +3166,44 @@ class RoboTwinHeuristicRuntime:
             return stages[0], stages[1]
         return None
 
+    @staticmethod
+    def _simultaneous_same_object_pick_stages(
+        task_env: Any,
+    ) -> tuple[Pick, Pick] | None:
+        """Return a recorded terminal two-arm Pick of one shared object."""
+        task_plan = getattr(task_env, "heuristic_task_plan", None)
+        stages = tuple(getattr(task_plan, "stages", ()))
+        if (
+            len(stages) != 2
+            or any(getattr(stage, "target", None) is None for stage in stages)
+            or stages[0].target != stages[1].target
+        ):
+            return None
+
+        group = getattr(stages[0], "group_id", None)
+        if (
+            group is None
+            or getattr(stages[1], "group_id", None) != group
+        ):
+            return None
+        arms = [
+            str(getattr(stage, "arm", "")).strip().lower()
+            for stage in stages
+        ]
+        if any(arm not in {"left", "right"} for arm in arms):
+            return None
+        if set(arms) != {"left", "right"}:
+            raise TargetSelectionFailure(
+                "simultaneous same-object Pick stages require one left and "
+                "one right arm"
+            )
+        return tuple(
+            stage
+            for _, stage in sorted(
+                zip(arms, stages), key=lambda item: item[0]
+            )
+        )
+
 
     @staticmethod
     def _grouped_bimanual_place_stages(
@@ -2824,6 +3329,9 @@ class RoboTwinHeuristicRuntime:
     ]:
         if plan_limit < 1:
             raise ValueError("plan_limit must be positive")
+        support_rejections_before = int(
+            getattr(self.ik, "failures", {}).get("SupportClearance", 0)
+        )
         source_reference, destination_reference = (
             self._place_reference_poses(target, place)
         )
@@ -2843,16 +3351,22 @@ class RoboTwinHeuristicRuntime:
         preplace_offset = float(place.preplace_offset_m)
         place_offset = float(place.place_offset_m)
         if (
-            pregrasp_offset < 0.0
+            not all(
+                np.isfinite(value)
+                for value in (
+                    pregrasp_offset,
+                    grasp_offset,
+                    gripper_target,
+                    preplace_offset,
+                    place_offset,
+                )
+            )
+            or pregrasp_offset < 0.0
             or grasp_offset < 0.0
             or grasp_offset > pregrasp_offset
             or not 0.0 <= gripper_target <= 1.0
             or postgrasp.shape != (3,)
             or not np.all(np.isfinite(postgrasp))
-            or not np.isfinite(preplace_offset)
-            or not np.isfinite(place_offset)
-            or preplace_offset < place_offset
-            or place_offset < 0.0
         ):
             raise ValueError("invalid structured pick/place offsets")
 
@@ -2866,9 +3380,9 @@ class RoboTwinHeuristicRuntime:
         failures = {
             stage: 0
             for stage in (
-                "pregrasp", "grasp", "lift", "robot_facing", "place_facing",
-                "narrow_facing",
-                "jaw_axis", "jaw_width", "preplace", "place",
+                "pregrasp", "grasp", "lift", "approach_roll",
+                "robot_facing", "place_facing", "narrow_facing",
+                "palm_clearance", "jaw_width", "preplace", "place",
                 "retreat"
             )
         }
@@ -2876,11 +3390,84 @@ class RoboTwinHeuristicRuntime:
         current_ee_position = np.asarray(
             ee_getter(), dtype=np.float64
         )[:3]
-        elongated_axis = _elongated_object_axis(scene, target)
 
-        variants: list[tuple[GraspCandidate, str]] = []
-        for candidate_index, raw_candidate in enumerate(ranked):
-            variants.append((raw_candidate, "m2t2"))
+        # Preserve raw M2T2 confidence order globally. Orientation-derived
+        # candidates are separate fallback tiers, so a high-confidence
+        # fallback can never preempt a lower-confidence feasible raw pose.
+        # The optional third tuple item freezes the raw candidate's placement
+        # goal.  In particular, constrain="auto" consults the grasp frame;
+        # rolling the attachment must not silently choose a different goal.
+        raw_variants = [
+            (candidate, "m2t2", None) for candidate in ranked
+        ]
+        approach_roll_variants: list[
+            tuple[GraspCandidate, str, np.ndarray]
+        ] = []
+        robot_facing_variants: list[
+            tuple[GraspCandidate, str, None]
+        ] = []
+        place_facing_variants: list[
+            tuple[GraspCandidate, str, None]
+        ] = []
+        narrow_facing_variants: list[
+            tuple[GraspCandidate, str, None]
+        ] = []
+        for raw_candidate in ranked:
+            try:
+                raw_goal_grasp_pose = np.asarray(
+                    raw_candidate.world_grasp_pose, dtype=np.float64
+                ).copy()
+                raw_goal_grasp_pose[:3, 3] -= (
+                    raw_goal_grasp_pose[:3, 2] * grasp_offset
+                )
+                raw_command = (
+                    raw_goal_grasp_pose @ self.ik.grasp_to_robotwin
+                )
+                raw_reference = _aligned_place_reference_pose(
+                    source_reference,
+                    destination_reference,
+                    raw_command,
+                    arm=arm,
+                    constrain=place.constrain,
+                    z_transform=(
+                        place.object_functional_point_id is None
+                    ),
+                )
+                raw_goal_object = _desired_object_pose(
+                    target.world_pose, source_reference, raw_reference
+                )
+                object_delta = (
+                    raw_goal_object @ np.linalg.inv(target.world_pose)
+                )
+                final_raw_rotation = (
+                    object_delta[:3, :3] @ raw_command[:3, :3]
+                )
+                canonical_rotation = t3d.quaternions.quat2mat(
+                    CANONICAL_COMMAND_QUATERNIONS[arm]
+                )
+                canonical_roll = _closest_approach_roll_angle(
+                    final_raw_rotation, canonical_rotation
+                )
+                for offset in (
+                    0.0, np.pi / 8.0, -np.pi / 8.0,
+                    np.pi / 4.0, -np.pi / 4.0,
+                ):
+                    rolled_pose = _approach_roll_grasp_pose(
+                        raw_candidate.world_grasp_pose,
+                        self.ik.grasp_to_robotwin,
+                        canonical_roll + offset,
+                    )
+                    approach_roll_variants.append((
+                        GraspCandidate(
+                            rolled_pose,
+                            float(raw_candidate.confidence),
+                            raw_candidate.object_name,
+                        ),
+                        "approach_roll",
+                        raw_reference.copy(),
+                    ))
+            except ValueError:
+                failures["approach_roll"] += 1
             try:
                 adjusted_pose = _robot_facing_grasp_pose(
                     raw_candidate.world_grasp_pose,
@@ -2890,13 +3477,14 @@ class RoboTwinHeuristicRuntime:
             except ValueError:
                 failures["robot_facing"] += 1
             else:
-                variants.append((
+                robot_facing_variants.append((
                     GraspCandidate(
                         adjusted_pose,
                         float(raw_candidate.confidence),
                         raw_candidate.object_name,
                     ),
                     "robot_facing",
+                    None,
                 ))
             try:
                 raw_command = (
@@ -2926,59 +3514,80 @@ class RoboTwinHeuristicRuntime:
             except ValueError:
                 failures["place_facing"] += 1
             else:
-                variants.append((
+                place_facing_variants.append((
                     GraspCandidate(
                         adjusted_pose,
                         float(raw_candidate.confidence),
                         raw_candidate.object_name,
                     ),
                     "place_facing",
+                    None,
                 ))
-                if candidate_index < 16:
-                    try:
-                        canonical_approach = t3d.quaternions.quat2mat(
-                            CANONICAL_COMMAND_QUATERNIONS[arm]
-                        )[:, 0]
-                        narrow_axis = _target_narrow_axis(
-                            scene,
-                            target,
+                try:
+                    canonical_approach = t3d.quaternions.quat2mat(
+                        CANONICAL_COMMAND_QUATERNIONS[arm]
+                    )[:, 0]
+                    narrow_axis = _target_narrow_axis(
+                        scene,
+                        target,
+                        variant_object,
+                        canonical_approach,
+                    )
+                    narrow_poses = (
+                        ()
+                        if narrow_axis is None
+                        else _narrow_axis_grasp_poses(
+                            raw_candidate.world_grasp_pose,
+                            target.world_pose,
                             variant_object,
+                            current_ee_position,
+                            self.ik.grasp_to_robotwin,
+                            narrow_axis,
                             canonical_approach,
+                            max_approaches=10,
                         )
-                        narrow_poses = (
-                            ()
-                            if narrow_axis is None
-                            else _narrow_axis_grasp_poses(
-                                raw_candidate.world_grasp_pose,
-                                target.world_pose,
-                                variant_object,
-                                current_ee_position,
-                                self.ik.grasp_to_robotwin,
-                                narrow_axis,
-                                canonical_approach,
-                                max_approaches=10,
-                            )
-                        )
-                    except ValueError:
+                    )
+                except ValueError:
+                    failures["narrow_facing"] += 1
+                else:
+                    if not narrow_poses:
                         failures["narrow_facing"] += 1
-                    else:
-                        if not narrow_poses:
-                            failures["narrow_facing"] += 1
-                        for narrow_pose in narrow_poses:
-                            variants.append((
-                                GraspCandidate(
-                                    narrow_pose,
-                                    float(raw_candidate.confidence),
-                                    raw_candidate.object_name,
-                                ),
-                                "narrow_facing",
-                            ))
+                    for narrow_pose in narrow_poses:
+                        narrow_facing_variants.append((
+                            GraspCandidate(
+                                narrow_pose,
+                                float(raw_candidate.confidence),
+                                raw_candidate.object_name,
+                            ),
+                            "narrow_facing",
+                            None,
+                        ))
 
+        variants = (
+            raw_variants
+            + approach_roll_variants
+            + robot_facing_variants
+            + place_facing_variants
+            + narrow_facing_variants
+        )
         plans: list[_SingleArmPlacePlan] = []
-        for candidate, variant_source in variants:
+        grasp_lift_plans: list[_SingleArmPlacePlan] = []
+        for candidate, variant_source, raw_goal_reference in variants:
             raw_grasp_pose = np.asarray(
                 candidate.world_grasp_pose, dtype=np.float64
             )
+            palm_depth = _target_m2t2_palm_depth(
+                scene,
+                target,
+                raw_grasp_pose,
+                self.ik.grasp_to_robotwin,
+            )
+            if (
+                palm_depth is not None
+                and palm_depth < M2T2_MIN_TARGET_PALM_DEPTH_M
+            ):
+                failures["palm_clearance"] += 1
+                continue
             grasp_pose = raw_grasp_pose.copy()
             grasp_pose[:3, 3] -= raw_grasp_pose[:3, 2] * grasp_offset
             pregrasp_pose = raw_grasp_pose.copy()
@@ -3010,13 +3619,6 @@ class RoboTwinHeuristicRuntime:
                     "Mink omitted a completed three-stage grasp plan"
                 )
             jaw_axis = grasp_targets[1][:3, 1]
-            if (
-                elongated_axis is not None
-                and abs(float(np.dot(jaw_axis, elongated_axis)))
-                > self.bimanual_max_jaw_axis_alignment
-            ):
-                failures["jaw_axis"] += 1
-                continue
             target_width = _target_width_along_axis(
                 scene, target, jaw_axis
             )
@@ -3026,13 +3628,19 @@ class RoboTwinHeuristicRuntime:
             ):
                 failures["jaw_width"] += 1
                 continue
-            desired_reference = _aligned_place_reference_pose(
-                source_reference,
-                destination_reference,
-                grasp_targets[1],
-                arm=arm,
-                constrain=place.constrain,
-                z_transform=place.object_functional_point_id is None,
+            desired_reference = (
+                raw_goal_reference.copy()
+                if raw_goal_reference is not None
+                else _aligned_place_reference_pose(
+                    source_reference,
+                    destination_reference,
+                    grasp_targets[1],
+                    arm=arm,
+                    constrain=place.constrain,
+                    z_transform=(
+                        place.object_functional_point_id is None
+                    ),
+                )
             )
             desired_object, desired_gripper = _rigid_place_command_pose(
                 target.world_pose,
@@ -3040,6 +3648,20 @@ class RoboTwinHeuristicRuntime:
                 grasp_targets[1],
                 desired_reference,
             )
+            if len(grasp_lift_plans) < plan_limit:
+                grasp_lift_plans.append(
+                    _SingleArmPlacePlan(
+                        arm=arm,
+                        target_name=target.name,
+                        arm_source=arm_source,
+                        candidate=candidate,
+                        paths=tuple(grasp_paths),
+                        command_targets=tuple(grasp_targets),
+                        desired_object_pose=desired_object,
+                        orientation_source=variant_source,
+                        completion_level="grasp_lift",
+                    )
+                )
             offset_axis = _place_offset_axis(
                 place.preplace_axis,
                 desired_object,
@@ -3096,10 +3718,20 @@ class RoboTwinHeuristicRuntime:
                     command_targets=tuple(grasp_targets)
                     + tuple(followup_targets),
                     desired_object_pose=desired_object,
+                    orientation_source=variant_source,
+                    completion_level="place",
                 )
             )
             if len(plans) >= plan_limit:
                 break
+        failures["support_clearance"] = (
+            int(getattr(self.ik, "failures", {}).get(
+                "SupportClearance", 0
+            ))
+            - support_rejections_before
+        )
+        if not plans:
+            plans = grasp_lift_plans
         return plans, list(ranker.last_candidates), trace, failures
 
     def _get_single_place_action(
@@ -3159,33 +3791,45 @@ class RoboTwinHeuristicRuntime:
             names,
             sources,
         )
-        for phase, index in (
-            ("lift", 2),
-            ("preplace", 3),
-            ("place", 4),
-        ):
-            controller.move_phase(
-                phase,
-                {arm: selected.paths[index]},
-                {arm: selected.command_targets[index]},
-                names,
-                sources,
+        controller.move_phase(
+            "lift",
+            {arm: selected.paths[2]},
+            {arm: selected.command_targets[2]},
+            names,
+            sources,
+        )
+        if selected.completion_level == "place":
+            for phase, index in (("preplace", 3), ("place", 4)):
+                controller.move_phase(
+                    phase,
+                    {arm: selected.paths[index]},
+                    {arm: selected.command_targets[index]},
+                    names,
+                    sources,
+                )
+            if place.release:
+                controller.gripper_phase(
+                    "open",
+                    {arm: 1.0},
+                    self.gripper_settle_actions,
+                    names,
+                    sources,
+                )
+                controller.move_phase(
+                    "retreat",
+                    {arm: selected.paths[5]},
+                    {arm: selected.command_targets[5]},
+                    names,
+                    sources,
+                )
+        elif selected.completion_level != "grasp_lift":
+            raise ValueError(
+                f"unknown placement completion level "
+                f"{selected.completion_level!r}"
             )
-        if place.release:
-            controller.gripper_phase(
-                "open",
-                {arm: 1.0},
-                self.gripper_settle_actions,
-                names,
-                sources,
-            )
-            controller.move_phase(
-                "retreat",
-                {arm: selected.paths[5]},
-                {arm: selected.command_targets[5]},
-                names,
-                sources,
-            )
+        for record in controller.metadata:
+            record["completion_level"] = selected.completion_level
+            record["required_release"] = bool(place.release)
         self._action_metadata_override = list(controller.metadata)
         self._save_grasp_visualization(
             scene,
@@ -3202,6 +3846,11 @@ class RoboTwinHeuristicRuntime:
             "[heuristic] placement plan selected "
             f"target={target.name} destination={place.destination} arm={arm} "
             f"confidence={selected.candidate.confidence:.3f} "
+            f"orientation_source={selected.orientation_source} "
+            f"completion_level={selected.completion_level} "
+            f"support_plane_z={self._support_plane_for_arm(arm)} "
+            f"support_clearance_rejections="
+            f"{failures.get('support_clearance', 0)} "
             f"desired_xyz={np.array2string(desired[:3, 3], precision=3)}"
         )
         return [action.copy() for action in controller.actions]
@@ -3284,6 +3933,9 @@ class RoboTwinHeuristicRuntime:
     ]:
         giver_arm = str(handoff.from_arm).strip().lower()
         receiver_arm = str(handoff.to_arm).strip().lower()
+        support_rejections_before = int(
+            getattr(self.ik, "failures", {}).get("SupportClearance", 0)
+        )
         for stage_arm, expected, label in (
             (pick.arm, giver_arm, "pick"),
             (place.arm, receiver_arm, "place"),
@@ -3347,8 +3999,6 @@ class RoboTwinHeuristicRuntime:
             or not np.all(np.isfinite(postgrasp))
             or not np.isfinite(preplace_offset)
             or not np.isfinite(place_offset)
-            or preplace_offset < place_offset
-            or place_offset < 0.0
         ):
             raise ValueError("invalid structured handoff offsets")
 
@@ -3394,7 +4044,6 @@ class RoboTwinHeuristicRuntime:
             if len(target_points)
             else np.empty((0, 3), dtype=np.float64)
         )
-        elongated_axis = _elongated_object_axis(scene, target)
 
         def current_ee_position(arm: str) -> np.ndarray | None:
             getter = getattr(self.task_env.robot, f"get_{arm}_ee_pose", None)
@@ -3409,18 +4058,23 @@ class RoboTwinHeuristicRuntime:
         def grasp_is_feasible(
             world_grasp_pose: np.ndarray, role: str
         ) -> bool:
+            palm_depth = _target_m2t2_palm_depth(
+                scene,
+                target,
+                world_grasp_pose,
+                self.ik.grasp_to_robotwin,
+            )
+            if (
+                palm_depth is not None
+                and palm_depth < M2T2_MIN_TARGET_PALM_DEPTH_M
+            ):
+                key = f"{role}_palm_clearance"
+                failures[key] = failures.get(key, 0) + 1
+                return False
             command = (
                 np.asarray(world_grasp_pose, dtype=np.float64)
                 @ self.ik.grasp_to_robotwin
             )
-            if (
-                elongated_axis is not None
-                and abs(float(np.dot(command[:3, 1], elongated_axis)))
-                > self.bimanual_max_jaw_axis_alignment
-            ):
-                key = f"{role}_jaw_axis"
-                failures[key] = failures.get(key, 0) + 1
-                return False
             width = _target_width_along_axis(
                 scene, target, command[:3, 1]
             )
@@ -3486,9 +4140,13 @@ class RoboTwinHeuristicRuntime:
             else:
                 failures["receiver_region"] += 1
 
-        giver_plans: list[_HandoffArmPlan] = []
+        giver_raw_variants = [
+            ("m2t2", candidate, local_contact,
+             candidate.world_grasp_pose)
+            for candidate, local_contact in classified["giver"]
+        ]
+        giver_fallback_variants = []
         for candidate, local_contact in classified["giver"]:
-            variants = [("m2t2", candidate.world_grasp_pose)]
             if giver_ee is not None:
                 adjusted = _robot_facing_grasp_pose(
                     candidate.world_grasp_pose,
@@ -3496,8 +4154,18 @@ class RoboTwinHeuristicRuntime:
                     self.ik.grasp_to_robotwin,
                 )
                 if not np.allclose(adjusted, candidate.world_grasp_pose):
-                    variants.append(("robot_facing_fallback", adjusted))
-            for orientation_source, grasp_pose in variants:
+                    giver_fallback_variants.append((
+                        "robot_facing_fallback",
+                        candidate,
+                        local_contact,
+                        adjusted,
+                    ))
+
+        giver_plans: list[_HandoffArmPlan] = []
+        for variants in (giver_raw_variants, giver_fallback_variants):
+            for (
+                orientation_source, candidate, local_contact, grasp_pose
+            ) in variants:
                 if not grasp_is_feasible(grasp_pose, "giver"):
                     continue
                 contact_command = (
@@ -3555,13 +4223,18 @@ class RoboTwinHeuristicRuntime:
                         orientation_source=orientation_source,
                     )
                 )
-                break
+                if len(giver_plans) >= self.bimanual_max_plans_per_arm:
+                    break
             if len(giver_plans) >= self.bimanual_max_plans_per_arm:
                 break
 
-        receiver_plans: list[_HandoffArmPlan] = []
+        receiver_raw_variants = [
+            ("m2t2", candidate, local_contact,
+             candidate.world_grasp_pose)
+            for candidate, local_contact in classified["receiver"]
+        ]
+        receiver_fallback_variants = []
         for candidate, local_contact in classified["receiver"]:
-            variants = [("m2t2", candidate.world_grasp_pose)]
             if receiver_ee is not None:
                 adjusted = _place_facing_grasp_pose(
                     candidate.world_grasp_pose,
@@ -3571,8 +4244,19 @@ class RoboTwinHeuristicRuntime:
                     self.ik.grasp_to_robotwin,
                 )
                 if not np.allclose(adjusted, candidate.world_grasp_pose):
-                    variants.append(("robot_facing_fallback", adjusted))
-            for orientation_source, source_grasp_pose in variants:
+                    receiver_fallback_variants.append((
+                        "robot_facing_fallback",
+                        candidate,
+                        local_contact,
+                        adjusted,
+                    ))
+
+        receiver_plans: list[_HandoffArmPlan] = []
+        for variants in (receiver_raw_variants, receiver_fallback_variants):
+            for (
+                orientation_source, candidate, local_contact,
+                source_grasp_pose,
+            ) in variants:
                 if not grasp_is_feasible(source_grasp_pose, "receiver"):
                     continue
                 source_contact_command = (
@@ -3645,10 +4329,17 @@ class RoboTwinHeuristicRuntime:
                         orientation_source=orientation_source,
                     )
                 )
-                break
+                if len(receiver_plans) >= self.bimanual_max_plans_per_arm:
+                    break
             if len(receiver_plans) >= self.bimanual_max_plans_per_arm:
                 break
 
+        failures["support_clearance"] = (
+            int(getattr(self.ik, "failures", {}).get(
+                "SupportClearance", 0
+            ))
+            - support_rejections_before
+        )
         print(
             "[heuristic] handoff IK "
             f"target={target.name} giver={giver_arm}:{len(giver_plans)} "
@@ -3806,8 +4497,12 @@ class RoboTwinHeuristicRuntime:
         )
         pairs.sort(
             key=lambda pair: (
+                all(
+                    plan.orientation_source == "m2t2"
+                    for plan in pair
+                ),
                 pair[0].candidate.confidence
-                + pair[1].candidate.confidence
+                + pair[1].candidate.confidence,
             ),
             reverse=True,
         )
@@ -3858,7 +4553,577 @@ class RoboTwinHeuristicRuntime:
             f"contact={receiver.contact_local_point} "
             f"orientation_sources={giver.orientation_source}/"
             f"{receiver.orientation_source} "
-            f"collision_rejections={collision_rejections}"
+            f"collision_rejections={collision_rejections} "
+            f"support_plane_z="
+            f"{self._support_plane_for_arm(giver.arm)} "
+            f"support_clearance_rejections="
+            f"{failures.get('support_clearance', 0)}"
+        )
+        return actions
+
+    def _plan_simultaneous_pick_sides(
+        self,
+        scene: SceneObservation,
+        target: ObjectState,
+        picks: tuple[Pick, Pick],
+    ) -> tuple[
+        dict[str, list[_SimultaneousPickArmPlan]],
+        list[GraspCandidate],
+        dict[str, Any],
+        dict[str, int],
+        float,
+        str,
+    ]:
+        """Plan both recorded arms from one shared confidence-ranked pool."""
+        picks_by_arm = {
+            str(pick.arm).strip().lower(): pick for pick in picks
+        }
+        if set(picks_by_arm) != {"left", "right"}:
+            raise TargetSelectionFailure(
+                "simultaneous Pick requires one recorded stage per arm"
+            )
+        if {pick.target for pick in picks} != {target.name}:
+            raise TargetSelectionFailure(
+                "simultaneous Pick target differs from segmented target"
+            )
+
+        parameters: dict[str, tuple[float, float, float, np.ndarray]] = {}
+        for arm, pick in picks_by_arm.items():
+            pregrasp_offset = (
+                self.config.pregrasp_offset_m
+                if pick.pregrasp_offset_m is None
+                else float(pick.pregrasp_offset_m)
+            )
+            grasp_offset = float(getattr(pick, "grasp_offset_m", 0.0))
+            gripper_target = float(getattr(pick, "gripper_target", 0.0))
+            postgrasp = np.asarray(
+                pick.postgrasp_displacement
+                if pick.postgrasp_displacement is not None
+                else (0.0, 0.0, self.bimanual_lift_m),
+                dtype=np.float64,
+            )
+            if (
+                not np.isfinite(pregrasp_offset)
+                or not np.isfinite(grasp_offset)
+                or pregrasp_offset < 0.0
+                or grasp_offset < 0.0
+                or grasp_offset > pregrasp_offset
+                or not np.isfinite(gripper_target)
+                or not 0.0 <= gripper_target <= 1.0
+                or postgrasp.shape != (3,)
+                or not np.all(np.isfinite(postgrasp))
+            ):
+                raise ValueError(
+                    f"invalid simultaneous Pick parameters for arm={arm}"
+                )
+            parameters[arm] = (
+                pregrasp_offset,
+                grasp_offset,
+                gripper_target,
+                postgrasp,
+            )
+
+        if not np.allclose(
+            parameters["left"][3],
+            parameters["right"][3],
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise TargetSelectionFailure(
+                "simultaneous same-object Pick requires matching world "
+                "postgrasp displacements"
+            )
+
+        support_rejections_before = int(
+            getattr(self.ik, "failures", {}).get("SupportClearance", 0)
+        )
+        ranker = ConfidenceRankedGrasps(
+            self.grasps, min_confidence=self.config.min_confidence
+        )
+        ranked = ranker.propose(scene, target)[: self.config.max_candidates]
+        trace = self._copy_backend_trace(
+            getattr(self.backend, "last_trace", {})
+        )
+        failures: dict[str, int] = {
+            "left_region": 0,
+            "right_region": 0,
+            "pair_separation": 0,
+        }
+
+        world_object = _pose_matrix(
+            target.world_pose, name="simultaneous_pick_world_object_pose"
+        )
+        world_from_object = np.linalg.inv(world_object)
+        points = np.asarray(scene.xyz, dtype=np.float64).reshape(-1, 3)
+        labels = np.asarray(scene.instance_labels).reshape(-1)
+        if len(points) != len(labels):
+            raise ValueError("scene points and instance labels must align")
+        target_points = points[labels == target.instance_id]
+        target_points = target_points[
+            np.all(np.isfinite(target_points), axis=1)
+        ]
+        local_target = (
+            target_points @ world_from_object[:3, :3].T
+            + world_from_object[:3, 3]
+            if len(target_points)
+            else np.empty((0, 3), dtype=np.float64)
+        )
+
+        def current_ee_position(arm: str) -> np.ndarray | None:
+            getter = getattr(
+                self.task_env.robot, f"get_{arm}_ee_pose", None
+            )
+            if getter is None:
+                return None
+            values = np.asarray(getter(), dtype=np.float64)
+            if values.ndim != 1 or len(values) < 3:
+                return None
+            position = values[:3]
+            return position if np.all(np.isfinite(position)) else None
+
+        ee_positions = {
+            arm: current_ee_position(arm) for arm in ("left", "right")
+        }
+
+        def local_reference(
+            world_reference: np.ndarray | None,
+        ) -> np.ndarray | None:
+            if world_reference is None:
+                return None
+            return (
+                world_from_object[:3, :3] @ world_reference
+                + world_from_object[:3, 3]
+            )
+
+        (
+            left_region,
+            right_region,
+            minimum_separation,
+            contact_region_source,
+        ) = _handoff_contact_regions(
+            local_target,
+            getattr(
+                picks_by_arm["left"],
+                "allowed_contact_points_local",
+                None,
+            ),
+            getattr(
+                picks_by_arm["right"],
+                "allowed_contact_points_local",
+                None,
+            ),
+            giver_reference_local=local_reference(ee_positions["left"]),
+            receiver_reference_local=local_reference(ee_positions["right"]),
+        )
+        regions = {"left": left_region, "right": right_region}
+        raw_region_distance = max(0.02, minimum_separation)
+        classified: dict[
+            str,
+            list[tuple[GraspCandidate, tuple[float, float, float]]],
+        ] = {"left": [], "right": []}
+        for candidate in ranked:
+            tcp = _grasp_command_tcp(
+                candidate.world_grasp_pose, self.ik.grasp_to_robotwin
+            )
+            local_tcp = (
+                world_from_object[:3, :3] @ tcp
+                + world_from_object[:3, 3]
+            )
+            distances = {
+                arm: float(
+                    np.min(
+                        np.linalg.norm(region - local_tcp, axis=1)
+                    )
+                )
+                for arm, region in regions.items()
+            }
+            local_contact = tuple(float(value) for value in local_tcp)
+            if (
+                distances["left"] + 1e-6 < distances["right"]
+                and distances["left"] <= raw_region_distance
+            ):
+                classified["left"].append((candidate, local_contact))
+            else:
+                failures["left_region"] += 1
+            if (
+                distances["right"] + 1e-6 < distances["left"]
+                and distances["right"] <= raw_region_distance
+            ):
+                classified["right"].append((candidate, local_contact))
+            else:
+                failures["right_region"] += 1
+
+        def grasp_is_feasible(
+            world_grasp_pose: np.ndarray, arm: str
+        ) -> bool:
+            palm_depth = _target_m2t2_palm_depth(
+                scene,
+                target,
+                world_grasp_pose,
+                self.ik.grasp_to_robotwin,
+            )
+            if (
+                palm_depth is not None
+                and palm_depth < M2T2_MIN_TARGET_PALM_DEPTH_M
+            ):
+                key = f"{arm}_palm_clearance"
+                failures[key] = failures.get(key, 0) + 1
+                return False
+            command = (
+                np.asarray(world_grasp_pose, dtype=np.float64)
+                @ self.ik.grasp_to_robotwin
+            )
+            width = _target_width_along_axis(
+                scene, target, command[:3, 1]
+            )
+            if (
+                width is not None
+                and width > self.bimanual_max_target_width_m
+            ):
+                key = f"{arm}_jaw_width"
+                failures[key] = failures.get(key, 0) + 1
+                # A global target-cloud span cannot prove that a local M2T2
+                # contact is outside the gripper. Keep this as telemetry, but
+                # let differential IK and the paired path checks try the pose.
+            return True
+
+        plans: dict[str, list[_SimultaneousPickArmPlan]] = {
+            "left": [],
+            "right": [],
+        }
+        for arm in ("left", "right"):
+            raw_variants = [
+                (
+                    "m2t2",
+                    candidate,
+                    local_contact,
+                    candidate.world_grasp_pose,
+                )
+                for candidate, local_contact in classified[arm]
+            ]
+            aligned_variants = []
+            aligned_robot_facing_variants = []
+            for candidate in ranked:
+                source_tcp = _grasp_command_tcp(
+                    candidate.world_grasp_pose,
+                    self.ik.grasp_to_robotwin,
+                )
+                source_local_tcp = (
+                    world_from_object[:3, :3] @ source_tcp
+                    + world_from_object[:3, 3]
+                )
+                region = regions[arm]
+                anchor = region[
+                    int(np.argmin(
+                        np.linalg.norm(region - source_local_tcp, axis=1)
+                    ))
+                ]
+                local_contact = tuple(float(value) for value in anchor)
+                aligned = _align_grasp_pose_to_local_contact(
+                    candidate.world_grasp_pose,
+                    world_object,
+                    anchor,
+                    self.ik.grasp_to_robotwin,
+                )
+                aligned_variants.append(
+                    (
+                        "recorded_contact_alignment",
+                        candidate,
+                        local_contact,
+                        aligned,
+                    )
+                )
+                if ee_positions[arm] is None:
+                    continue
+                try:
+                    adjusted = _robot_facing_grasp_pose(
+                        aligned,
+                        ee_positions[arm],
+                        self.ik.grasp_to_robotwin,
+                    )
+                except ValueError:
+                    key = f"{arm}_recorded_contact_robot_facing"
+                    failures[key] = failures.get(key, 0) + 1
+                    continue
+                aligned_robot_facing_variants.append(
+                    (
+                        "recorded_contact_robot_facing",
+                        candidate,
+                        local_contact,
+                        adjusted,
+                    )
+                )
+
+            (
+                pregrasp_offset,
+                grasp_offset,
+                gripper_target,
+                postgrasp,
+            ) = parameters[arm]
+            for variants in (
+                raw_variants,
+                aligned_variants,
+                aligned_robot_facing_variants,
+            ):
+                for (
+                    orientation_source,
+                    candidate,
+                    local_contact,
+                    grasp_pose,
+                ) in variants:
+                    if not grasp_is_feasible(grasp_pose, arm):
+                        continue
+                    contact_command = (
+                        np.asarray(grasp_pose, dtype=np.float64)
+                        @ self.ik.grasp_to_robotwin
+                    )
+                    pregrasp_command = _approach_offset_command_pose(
+                        contact_command, pregrasp_offset
+                    )
+                    grasp_command = _approach_offset_command_pose(
+                        contact_command, grasp_offset
+                    )
+                    lift_command = grasp_command.copy()
+                    lift_command[:3, 3] += postgrasp
+                    chain = self._solve_handoff_command_chain(
+                        arm,
+                        arm,
+                        (
+                            ("pregrasp", pregrasp_command),
+                            ("grasp", grasp_command),
+                            ("lift", lift_command),
+                        ),
+                        failures,
+                    )
+                    if chain is None:
+                        continue
+                    paths, commands = chain
+                    planned_candidate = GraspCandidate(
+                        np.asarray(grasp_pose, dtype=np.float64),
+                        float(candidate.confidence),
+                        candidate.object_name,
+                    )
+                    plans[arm].append(
+                        _SimultaneousPickArmPlan(
+                            arm=arm,
+                            target_name=target.name,
+                            arm_source="robotwin_ground_truth",
+                            candidate=planned_candidate,
+                            paths=paths,
+                            command_targets=commands,
+                            contact_local_point=local_contact,
+                            gripper_target=gripper_target,
+                            orientation_source=orientation_source,
+                        )
+                    )
+                    if (
+                        len(plans[arm])
+                        >= self.bimanual_max_plans_per_arm
+                    ):
+                        break
+                if (
+                    len(plans[arm])
+                    >= self.bimanual_max_plans_per_arm
+                ):
+                    break
+
+        failures["support_clearance"] = (
+            int(
+                getattr(self.ik, "failures", {}).get(
+                    "SupportClearance", 0
+                )
+            )
+            - support_rejections_before
+        )
+        return (
+            plans,
+            ranked,
+            trace,
+            failures,
+            minimum_separation,
+            contact_region_source,
+        )
+
+    def _build_simultaneous_pick_action_pair(
+        self,
+        left: _SimultaneousPickArmPlan,
+        right: _SimultaneousPickArmPlan,
+    ) -> list[np.ndarray]:
+        """Synchronize dual pregrasp/grasp/close/lift joint commands."""
+        plans = {"left": left, "right": right}
+        if left.arm != "left" or right.arm != "right":
+            raise ValueError("simultaneous plans require one plan per arm")
+        if left.target_name != right.target_name:
+            raise ValueError("simultaneous plans must share one target")
+        if any(
+            len(plan.paths) != 3 or len(plan.command_targets) != 3
+            for plan in plans.values()
+        ):
+            raise ValueError(
+                "simultaneous plans require pregrasp/grasp/lift chains"
+            )
+
+        controller = self.staged_controller
+        controller.reset()
+        names = {arm: plan.target_name for arm, plan in plans.items()}
+        sources = {arm: plan.arm_source for arm, plan in plans.items()}
+        controller.gripper_phase(
+            "open",
+            {"left": 1.0, "right": 1.0},
+            1,
+            names,
+            sources,
+        )
+        for phase, index in (
+            ("pregrasp", 0),
+            ("grasp", 1),
+        ):
+            controller.move_phase(
+                phase,
+                {arm: plan.paths[index] for arm, plan in plans.items()},
+                {
+                    arm: plan.command_targets[index]
+                    for arm, plan in plans.items()
+                },
+                names,
+                sources,
+            )
+        controller.gripper_phase(
+            "close",
+            {arm: plan.gripper_target for arm, plan in plans.items()},
+            self.gripper_settle_actions,
+            names,
+            sources,
+        )
+        controller.move_phase(
+            "lift",
+            {arm: plan.paths[2] for arm, plan in plans.items()},
+            {arm: plan.command_targets[2] for arm, plan in plans.items()},
+            names,
+            sources,
+        )
+        actions = [action.copy() for action in controller.actions]
+        if any(
+            action.shape != (14,) or not np.all(np.isfinite(action))
+            for action in actions
+        ):
+            raise ValueError(
+                "simultaneous Pick must compose finite 14D qpos actions"
+            )
+        return actions
+
+    def _get_simultaneous_pick_action(
+        self,
+        scene: SceneObservation,
+        target: ObjectState,
+        picks: tuple[Pick, Pick],
+    ) -> list[np.ndarray]:
+        (
+            plans,
+            ranked,
+            trace,
+            failures,
+            minimum_separation,
+            contact_region_source,
+        ) = self._plan_simultaneous_pick_sides(scene, target, picks)
+        if not plans["left"] or not plans["right"]:
+            for arm in ("left", "right"):
+                self._save_grasp_visualization(
+                    scene,
+                    target,
+                    ranked,
+                    None,
+                    arm,
+                    raw_trace_override=trace,
+                    executed_command_pose_override=None,
+                    use_default_executed_pose=False,
+                )
+            raise NoFeasiblePlanFailure(
+                "M2T2/Mink produced no complete simultaneous Pick plan; "
+                f"left={len(plans['left'])} right={len(plans['right'])} "
+                f"failures={failures}; ik_failures={self.ik.failures}"
+            )
+
+        pairs = [
+            (left, right)
+            for left in plans["left"]
+            for right in plans["right"]
+            if float(
+                np.linalg.norm(
+                    np.asarray(left.contact_local_point)
+                    - np.asarray(right.contact_local_point)
+                )
+            )
+            >= minimum_separation
+        ]
+        failures["pair_separation"] += (
+            len(plans["left"]) * len(plans["right"]) - len(pairs)
+        )
+        pairs.sort(
+            key=lambda pair: (
+                sum(
+                    plan.orientation_source == "m2t2" for plan in pair
+                ),
+                pair[0].candidate.confidence
+                + pair[1].candidate.confidence,
+            ),
+            reverse=True,
+        )
+
+        selected: tuple[
+            _SimultaneousPickArmPlan, _SimultaneousPickArmPlan
+        ] | None = None
+        actions: list[np.ndarray] = []
+        collision_rejections = 0
+        for left, right in pairs:
+            candidate_actions = self._build_simultaneous_pick_action_pair(
+                left, right
+            )
+            if self.ik.full_robot_path_has_self_collision(
+                candidate_actions,
+                max_joint_step_rad=self.bimanual_collision_step_rad,
+            ):
+                collision_rejections += 1
+                continue
+            selected = left, right
+            actions = candidate_actions
+            break
+        if selected is None:
+            raise NoFeasiblePlanFailure(
+                "all confidence-ranked separated-region simultaneous Pick "
+                "pairs are infeasible; "
+                f"separation_rejections={failures['pair_separation']} "
+                f"collision_rejections={collision_rejections}"
+            )
+
+        self._action_metadata_override = list(
+            self.staged_controller.metadata
+        )
+        left, right = selected
+        for plan in selected:
+            self._save_grasp_visualization(
+                scene,
+                target,
+                ranked,
+                plan.candidate,
+                plan.arm,
+                raw_trace_override=trace,
+                executed_command_pose_override=plan.command_targets[1],
+                use_default_executed_pose=False,
+            )
+        print(
+            "[heuristic] simultaneous Pick selected "
+            f"target={target.name} left_conf={left.candidate.confidence:.3f} "
+            f"left_contact={left.contact_local_point} "
+            f"right_conf={right.candidate.confidence:.3f} "
+            f"right_contact={right.contact_local_point} "
+            f"orientation_sources={left.orientation_source}/"
+            f"{right.orientation_source} "
+            f"contact_regions={contact_region_source} "
+            f"collision_rejections={collision_rejections} "
+            f"support_plane_z={self._support_plane_for_arm('left')} "
+            f"support_clearance_rejections="
+            f"{failures.get('support_clearance', 0)}"
         )
         return actions
 
@@ -3883,6 +5148,7 @@ class RoboTwinHeuristicRuntime:
                 raise TargetSelectionFailure(
                     "recorded bimanual Pick arm differs from selected arm"
                 )
+            self._configure_support_plane(scene, target, (arm,))
             plans, ranked, trace, failures = self._plan_single_arm_place(
                 scene,
                 target,
@@ -4017,8 +5283,12 @@ class RoboTwinHeuristicRuntime:
         ]
         pairs.sort(
             key=lambda pair: (
+                all(
+                    plan.orientation_source == "m2t2"
+                    for plan in pair
+                ),
                 pair[0].candidate.confidence
-                + pair[1].candidate.confidence
+                + pair[1].candidate.confidence,
             ),
             reverse=True,
         )
@@ -4072,6 +5342,15 @@ class RoboTwinHeuristicRuntime:
                 for arm in ("left", "right")
             )
             + f" collision_rejections={collision_rejections}"
+            + " support_plane_z="
+            + str({
+                arm: self._support_plane_for_arm(arm)
+                for arm in ("left", "right")
+            })
+            + " support_clearance_rejections="
+            + str(getattr(self.ik, "failures", {}).get(
+                "SupportClearance", 0
+            ))
         )
         return actions
 
@@ -4094,8 +5373,31 @@ class RoboTwinHeuristicRuntime:
             )
         self._grasp_attempted = True
         self._action_metadata_override = None
+        clear_support = getattr(self.ik, "clear_support_planes", None)
+        if clear_support is not None:
+            clear_support()
         self.simulator.update(scene)
         target_names = self._target_names(scene)
+        simultaneous_picks = self._simultaneous_same_object_pick_stages(
+            self.task_env
+        )
+        if simultaneous_picks is not None:
+            if (
+                len(target_names) != 1
+                or simultaneous_picks[0].target != target_names[0]
+            ):
+                raise TargetSelectionFailure(
+                    "simultaneous Pick target differs from segmented "
+                    "manipulation targets"
+                )
+            target = self.simulator.object_state(target_names[0])
+            self.ik.reset_stats()
+            self._configure_support_plane(
+                scene, target, ("left", "right")
+            )
+            return self._get_simultaneous_pick_action(
+                scene, target, simultaneous_picks
+            )
         if len(target_names) == 2:
             self.ik.reset_stats()
             grouped_stages = self._grouped_bimanual_place_stages(
@@ -4131,6 +5433,14 @@ class RoboTwinHeuristicRuntime:
                     "structured handoff source does not match M2T2 target: "
                     f"{pick.target!r} != {target_name!r}"
                 )
+            self._configure_support_plane(
+                scene,
+                target,
+                (
+                    str(handoff.from_arm).strip().lower(),
+                    str(handoff.to_arm).strip().lower(),
+                ),
+            )
             return self._get_handoff_action(
                 scene,
                 target,
@@ -4154,6 +5464,7 @@ class RoboTwinHeuristicRuntime:
                 raise TargetSelectionFailure(
                     "structured place arm differs from selected grasp arm"
                 )
+            self._configure_support_plane(scene, target, (arm,))
             return self._get_single_place_action(
                 scene,
                 target,
@@ -4162,6 +5473,7 @@ class RoboTwinHeuristicRuntime:
                 arm=arm,
                 arm_source=arm_source,
             )
+        self._configure_support_plane(scene, target, (arm,))
         ranker = ConfidenceRankedGrasps(
             self.grasps, min_confidence=self.config.min_confidence
         )
@@ -4207,6 +5519,9 @@ class RoboTwinHeuristicRuntime:
             staged_controller.reset()
         self.bimanual_controller.reset()
         self.ik.reset_stats()
+        clear_support = getattr(self.ik, "clear_support_planes", None)
+        if clear_support is not None:
+            clear_support()
         self.backend.reset(int(getattr(self.task_env, "episode_seed", 0)))
         self._visualization_index = 0
 
@@ -4270,10 +5585,10 @@ def create_runtime(
             dt=float(usr_args.get("mink_dt", 0.05)),
             max_iterations=int(usr_args.get("mink_max_iterations", 100)),
             position_tolerance_m=float(
-                usr_args.get("mink_position_tolerance_m", 1e-3)
+                usr_args.get("mink_position_tolerance_m", 0.01)
             ),
             orientation_tolerance_rad=float(
-                usr_args.get("mink_orientation_tolerance_rad", 1e-2)
+                usr_args.get("mink_orientation_tolerance_rad", 0.10)
             ),
         ),
         relax_orientation_on_failure=bool(
@@ -4312,5 +5627,8 @@ def create_runtime(
         ),
         bimanual_max_target_width_m=float(
             usr_args.get("bimanual_max_target_width_m", 0.10)
+        ),
+        support_collision_filter_enabled=bool(
+            usr_args.get("support_collision_filter_enabled", False)
         ),
     )

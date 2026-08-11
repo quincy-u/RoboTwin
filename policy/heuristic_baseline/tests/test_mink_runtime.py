@@ -14,6 +14,7 @@ from policy.heuristic_baseline.runtime import (
     BimanualQposActionBuffer,
     CANONICAL_COMMAND_QUATERNIONS,
     ConfidenceRankedGrasps,
+    M2T2_MIN_TARGET_PALM_DEPTH_M,
     M2T2_TO_ROBOTWIN,
     M2T2_GRIPPER_POLYLINE,
     QposActionBuffer,
@@ -24,7 +25,10 @@ from policy.heuristic_baseline.runtime import (
     _BimanualArmPlan,
     _HandoffArmPlan,
     _SingleArmPlacePlan,
+    _handoff_contact_regions,
     _aligned_place_reference_pose,
+    _approach_roll_grasp_pose,
+    _estimate_target_support_plane_z,
     _grasp_command_tcp,
     _rigid_place_command_pose,
     _aloha_self_collision_config,
@@ -35,6 +39,7 @@ from policy.heuristic_baseline.runtime import (
     _project_world_points_cv,
     _rigid_transport_command_pose,
     _robot_facing_grasp_pose,
+    _target_m2t2_palm_depth,
     _target_width_along_axis,
     _target_narrow_axis,
     save_grasp_visualization,
@@ -1505,7 +1510,9 @@ class MinkRuntimeTest(unittest.TestCase):
         )
 
     def test_handoff_buffer_transfers_ownership_and_releases_receiver(self):
-        def make_plan(arm, role, confidence, local_z, path_count):
+        def make_plan(
+            arm, role, confidence, local_point, path_count, gripper_target
+        ):
             sign = -1.0 if arm == "left" else 1.0
             paths = tuple(
                 np.full((2, 6), sign * 0.05 * (index + 1))
@@ -1524,11 +1531,16 @@ class MinkRuntimeTest(unittest.TestCase):
                 candidate=GraspCandidate(I.copy(), confidence, "box"),
                 paths=paths,
                 command_targets=tuple(commands),
-                contact_local_z=local_z,
+                contact_local_point=local_point,
+                gripper_target=gripper_target,
             )
 
-        giver = make_plan("left", "giver", 0.9, 0.07, 5)
-        receiver = make_plan("right", "receiver", 0.8, -0.07, 4)
+        giver = make_plan(
+            "left", "giver", 0.9, (-0.02, 0.01, 0.07), 5, 0.25
+        )
+        receiver = make_plan(
+            "right", "receiver", 0.8, (0.03, -0.01, -0.07), 4, 0.35
+        )
         runtime = RoboTwinHeuristicRuntime.__new__(RoboTwinHeuristicRuntime)
         runtime.staged_controller = StagedQposActionBuffer(
             Env(), max_waypoints_per_segment=8
@@ -1592,15 +1604,17 @@ class MinkRuntimeTest(unittest.TestCase):
             and record["phase"] == "open"
         )
         self.assertTrue(
-            all(row[6] == 0.0 and row[13] == 0.0
+            all(row[6] == 0.25 and row[13] == 0.35
                 for row in actions[receiver_close:giver_release])
         )
         self.assertTrue(
-            all(row[6] == 1.0 and row[13] == 0.0
+            all(row[6] == 1.0 and row[13] == 0.35
                 for row in actions[giver_release:receiver_release])
         )
         self.assertEqual(actions[-1][6], 1.0)
         self.assertEqual(actions[-1][13], 1.0)
+        self.assertEqual(giver.contact_local_point, (-0.02, 0.01, 0.07))
+        self.assertEqual(receiver.contact_local_point, (0.03, -0.01, -0.07))
 
     def test_handoff_uses_one_source_inference_and_full_rigid_rendezvous(self):
         class Actor:
@@ -1703,12 +1717,23 @@ class MinkRuntimeTest(unittest.TestCase):
         pick = Pick(
             "box", "left", pregrasp_offset_m=0.07,
             postgrasp_displacement=(0.0, 0.0, 0.10),
+            gripper_target=0.25,
+            allowed_contact_points_local=(
+                (0.0, 0.0, 0.07), (0.0, 0.0, 0.06)
+            ),
         )
         handoff = Handoff(
-            "box", "left", "right", "block_middle_pose",
+            "box", "left", "right",
             object_functional_point_id=0,
             pregrasp_offset_m=0.07,
             constrain="free",
+            rendezvous_pose=tuple(
+                tuple(float(value) for value in row) for row in middle
+            ),
+            gripper_target=0.35,
+            allowed_contact_points_local=(
+                (0.0, 0.0, -0.07), (0.0, 0.0, -0.06)
+            ),
         )
         place = Place(
             "box", "target_box", "right",
@@ -1723,7 +1748,10 @@ class MinkRuntimeTest(unittest.TestCase):
 
         with patch.object(
             runtime, "_save_grasp_visualization"
-        ) as visualizer:
+        ) as visualizer, patch(
+            "policy.heuristic_baseline.runtime._target_m2t2_palm_depth",
+            return_value=0.08,
+        ):
             actions = runtime._get_handoff_action(
                 scene, target, pick=pick, handoff=handoff, place=place
             )
@@ -1764,9 +1792,41 @@ class MinkRuntimeTest(unittest.TestCase):
             middle @ receiver_second.world_grasp_pose @ M2T2_TO_ROBOTWIN,
             atol=1e-12,
         )
+        giver_close = next(
+            record for record in endpoints
+            if record["phase"] == "close"
+            and record.get("gripper_arms") == ["left"]
+        )
+        receiver_close = next(
+            record for record in endpoints
+            if record["phase"] == "close"
+            and record.get("gripper_arms") == ["right"]
+        )
+        self.assertEqual(giver_close["target_gripper"], 0.25)
+        self.assertEqual(receiver_close["target_gripper"], 0.35)
+
+    def test_handoff_pca_fallback_is_axis_sign_invariant(self):
+        local_target = np.array([
+            [-0.12, 0.00, 0.00], [-0.10, 0.01, 0.00],
+            [0.10, -0.01, 0.00], [0.12, 0.00, 0.00],
+        ])
+
+        giver, receiver, separation, source = _handoff_contact_regions(
+            local_target, None, None,
+            giver_reference_local=None,
+            receiver_reference_local=None,
+        )
+
+        centroids = np.stack((giver.mean(axis=0), receiver.mean(axis=0)))
+        self.assertEqual(source, "segmented_pca_fallback")
+        self.assertGreater(separation, 0.0)
+        self.assertGreater(np.linalg.norm(centroids[0] - centroids[1]), 0.20)
+        self.assertEqual(
+            {np.sign(value) for value in centroids[:, 0]}, {-1.0, 1.0}
+        )
 
     def test_handoff_collision_rejection_exposes_no_partial_actions(self):
-        def make_plan(arm, role, count, local_z):
+        def make_plan(arm, role, count, local_point):
             return _HandoffArmPlan(
                 arm=arm,
                 role=role,
@@ -1775,7 +1835,7 @@ class MinkRuntimeTest(unittest.TestCase):
                 candidate=GraspCandidate(I.copy(), 0.9, "box"),
                 paths=tuple(np.full((1, 6), 0.05) for _ in range(count)),
                 command_targets=tuple(I.copy() for _ in range(count)),
-                contact_local_z=local_z,
+                contact_local_point=local_point,
             )
 
         class CollisionIK:
@@ -1792,8 +1852,12 @@ class MinkRuntimeTest(unittest.TestCase):
                 )
                 return True
 
-        giver = make_plan("left", "giver", 5, 0.07)
-        receiver = make_plan("right", "receiver", 4, -0.07)
+        giver = make_plan(
+            "left", "giver", 5, (-0.03, 0.01, 0.07)
+        )
+        receiver = make_plan(
+            "right", "receiver", 4, (0.02, -0.01, -0.07)
+        )
         runtime = RoboTwinHeuristicRuntime.__new__(RoboTwinHeuristicRuntime)
         runtime.task_env = Env()
         runtime.staged_controller = StagedQposActionBuffer(
@@ -1815,14 +1879,17 @@ class MinkRuntimeTest(unittest.TestCase):
             runtime, "_plan_handoff_sides", return_value=planned
         ):
             with self.assertRaisesRegex(
-                NoFeasiblePlanFailure, "opposite-end handoff pairs"
+                NoFeasiblePlanFailure, "separated-region handoff pairs"
             ):
                 runtime._get_handoff_action(
                     object(),
                     target,
                     pick=Pick("box", "left"),
                     handoff=Handoff(
-                        "box", "left", "right", "block_middle_pose"
+                        "box", "left", "right",
+                        rendezvous_pose=tuple(
+                            tuple(float(value) for value in row) for row in I
+                        ),
                     ),
                     place=place,
                 )
@@ -2182,6 +2249,290 @@ class MinkRuntimeTest(unittest.TestCase):
 
         self.assertEqual(runtime.simulator.update_calls, 1)
 
+    def test_single_place_raw_pose_preempts_higher_confidence_fallback(self):
+        class Actor:
+            def get_pose(self):
+                return I.copy()
+
+        class TierIK:
+            grasp_to_robotwin = I.copy()
+
+            def __init__(self):
+                self.failures = {}
+                self.solve_count = 0
+                self.completed_paths = ()
+                self.completed_command_targets = ()
+
+            def solve(self, arm, pose):
+                del arm
+                stage = self.solve_count % 3
+                if stage == 0:
+                    self.completed_paths = ()
+                    self.completed_command_targets = ()
+                self.solve_count += 1
+                pose = np.asarray(pose, dtype=np.float64)
+                if np.isclose(pose[0, 3], 0.20):
+                    return None
+                goal = np.full(6, 0.01 * self.solve_count)
+                self.completed_paths += (goal[None, :],)
+                self.completed_command_targets += (pose.copy(),)
+                return goal
+
+            def solve_command_target(self, arm, command, start):
+                del arm
+                goal = np.asarray(start, dtype=np.float64) + 0.01
+                return goal, goal[None, :], np.asarray(command).copy()
+
+        high_pose = I.copy()
+        high_pose[0, 3] = 0.20
+        low_pose = I.copy()
+        low_pose[0, 3] = 0.40
+        candidates = [
+            GraspCandidate(high_pose, 0.90, "target"),
+            GraspCandidate(low_pose, 0.40, "target"),
+        ]
+        grasps = FakeGrasps(candidates)
+        grasps.backend = SimpleNamespace(last_trace={})
+        actor = Actor()
+        env = SimpleNamespace(
+            robot=SimpleNamespace(
+                get_right_ee_pose=lambda: np.array(
+                    [0.5, -0.4, 0.9, 1.0, 0.0, 0.0, 0.0]
+                )
+            ),
+            get_tracked_objects=lambda: {"target": actor},
+        )
+        target = ObjectState("target", I.copy(), 7)
+        y = np.linspace(-0.04, 0.04, 9)
+        points = np.column_stack((
+            0.002 * np.sin(np.arange(len(y))),
+            y,
+            0.08 + 0.001 * np.cos(np.arange(len(y))),
+        ))
+        scene = SceneObservation(
+            xyz=points,
+            rgb=np.zeros((len(points), 3)),
+            instance_labels=np.full(len(points), 7),
+            camera_pose=I.copy(),
+            objects={"target": target},
+        )
+        runtime = RoboTwinHeuristicRuntime.__new__(
+            RoboTwinHeuristicRuntime
+        )
+        runtime.task_env = env
+        runtime.grasps = grasps
+        runtime.backend = grasps.backend
+        runtime.config = SimpleNamespace(
+            min_confidence=0.0,
+            max_candidates=8,
+            pregrasp_offset_m=0.07,
+            retreat_offset_m=0.10,
+        )
+        runtime.ik = TierIK()
+        runtime.bimanual_max_target_width_m = 0.10
+        pose_tuple = tuple(
+            tuple(float(value) for value in row) for row in I
+        )
+        pick = Pick("target", "right", pregrasp_offset_m=0.07)
+        place = Place(
+            "target",
+            None,
+            "right",
+            target_pose=pose_tuple,
+            preplace_offset_m=0.05,
+            place_offset_m=0.0,
+            constrain="free",
+            preplace_axis=(0.0, 0.0, 1.0),
+        )
+
+        def robot_facing(pose, *_args):
+            adjusted = np.asarray(pose).copy()
+            adjusted[0, 3] += 1.0
+            return adjusted
+
+        def aligned(_source, destination, _grasp, **_kwargs):
+            return np.asarray(destination).copy()
+
+        with patch(
+            "policy.heuristic_baseline.runtime._target_m2t2_palm_depth",
+            return_value=0.08,
+        ), patch(
+            "policy.heuristic_baseline.runtime._robot_facing_grasp_pose",
+            side_effect=robot_facing,
+        ), patch(
+            "policy.heuristic_baseline.runtime._place_facing_grasp_pose",
+            side_effect=ValueError("disabled in tier-order fixture"),
+        ), patch(
+            "policy.heuristic_baseline.runtime._aligned_place_reference_pose",
+            side_effect=aligned,
+        ):
+            plans, _, _, failures = runtime._plan_single_arm_place(
+                scene,
+                target,
+                pick=pick,
+                place=place,
+                arm="right",
+                arm_source="robotwin_ground_truth",
+                plan_limit=2,
+            )
+
+        self.assertEqual(
+            [plan.orientation_source for plan in plans],
+            ["m2t2", "approach_roll"],
+        )
+        self.assertEqual(
+            [plan.candidate.confidence for plan in plans], [0.40, 0.40]
+        )
+        np.testing.assert_allclose(
+            plans[0].candidate.world_grasp_pose, low_pose
+        )
+        elongated = _elongated_object_axis(scene, target)
+        self.assertIsNotNone(elongated)
+        self.assertGreater(abs(float(np.dot(elongated, [0.0, 1.0, 0.0]))), 0.99)
+        self.assertLessEqual(
+            _target_width_along_axis(scene, target, [0.0, 1.0, 0.0]),
+            runtime.bimanual_max_target_width_m,
+        )
+        self.assertEqual(failures["jaw_width"], 0)
+        self.assertNotIn("jaw_axis", failures)
+
+    def test_target_palm_depth_rejects_intruding_rotated_fallback(self):
+        contact = np.zeros(3)
+        raw = I.copy()
+        raw[:3, 3] = contact - 0.1034 * raw[:3, 2]
+        fallback = I.copy()
+        fallback[:3, :3] = t3d.axangles.axangle2mat(
+            [0.0, 1.0, 0.0], np.pi / 2.0
+        )
+        fallback[:3, 3] = contact - 0.1034 * fallback[:3, 2]
+        target_points = np.array([
+            [x, y, z]
+            for x in np.linspace(-0.0806, -0.0600, 8)
+            for y in (-0.003, 0.003)
+            for z in np.linspace(-0.0439, -0.0350, 6)
+        ])
+        distractors = np.array([
+            [-10.0, 0.0, -10.0], [10.0, 0.0, 10.0]
+        ])
+        points = np.vstack((target_points, distractors))
+        target = ObjectState("target", I.copy(), 7)
+        scene = SceneObservation(
+            xyz=points,
+            rgb=np.zeros((len(points), 3)),
+            instance_labels=np.r_[
+                np.full(len(target_points), 7), [99, 99]
+            ],
+            camera_pose=I.copy(),
+            objects={"target": target},
+        )
+
+        raw_depth = _target_m2t2_palm_depth(
+            scene, target, raw, M2T2_TO_ROBOTWIN
+        )
+        fallback_depth = _target_m2t2_palm_depth(
+            scene, target, fallback, M2T2_TO_ROBOTWIN
+        )
+
+        np.testing.assert_allclose(
+            _grasp_command_tcp(raw, M2T2_TO_ROBOTWIN), contact,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            _grasp_command_tcp(fallback, M2T2_TO_ROBOTWIN), contact,
+            atol=1e-12,
+        )
+        self.assertGreaterEqual(
+            raw_depth, M2T2_MIN_TARGET_PALM_DEPTH_M
+        )
+        self.assertLess(
+            fallback_depth, M2T2_MIN_TARGET_PALM_DEPTH_M
+        )
+
+    def test_handoff_raw_pair_preempts_higher_confidence_fallbacks(self):
+        def make_plan(arm, role, confidence, source, contact):
+            count = 5 if role == "giver" else 4
+            return _HandoffArmPlan(
+                arm=arm,
+                role=role,
+                target_name="target",
+                arm_source="robotwin_ground_truth",
+                candidate=GraspCandidate(I.copy(), confidence, "target"),
+                paths=tuple(np.zeros((1, 6)) for _ in range(count)),
+                command_targets=tuple(I.copy() for _ in range(count)),
+                contact_local_point=contact,
+                orientation_source=source,
+            )
+
+        giver_fallback = make_plan(
+            "left", "giver", 0.99, "robot_facing_fallback",
+            (-0.10, 0.0, 0.0),
+        )
+        giver_raw = make_plan(
+            "left", "giver", 0.35, "m2t2", (-0.10, 0.0, 0.0)
+        )
+        receiver_fallback = make_plan(
+            "right", "receiver", 0.98, "robot_facing_fallback",
+            (0.10, 0.0, 0.0),
+        )
+        receiver_raw = make_plan(
+            "right", "receiver", 0.30, "m2t2", (0.10, 0.0, 0.0)
+        )
+        runtime = RoboTwinHeuristicRuntime.__new__(
+            RoboTwinHeuristicRuntime
+        )
+        runtime.ik = SimpleNamespace(
+            failures={},
+            full_robot_path_has_self_collision=(
+                lambda _actions, *, max_joint_step_rad: False
+            ),
+        )
+        runtime.bimanual_collision_step_rad = 0.025
+        runtime.staged_controller = SimpleNamespace(metadata=[])
+        runtime._action_metadata_override = None
+        planned = (
+            [giver_fallback, giver_raw],
+            [receiver_fallback, receiver_raw],
+            [],
+            {},
+            {"pair_separation": 0},
+            0.05,
+        )
+        target = ObjectState("target", I.copy(), 7)
+        handoff = Handoff(
+            "target", "left", "right",
+            rendezvous_pose=tuple(
+                tuple(float(value) for value in row) for row in I
+            ),
+        )
+        place = Place("target", None, "right", release=True)
+
+        with patch.object(
+            runtime, "_plan_handoff_sides", return_value=planned
+        ), patch.object(
+            runtime, "_build_handoff_action_pair",
+            return_value=[np.zeros(14)],
+        ) as builder, patch.object(
+            runtime, "_save_grasp_visualization"
+        ):
+            actions = runtime._get_handoff_action(
+                object(),
+                target,
+                pick=Pick("target", "left"),
+                handoff=handoff,
+                place=place,
+            )
+
+        self.assertTrue(actions)
+        selected_giver, selected_receiver = builder.call_args.args[:2]
+        self.assertEqual(selected_giver.orientation_source, "m2t2")
+        self.assertEqual(selected_receiver.orientation_source, "m2t2")
+        self.assertLess(
+            selected_giver.candidate.confidence
+            + selected_receiver.candidate.confidence,
+            giver_fallback.candidate.confidence
+            + receiver_fallback.candidate.confidence,
+        )
+
 
     def test_runtime_reset_reenables_one_attempt(self):
         class ResetSpy:
@@ -2220,6 +2571,345 @@ class MinkRuntimeTest(unittest.TestCase):
         self.assertEqual(runtime.ik.calls, 1)
         self.assertEqual(runtime.backend.seeds, [23])
         self.assertEqual(runtime._visualization_index, 0)
+
+
+    def test_approach_roll_preserves_command_and_source_geometry(self):
+        grasp = I.copy()
+        grasp[:3, :3] = t3d.euler.euler2mat(0.31, -0.42, 0.57)
+        grasp[:3, 3] = [0.13, -0.19, 0.84]
+        command = grasp @ M2T2_TO_ROBOTWIN
+        tcp = command[:3, 3] + 0.12 * command[:3, 0]
+
+        rolled = _approach_roll_grasp_pose(
+            grasp, M2T2_TO_ROBOTWIN, np.pi / 4.0
+        )
+        rolled_command = rolled @ M2T2_TO_ROBOTWIN
+        rolled_tcp = (
+            rolled_command[:3, 3]
+            + 0.12 * rolled_command[:3, 0]
+        )
+
+        np.testing.assert_allclose(rolled[:3, 3], grasp[:3, 3], atol=1e-12)
+        np.testing.assert_allclose(rolled[:3, 2], grasp[:3, 2], atol=1e-12)
+        np.testing.assert_allclose(
+            rolled_command[:3, 3], command[:3, 3], atol=1e-12
+        )
+        np.testing.assert_allclose(
+            rolled_command[:3, 0], command[:3, 0], atol=1e-12
+        )
+        np.testing.assert_allclose(rolled_tcp, tcp, atol=1e-12)
+        np.testing.assert_allclose(
+            rolled[:3, :3].T @ rolled[:3, :3], np.eye(3), atol=1e-12
+        )
+        self.assertAlmostEqual(
+            float(np.linalg.det(rolled[:3, :3])), 1.0, places=12
+        )
+
+
+    def test_support_plane_estimator_excludes_target_bottom_points(self):
+        target_pose = I.copy()
+        target_pose[:3, 3] = [0.02, -0.03, 0.79]
+        target = ObjectState("target", target_pose, 7)
+        target_points = np.array([
+            [0.02 + x, -0.03 + y, z]
+            for x in np.linspace(-0.02, 0.02, 5)
+            for y in np.linspace(-0.015, 0.015, 5)
+            for z in (0.755, 0.785, 0.820)
+        ])
+        plane_points = np.array([
+            [0.02 + x, -0.03 + y, 0.740 + 0.0001 * ((i + j) % 3)]
+            for i, x in enumerate(np.linspace(-0.04, 0.04, 7))
+            for j, y in enumerate(np.linspace(-0.04, 0.04, 7))
+        ])
+
+        def make_scene(points, labels):
+            return SceneObservation(
+                xyz=np.asarray(points, dtype=np.float64),
+                rgb=np.zeros((len(points), 3), dtype=np.float64),
+                instance_labels=np.asarray(labels, dtype=np.int64),
+                camera_pose=I.copy(),
+                objects={"target": target},
+            )
+
+        mixed = make_scene(
+            np.vstack((target_points, plane_points)),
+            np.r_[
+                np.full(len(target_points), 7),
+                np.full(len(plane_points), 99),
+            ],
+        )
+        target_only = make_scene(
+            target_points, np.full(len(target_points), 7)
+        )
+
+        self.assertAlmostEqual(
+            _estimate_target_support_plane_z(mixed, target),
+            float(np.median(plane_points[:, 2])),
+            places=6,
+        )
+        self.assertIsNone(
+            _estimate_target_support_plane_z(target_only, target)
+        )
+
+    def test_support_collision_includes_fixed_descendant_and_dense_midpoint(self):
+        model = mujoco.MjModel.from_xml_string(
+            """
+            <mujoco>
+              <worldbody>
+                <body name="controlled_root" pos="0 0 1">
+                  <joint name="right_joint" type="hinge" axis="0 1 0"/>
+                  <geom name="root_collision" type="sphere" size="0.02"/>
+                  <body name="fixed_wrist_sensor" pos="0.4 0 0">
+                    <geom name="sensor_collision" type="box"
+                          size="0.04 0.03 0.02"/>
+                  </body>
+                </body>
+              </worldbody>
+            </mujoco>
+            """
+        )
+
+        class OneJointRobot:
+            right_arm_joints_name = ("right_joint",)
+            right_entity_origion_pose = Pose()
+
+            def get_right_arm_jointState(self):
+                return np.array([0.0, 1.0])
+
+        ik = RoboTwinMinkIK.__new__(RoboTwinMinkIK)
+        ik.solver = SimpleNamespace(model=model)
+        ik.task_env = SimpleNamespace(robot=OneJointRobot())
+        ik.support_collision_checks = 0
+        body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, "fixed_wrist_sensor"
+        )
+        geom_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "sensor_collision"
+        )
+
+        self.assertIn(body_id, ik.active_arm_body_ids("right"))
+        self.assertIn(geom_id, ik.active_arm_geom_ids("right"))
+
+        def minimum_z(joint):
+            data = mujoco.MjData(model)
+            data.qpos[0] = joint
+            mujoco.mj_forward(model, data)
+            return min(
+                ik._geom_minimum_world_z(model, data, item, I)
+                for item in ik.active_arm_geom_ids("right")
+            )
+
+        # Both endpoints clear the support. The welded sensor box dips below
+        # it near pi/2, so only dense path validation catches this motion.
+        self.assertGreater(minimum_z(0.0), 0.753)
+        self.assertGreater(minimum_z(np.pi), 0.753)
+        self.assertTrue(
+            ik.path_has_support_collision(
+                "right",
+                np.array([[np.pi]]),
+                0.750,
+                start=np.array([0.0]),
+            )
+        )
+        self.assertFalse(
+            ik.path_has_support_collision(
+                "right",
+                np.array([[-np.pi / 2.0]]),
+                0.750,
+                start=np.array([0.0]),
+            )
+        )
+
+
+    def test_saved_style_support_collision_rejects_bad_and_allows_safe_pose(self):
+        class WorldPose:
+            def to_transformation_matrix(self):
+                pose = I.copy()
+                pose[:3, :3] = t3d.quaternions.quat2mat(
+                    [0.707, 0.0, 0.0, 0.707]
+                )
+                pose[:3, 3] = [0.0, -0.65, 0.0]
+                return pose
+
+        class WorldRobot(Robot):
+            left_entity_origion_pose = WorldPose()
+            right_entity_origion_pose = WorldPose()
+
+        model_path = (
+            Path(__file__).resolve().parents[3]
+            / "assets"
+            / "embodiments"
+            / "aloha-agilex"
+            / "urdf"
+            / "arx5_description_isaac.urdf"
+        )
+        ik = RoboTwinMinkIK(
+            SimpleNamespace(robot=WorldRobot()), I, model_path=model_path
+        )
+        bad = np.array([
+            0.3155142192501402,
+            2.430038960022039,
+            1.2861609031780952,
+            0.14376985254571506,
+            1.3626009970739368,
+            -2.233478929904455,
+        ])
+        safe = np.array([
+            -0.027226163863374175,
+            2.1285174328107104,
+            0.9029227655007368,
+            0.9928067097744266,
+            0.018112636133269078,
+            0.29531992859857503,
+        ])
+
+        self.assertTrue(
+            ik.path_has_support_collision("left", bad[None], 0.740)
+        )
+        self.assertFalse(
+            ik.path_has_support_collision("left", safe[None], 0.740)
+        )
+
+
+    def test_narrow_fallback_considers_candidates_beyond_rank_sixteen(self):
+        class Actor:
+            def get_pose(self):
+                return I.copy()
+
+        marker_x = 0.116
+
+        class NarrowOnlyIK:
+            grasp_to_robotwin = I.copy()
+
+            def __init__(self):
+                self.failures = {}
+                self.solve_count = 0
+                self.completed_paths = ()
+                self.completed_command_targets = ()
+
+            def solve(self, arm, pose):
+                del arm
+                stage = self.solve_count % 3
+                if stage == 0:
+                    self.completed_paths = ()
+                    self.completed_command_targets = ()
+                self.solve_count += 1
+                pose = np.asarray(pose, dtype=np.float64)
+                if not (
+                    np.isclose(pose[0, 3], marker_x)
+                    and np.isclose(pose[1, 3], 0.50)
+                ):
+                    return None
+                goal = np.full(6, 0.01 * (stage + 1))
+                self.completed_paths += (goal[None, :],)
+                self.completed_command_targets += (pose.copy(),)
+                return goal
+
+            def solve_command_target(self, arm, command, start):
+                del arm
+                goal = np.asarray(start, dtype=np.float64) + 0.01
+                return goal, goal[None, :], np.asarray(command).copy()
+
+        candidates = []
+        for index in range(17):
+            pose = I.copy()
+            pose[0, 3] = 0.100 + 0.001 * index
+            candidates.append(
+                GraspCandidate(
+                    pose, 1.0 - 0.01 * index, "target"
+                )
+            )
+        grasps = FakeGrasps(candidates)
+        grasps.backend = SimpleNamespace(last_trace={})
+        env = SimpleNamespace(
+            robot=SimpleNamespace(
+                get_right_ee_pose=lambda: np.array(
+                    [0.5, -0.4, 0.9, 1.0, 0.0, 0.0, 0.0]
+                )
+            ),
+            get_tracked_objects=lambda: {"target": Actor()},
+        )
+        target = ObjectState("target", I.copy(), 7)
+        scene = SceneObservation(
+            xyz=np.array([
+                [-0.02, -0.01, 0.75], [0.02, -0.01, 0.75],
+                [-0.02, 0.01, 0.80], [0.02, 0.01, 0.80],
+            ]),
+            rgb=np.zeros((4, 3)),
+            instance_labels=np.full(4, 7),
+            camera_pose=I.copy(),
+            objects={"target": target},
+        )
+        runtime = RoboTwinHeuristicRuntime.__new__(
+            RoboTwinHeuristicRuntime
+        )
+        runtime.task_env = env
+        runtime.grasps = grasps
+        runtime.backend = grasps.backend
+        runtime.config = SimpleNamespace(
+            min_confidence=0.0,
+            max_candidates=32,
+            pregrasp_offset_m=0.07,
+            retreat_offset_m=0.10,
+        )
+        runtime.ik = NarrowOnlyIK()
+        runtime.bimanual_max_target_width_m = 0.10
+        pose_tuple = tuple(tuple(float(value) for value in row) for row in I)
+        narrow_calls = []
+
+        def narrow_pose(pose, *_args, **_kwargs):
+            narrow_calls.append(float(pose[0, 3]))
+            result = np.asarray(pose, dtype=np.float64).copy()
+            result[1, 3] = 0.50
+            return (result,)
+
+        with patch(
+            "policy.heuristic_baseline.runtime._target_m2t2_palm_depth",
+            return_value=0.08,
+        ), patch(
+            "policy.heuristic_baseline.runtime._target_width_along_axis",
+            return_value=0.05,
+        ), patch(
+            "policy.heuristic_baseline.runtime._robot_facing_grasp_pose",
+            side_effect=ValueError("disabled in narrow-tier fixture"),
+        ), patch(
+            "policy.heuristic_baseline.runtime._place_facing_grasp_pose",
+            side_effect=lambda pose, *_args: np.asarray(pose).copy(),
+        ), patch(
+            "policy.heuristic_baseline.runtime._target_narrow_axis",
+            return_value=np.array([0.0, 1.0, 0.0]),
+        ), patch(
+            "policy.heuristic_baseline.runtime._narrow_axis_grasp_poses",
+            side_effect=narrow_pose,
+        ), patch(
+            "policy.heuristic_baseline.runtime._aligned_place_reference_pose",
+            side_effect=lambda _source, destination, *_args, **_kwargs:
+            np.asarray(destination).copy(),
+        ):
+            plans, _, _, _ = runtime._plan_single_arm_place(
+                scene,
+                target,
+                pick=Pick("target", "right", pregrasp_offset_m=0.07),
+                place=Place(
+                    "target",
+                    None,
+                    "right",
+                    target_pose=pose_tuple,
+                    preplace_offset_m=0.05,
+                    place_offset_m=0.0,
+                    constrain="free",
+                    preplace_axis=(0.0, 0.0, 1.0),
+                ),
+                arm="right",
+                arm_source="robotwin_ground_truth",
+            )
+
+        self.assertEqual(len(narrow_calls), 17)
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].orientation_source, "narrow_facing")
+        self.assertAlmostEqual(
+            plans[0].candidate.confidence, candidates[16].confidence
+        )
 
 
 if __name__ == "__main__":

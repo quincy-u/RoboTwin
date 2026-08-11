@@ -442,6 +442,17 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             }
             for index in range(len(actions))
         ]
+    incomplete_required_release = any(
+        item.get("completion_level") == "grasp_lift"
+        and bool(item.get("required_release", False))
+        for item in metadata
+    )
+    if incomplete_required_release:
+        # A safe grasp/lift prefix is still useful as a physical attempt, but
+        # it has not completed the recorded placement contract. In particular,
+        # a position-only predicate must not turn a still-held object into a
+        # successful place.
+        task_env.eval_success = False
     batch_index = int(getattr(model, "execution_batch_index", 0))
     model.execution_batch_index = batch_index + 1
     trace_path = None
@@ -460,6 +471,8 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
     for action_index, (action, action_metadata) in enumerate(
         zip(actions, metadata)
     ):
+        if incomplete_required_release:
+            task_env.eval_success = False
         phase = action_metadata.get("phase", "action")
         endpoint = bool(action_metadata.get("endpoint", False))
         bimanual = action_metadata.get("arm") == "both"
@@ -520,12 +533,14 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             # RoboTwin exits take_action's interpolation loop as soon as
             # check_success() is true. During a release, several tasks report
             # success from the commanded-open cache before the physical
-            # aperture moves. Suppress that internal early exit, then run the
-            # real task check after the final release endpoint is validated.
+            # aperture moves. An incomplete release-required place must also
+            # finish each safe prefix waypoint instead of exiting early on a
+            # position-only predicate. Suppress those internal early exits;
+            # the real release check still runs after its validated endpoint.
             suppress_release_success = (
                 phase == "open" and bool(guarded_gripper_arms)
             )
-            if suppress_release_success:
+            if suppress_release_success or incomplete_required_release:
                 candidate = getattr(task_env, "check_success", None)
                 if callable(candidate):
                     real_check_success = candidate
@@ -556,7 +571,15 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
                             pass
             status = "executed"
 
-        eval_success_reported = bool(getattr(task_env, "eval_success", False))
+        raw_eval_success_reported = bool(
+            getattr(task_env, "eval_success", False)
+        )
+        eval_success_reported = raw_eval_success_reported
+        if incomplete_required_release:
+            # Keep endpoint/gripper guards active, but never promote this
+            # deliberately incomplete prefix to task success.
+            task_env.eval_success = False
+            eval_success_reported = False
         terminal_post_close_success = (
             eval_success_reported
             and close_completed
@@ -709,7 +732,11 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             and real_check_success is not None
         ):
             task_env.eval_success = bool(real_check_success())
-            eval_success_reported = bool(task_env.eval_success)
+            raw_eval_success_reported = bool(task_env.eval_success)
+            eval_success_reported = raw_eval_success_reported
+            if incomplete_required_release:
+                task_env.eval_success = False
+                eval_success_reported = False
 
         # A close-triggered success is terminal only for pick plans. Place
         # and handoff plans must continue through their later release.
@@ -753,7 +780,9 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             "status": status,
             "sim_step": int(getattr(task_env, "take_action_cnt", 0)),
             "eval_success": bool(getattr(task_env, "eval_success", False)),
-            "eval_success_reported": eval_success_reported,
+            "eval_success_reported": raw_eval_success_reported,
+            "completion_level": action_metadata.get("completion_level"),
+            "required_release": action_metadata.get("required_release"),
             "target_qpos": (
                 None
                 if target_qpos is None
@@ -777,6 +806,8 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
         if guard_failures:
             break
 
+    if incomplete_required_release:
+        task_env.eval_success = False
     if (
         not bool(getattr(task_env, "eval_success", False))
         and task_env.take_action_cnt < task_env.step_lim
