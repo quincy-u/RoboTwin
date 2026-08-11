@@ -35,6 +35,7 @@ from policy.heuristic_baseline.runtime import (
     _aloha_self_collision_config,
     _elongated_object_axis,
     _narrow_axis_grasp_poses,
+    _pose_matrix,
     _place_facing_grasp_pose,
     _grasp_wireframes,
     _project_world_points_cv,
@@ -80,6 +81,49 @@ class Robot:
 
 class Env:
     robot = Robot()
+
+
+class PoseMatrixTests(unittest.TestCase):
+    def test_repairs_rounded_scanner_functional_rotation(self):
+        pose = I.copy()
+        pose[:3, :3] = np.array([
+            [0.0, 1.0, 0.0],
+            [-0.2741599977016449, 0.0, -0.961679995059967],
+            [-0.961679995059967, 0.0, 0.2741599977016449],
+        ])
+
+        repaired = _pose_matrix(pose, name="scanner_functional_point")
+
+        np.testing.assert_allclose(
+            repaired[:3, :3].T @ repaired[:3, :3], np.eye(3), atol=1e-12
+        )
+        self.assertAlmostEqual(np.linalg.det(repaired[:3, :3]), 1.0)
+
+    def test_preserves_valid_rotation(self):
+        pose = I.copy()
+        pose[:3, :3] = t3d.euler.euler2mat(0.2, -0.3, 0.4)
+
+        repaired = _pose_matrix(pose, name="valid_pose")
+
+        np.testing.assert_array_equal(repaired, pose)
+
+    def test_repairs_nearby_reflection_to_proper_rotation(self):
+        pose = I.copy()
+        pose[:3, :3] = np.diag([1.0, 1.0, -1.0])
+
+        repaired = _pose_matrix(pose, name="reflected_pose")
+
+        np.testing.assert_allclose(
+            repaired[:3, :3].T @ repaired[:3, :3], np.eye(3), atol=1e-12
+        )
+        self.assertAlmostEqual(np.linalg.det(repaired[:3, :3]), 1.0)
+
+    def test_rejects_severely_malformed_rotation(self):
+        pose = I.copy()
+        pose[0, 0] = 0.5
+
+        with self.assertRaisesRegex(ValueError, "too malformed to repair"):
+            _pose_matrix(pose, name="scaled_pose")
 
 
 class FakeSolver:

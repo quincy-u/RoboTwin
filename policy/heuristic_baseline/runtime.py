@@ -1777,9 +1777,37 @@ class _BimanualArmPlan:
     orientation_source: str = "m2t2"
 
 
+def _repair_pose_rotation(rotation: np.ndarray, *, name: str) -> np.ndarray:
+    """Return a nearby proper rotation, repairing small metadata drift."""
+    value = np.asarray(rotation, dtype=np.float64)
+    if value.shape != (3, 3) or not np.all(np.isfinite(value)):
+        raise ValueError(f"{name} rotation must be a finite 3x3 matrix")
+    gram = value.T @ value
+    determinant = float(np.linalg.det(value))
+    if (
+        np.allclose(gram, np.eye(3), atol=1e-6, rtol=0.0)
+        and np.isclose(determinant, 1.0, atol=1e-6, rtol=0.0)
+    ):
+        return value.copy()
+
+    left, singular_values, right_transpose = np.linalg.svd(value)
+    if (
+        singular_values[-1] <= 1e-8
+        or np.max(np.abs(singular_values - 1.0)) > 0.05
+    ):
+        raise ValueError(f"{name} rotation is too malformed to repair")
+    repaired = left @ right_transpose
+    if np.linalg.det(repaired) < 0.0:
+        left[:, -1] *= -1.0
+        repaired = left @ right_transpose
+    return repaired
+
+
 def _pose_matrix(pose: Any, *, name: str) -> np.ndarray:
     if hasattr(pose, "to_transformation_matrix"):
-        matrix = np.asarray(pose.to_transformation_matrix(), dtype=np.float64)
+        matrix = np.array(
+            pose.to_transformation_matrix(), dtype=np.float64, copy=True
+        )
     else:
         values = np.asarray(pose, dtype=np.float64)
         if values.shape == (4, 4):
@@ -1792,6 +1820,7 @@ def _pose_matrix(pose: Any, *, name: str) -> np.ndarray:
             raise ValueError(f"{name} must be a pose7 or a 4x4 matrix")
     if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
         raise ValueError(f"{name} must be a finite 4x4 rigid transform")
+    matrix[:3, :3] = _repair_pose_rotation(matrix[:3, :3], name=name)
     return matrix
 
 
@@ -3356,6 +3385,59 @@ class RoboTwinHeuristicRuntime:
             )
         )
 
+    @staticmethod
+    def _auxiliary_pick_place_stages(
+        task_env: Any,
+    ) -> tuple[Pick, Pick, Place] | None:
+        """Return an auxiliary displaced Pick and one primary Pick/Place chain."""
+        task_plan = getattr(task_env, "heuristic_task_plan", None)
+        stages = tuple(getattr(task_plan, "stages", ()))
+        picks = [
+            stage for stage in stages
+            if getattr(stage, "target", None) is not None
+        ]
+        places = [
+            stage for stage in stages
+            if getattr(stage, "object", None) is not None
+            and hasattr(stage, "preplace_offset_m")
+            and hasattr(stage, "place_offset_m")
+        ]
+        if len(picks) != 2 or len(places) != 1 or len(stages) != 3:
+            return None
+        place = places[0]
+        primary = next(
+            (pick for pick in picks if pick.target == place.object),
+            None,
+        )
+        if primary is None:
+            return None
+        auxiliary = next(
+            (pick for pick in picks if pick.target != place.object),
+            None,
+        )
+        displacement = getattr(
+            auxiliary, "postgrasp_displacement", None
+        ) if auxiliary is not None else None
+        if (
+            auxiliary is None
+            or displacement is None
+            or np.linalg.norm(np.asarray(displacement, dtype=np.float64))
+            < 1e-8
+        ):
+            return None
+        auxiliary_arm = str(
+            getattr(auxiliary, "arm", "")
+        ).strip().lower()
+        primary_arm = str(getattr(primary, "arm", "")).strip().lower()
+        if (
+            auxiliary_arm not in {"left", "right"}
+            or primary_arm not in {"left", "right"}
+            or auxiliary_arm == primary_arm
+        ):
+            return None
+        return auxiliary, primary, place
+
+
 
     @staticmethod
     def _grouped_bimanual_place_stages(
@@ -3516,6 +3598,7 @@ class RoboTwinHeuristicRuntime:
         arm: str,
         arm_source: str,
         plan_limit: int = 1,
+        stop_after_grasp_lift: bool = False,
     ) -> tuple[
         list[_SingleArmPlacePlan],
         list[GraspCandidate],
@@ -3857,6 +3940,11 @@ class RoboTwinHeuristicRuntime:
                         completion_level="grasp_lift",
                     )
                 )
+            if (
+                stop_after_grasp_lift
+                and len(grasp_lift_plans) >= plan_limit
+            ):
+                break
             goal_variants = [
                 (desired_object, desired_gripper, variant_source)
             ]
@@ -5547,6 +5635,201 @@ class RoboTwinHeuristicRuntime:
         )
         return actions
 
+    def _get_auxiliary_pick_place_action(
+        self,
+        scene: SceneObservation,
+        target_names: tuple[str, ...],
+        stages: tuple[Pick, Pick, Place],
+    ) -> list[np.ndarray]:
+        """Execute a displaced auxiliary Pick before a primary placement."""
+        auxiliary_pick, primary_pick, primary_place = stages
+        if {
+            auxiliary_pick.target, primary_pick.target
+        } != set(target_names):
+            raise TargetSelectionFailure(
+                "auxiliary/primary Pick targets differ from segmented targets"
+            )
+        auxiliary_arm = str(auxiliary_pick.arm).strip().lower()
+        primary_arm = str(primary_pick.arm).strip().lower()
+        auxiliary_target = self.simulator.object_state(
+            auxiliary_pick.target
+        )
+        primary_target = self.simulator.object_state(primary_pick.target)
+        auxiliary_place = Place(
+            object=auxiliary_pick.target,
+            destination=None,
+            arm=auxiliary_arm,
+            target_pose=auxiliary_target.world_pose.copy(),
+            preplace_offset_m=0.0,
+            place_offset_m=0.0,
+            constrain="free",
+            release=False,
+        )
+
+        self._configure_support_plane(
+            scene, auxiliary_target, (auxiliary_arm,)
+        )
+        auxiliary_plans, auxiliary_ranked, auxiliary_trace, auxiliary_failures = (
+            self._plan_single_arm_place(
+                scene,
+                auxiliary_target,
+                pick=auxiliary_pick,
+                stop_after_grasp_lift=True,
+                place=auxiliary_place,
+                arm=auxiliary_arm,
+                arm_source="recorded_auxiliary",
+                plan_limit=1,
+            )
+        )
+        auxiliary_plan = next(
+            (plan for plan in auxiliary_plans if len(plan.paths) >= 3),
+            None,
+        )
+        if auxiliary_plan is None:
+            raise NoFeasiblePlanFailure(
+                "M2T2/Mink produced no auxiliary grasp/displacement prefix; "
+                f"failures={auxiliary_failures}; "
+                f"ik_failures={self.ik.failures}"
+            )
+
+        starts = {
+            arm: _arm_joint_state(self.task_env, arm)[:-1].copy()
+            for arm in ("left", "right")
+        }
+        starts[auxiliary_arm] = auxiliary_plan.paths[2][-1].copy()
+        for arm, joints in starts.items():
+            self.ik.set_joint_start_override(arm, joints)
+        self._configure_support_plane(scene, primary_target, (primary_arm,))
+        try:
+            primary_plans, primary_ranked, primary_trace, primary_failures = (
+                self._plan_single_arm_place(
+                    scene,
+                    primary_target,
+                    pick=primary_pick,
+                    place=primary_place,
+                    arm=primary_arm,
+                    arm_source="recorded_primary",
+                    plan_limit=self.bimanual_max_plans_per_arm,
+                )
+            )
+        finally:
+            for arm in ("left", "right"):
+                self.ik.set_joint_start_override(arm, None)
+        primary_plan = next(
+            (
+                plan for plan in primary_plans
+                if plan.completion_level == "place"
+                and len(plan.paths) >= (
+                    6 if primary_place.release else 5
+                )
+            ),
+            None,
+        )
+        if primary_plan is None:
+            raise NoFeasiblePlanFailure(
+                "M2T2/Mink produced no primary placement after auxiliary "
+                f"interaction; failures={primary_failures}; "
+                f"ik_failures={self.ik.failures}"
+            )
+
+        controller = self.staged_controller
+        controller.reset()
+        for target, pick, plan, arm in (
+            (
+                auxiliary_target,
+                auxiliary_pick,
+                auxiliary_plan,
+                auxiliary_arm,
+            ),
+            (primary_target, primary_pick, primary_plan, primary_arm),
+        ):
+            names = {arm: target.name}
+            sources = {arm: plan.arm_source}
+            controller.gripper_phase(
+                "open", {arm: 1.0}, 1, names, sources
+            )
+            for phase, index in (("pregrasp", 0), ("grasp", 1)):
+                controller.move_phase(
+                    phase,
+                    {arm: plan.paths[index]},
+                    {arm: plan.command_targets[index]},
+                    names,
+                    sources,
+                )
+            controller.gripper_phase(
+                "close",
+                {arm: float(getattr(pick, "gripper_target", 0.0))},
+                self.gripper_settle_actions,
+                names,
+                sources,
+            )
+            controller.move_phase(
+                "lift" if target is primary_target else "displace",
+                {arm: plan.paths[2]},
+                {arm: plan.command_targets[2]},
+                names,
+                sources,
+            )
+            if target is auxiliary_target:
+                continue
+            for phase, index in (("preplace", 3), ("place", 4)):
+                controller.move_phase(
+                    phase,
+                    {arm: plan.paths[index]},
+                    {arm: plan.command_targets[index]},
+                    names,
+                    sources,
+                )
+            if primary_place.release:
+                controller.gripper_phase(
+                    "open",
+                    {arm: 1.0},
+                    self.gripper_settle_actions,
+                    names,
+                    sources,
+                )
+                controller.move_phase(
+                    "retreat",
+                    {arm: plan.paths[5]},
+                    {arm: plan.command_targets[5]},
+                    names,
+                    sources,
+                )
+
+        actions = [action.copy() for action in controller.actions]
+        if self.ik.full_robot_path_has_self_collision(
+            actions, max_joint_step_rad=self.bimanual_collision_step_rad
+        ):
+            raise NoFeasiblePlanFailure(
+                "composed auxiliary interaction/primary placement path "
+                "has a robot collision"
+            )
+        self._action_metadata_override = list(controller.metadata)
+        for target, plan, ranked, trace in (
+            (
+                auxiliary_target, auxiliary_plan,
+                auxiliary_ranked, auxiliary_trace,
+            ),
+            (primary_target, primary_plan, primary_ranked, primary_trace),
+        ):
+            self._save_grasp_visualization(
+                scene,
+                target,
+                ranked,
+                plan.candidate,
+                plan.arm,
+                raw_trace_override=trace,
+                executed_command_pose_override=plan.command_targets[1],
+                use_default_executed_pose=False,
+            )
+        print(
+            "[heuristic] auxiliary interaction then placement selected "
+            f"auxiliary={auxiliary_target.name}:{auxiliary_arm} "
+            f"primary={primary_target.name}:{primary_arm}"
+        )
+        return actions
+
+
     def _get_grouped_bimanual_place_action(
         self,
         scene: SceneObservation,
@@ -6141,6 +6424,13 @@ class RoboTwinHeuristicRuntime:
             )
         if len(target_names) == 2:
             self.ik.reset_stats()
+            auxiliary_stages = self._auxiliary_pick_place_stages(
+                self.task_env
+            )
+            if auxiliary_stages is not None:
+                return self._get_auxiliary_pick_place_action(
+                    scene, target_names, auxiliary_stages
+                )
             grouped_stages = self._grouped_bimanual_place_stages(
                 self.task_env
             )
