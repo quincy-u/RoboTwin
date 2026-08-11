@@ -5739,6 +5739,91 @@ class RoboTwinHeuristicRuntime:
             actions = candidate_actions
             break
         if selected_pair is None:
+            def with_preplace_clearance(
+                plan: _SingleArmPlacePlan,
+                arm: str,
+                clearance_m: float,
+            ) -> _SingleArmPlacePlan | None:
+                paths = list(plan.paths)
+                commands = [
+                    np.asarray(command, dtype=np.float64).copy()
+                    for command in plan.command_targets
+                ]
+                raised = commands[3].copy()
+                raised[2, 3] += float(clearance_m)
+                start = np.asarray(paths[2][-1], dtype=np.float64)
+                raised_result = self.ik.solve_command_target(
+                    arm, raised, start
+                )
+                if raised_result is None:
+                    return None
+                place_result = self.ik.solve_command_target(
+                    arm, commands[4], raised_result[0]
+                )
+                if place_result is None:
+                    return None
+                paths[3] = raised_result[1]
+                commands[3] = raised_result[2]
+                paths[4] = place_result[1]
+                commands[4] = place_result[2]
+                if records[arm][2].release:
+                    retreat_result = self.ik.solve_command_target(
+                        arm, commands[5], place_result[0]
+                    )
+                    if retreat_result is None:
+                        return None
+                    paths[5] = retreat_result[1]
+                    commands[5] = retreat_result[2]
+                return replace(
+                    plan,
+                    paths=tuple(paths),
+                    command_targets=tuple(commands),
+                    orientation_source=(
+                        f"{plan.orientation_source}/staggered_z"
+                    ),
+                )
+
+            z_assignments = (
+                (0.12, 0.04),
+                (0.04, 0.12),
+                (0.10, 0.02),
+                (0.02, 0.10),
+            )
+            staggered_rejections = 0
+            for left_clearance, right_clearance in z_assignments:
+                for left, right in pairs:
+                    raised_left = with_preplace_clearance(
+                        left, "left", left_clearance
+                    )
+                    if raised_left is None:
+                        continue
+                    raised_right = with_preplace_clearance(
+                        right, "right", right_clearance
+                    )
+                    if raised_right is None:
+                        continue
+                    candidate_actions = compose({
+                        "left": raised_left,
+                        "right": raised_right,
+                    })
+                    if self.ik.full_robot_path_has_self_collision(
+                        candidate_actions,
+                        max_joint_step_rad=self.bimanual_collision_step_rad,
+                    ):
+                        staggered_rejections += 1
+                        continue
+                    selected_pair = raised_left, raised_right
+                    actions = candidate_actions
+                    print(
+                        "[heuristic] grouped placement using staggered "
+                        f"preplace_z left=+{left_clearance:.2f}m "
+                        f"right=+{right_clearance:.2f}m "
+                        f"collision_rejections={staggered_rejections}"
+                    )
+                    break
+                if selected_pair is not None:
+                    break
+        if selected_pair is None:
             raise NoFeasiblePlanFailure(
                 "all confidence-ranked grouped bimanual placement pairs "
                 f"collide; rejected_pairs={collision_rejections}"
