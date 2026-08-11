@@ -1766,7 +1766,7 @@ class MinkRuntimeTest(unittest.TestCase):
             retreat_offset_m=0.10,
         )
         runtime.ik = ExactIK()
-        runtime.bimanual_max_plans_per_arm = 2
+        runtime.bimanual_max_plans_per_arm = 4
         runtime.bimanual_collision_step_rad = 0.025
         runtime.bimanual_max_jaw_axis_alignment = 0.75
         runtime.bimanual_max_target_width_m = 0.10
@@ -1975,9 +1975,13 @@ class MinkRuntimeTest(unittest.TestCase):
                     place=place,
                 )
 
-        self.assertEqual(len(runtime.ik.checked), 1)
+        self.assertEqual(len(runtime.ik.checked), 2)
         checked_actions, step = runtime.ik.checked[0]
         self.assertEqual(step, 0.02)
+        self.assertTrue(
+            runtime.ik.checked[1][0]
+            and all(row.shape == (14,) for row in runtime.ik.checked[1][0])
+        )
         self.assertTrue(
             checked_actions and all(row.shape == (14,) for row in checked_actions)
         )
@@ -2094,6 +2098,32 @@ class MinkRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finite 6-vector"):
             ik.set_joint_start_override("left", np.zeros(5))
 
+    def test_mink_joint_transition_reaches_home_with_bounded_steps(self):
+        fake = FakeSolver([])
+        with patch(
+            "policy.heuristic_baseline.runtime.MinkIKSolver.from_xml_path",
+            return_value=fake,
+        ):
+            ik = RoboTwinMinkIK(
+                Env(),
+                I,
+                model_path="unused.urdf",
+                max_joint_step_rad=0.1,
+            )
+
+        path = ik.plan_joint_transition(
+            "left", np.full(6, 0.25), np.zeros(6)
+        )
+
+        self.assertIsNotNone(path)
+        np.testing.assert_allclose(path[-1], np.zeros(6))
+        self.assertLessEqual(
+            np.max(np.abs(np.diff(
+                np.vstack((np.full(6, 0.25), path)), axis=0
+            ))),
+            0.1,
+        )
+
     def test_place_dispatch_is_structural_across_module_namespaces(self):
         foreign_pick = SimpleNamespace(target="shoe", arm="right")
         foreign_place = SimpleNamespace(
@@ -2133,6 +2163,30 @@ class MinkRuntimeTest(unittest.TestCase):
         actual = RoboTwinHeuristicRuntime._sequential_place_stages(env)
 
         self.assertEqual(actual, pairs)
+
+    def test_two_separate_bimanual_places_are_sequential(self):
+        pairs = (
+            (
+                Pick("object_left", "left"),
+                Place("object_left", None, "left", target_pose=I),
+            ),
+            (
+                Pick("object_right", "right"),
+                Place("object_right", None, "right", target_pose=I),
+            ),
+        )
+        env = SimpleNamespace(
+            heuristic_task_plan=TaskPlan(
+                "separate_bimanual",
+                "pick_place",
+                tuple(stage for pair in pairs for stage in pair),
+            )
+        )
+
+        self.assertEqual(
+            RoboTwinHeuristicRuntime._sequential_place_stages(env),
+            pairs,
+        )
 
     def test_three_sequential_places_reject_mismatched_objects(self):
         stages = (
