@@ -3453,8 +3453,9 @@ class RoboTwinHeuristicRuntime:
             if getattr(stage, "object", None) is not None
             and hasattr(stage, "preplace_offset_m")
             and hasattr(stage, "place_offset_m")
+            and bool(getattr(stage, "release", False))
         ]
-        if len(picks) != 2 or len(places) != 1 or len(stages) != 3:
+        if len(picks) != 2 or len(places) != 1:
             return None
         place = places[0]
         primary = next(
