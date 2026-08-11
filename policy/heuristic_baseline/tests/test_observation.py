@@ -10,7 +10,7 @@ from policy.heuristic_baseline.observation import (
     _world_pointcloud,
     encode_obs,
 )
-from policy.heuristic_baseline.task_plan import Pick, TaskPlan
+from policy.heuristic_baseline.task_plan import Pick, Place, TaskPlan
 
 
 class _Pose:
@@ -127,6 +127,47 @@ class _DualTaskEnv:
         return self.actors
 
 
+class _PlaceCameras:
+    static_camera_name = ["head_camera"]
+    static_camera_list = [_DualCamera()]
+
+    def __init__(self) -> None:
+        self.mask_requests: list[set[str]] = []
+
+    def get_object_masks(self, tracked):
+        self.mask_requests.append(set(tracked))
+        if set(tracked) != {"shoe"}:
+            raise AssertionError(
+                f"destination must not be a mask target: {set(tracked)}"
+            )
+        return {
+            "head_camera": {
+                "shoe": np.array([[True, False, False]], dtype=bool),
+            }
+        }
+
+
+class _PlaceTaskEnv:
+    def __init__(self) -> None:
+        self.cameras = _PlaceCameras()
+        self.actors = {
+            "shoe": _DualActor(51, (-0.1, 0.1, 0.8)),
+            "target_block": _DualActor(52, (0.0, -0.08, 0.74)),
+            "distractor": _DualActor(53, (0.2, 0.0, 0.8)),
+        }
+        self.heuristic_task_plan = TaskPlan(
+            "place_shoe",
+            "pick_place",
+            (
+                Pick("shoe", "left"),
+                Place("shoe", "target_block", "left"),
+            ),
+        )
+
+    def get_tracked_objects(self):
+        return self.actors
+
+
 
 class ObservationTest(unittest.TestCase):
     def test_world_pointcloud_accepts_three_by_four_extrinsic(self) -> None:
@@ -197,6 +238,31 @@ class ObservationTest(unittest.TestCase):
         self.assertEqual(
             {state.instance_id for state in scene.objects.values()},
             {41, 42},
+        )
+
+    def test_place_plan_masks_only_source_and_includes_destination_pose(self):
+        observation = {
+            "observation": {
+                "head_camera": {
+                    "rgb": np.zeros((1, 3, 3), dtype=np.uint8),
+                    "depth": np.full((1, 3), 1000.0, dtype=np.float32),
+                    "cam2world_gl": np.eye(4),
+                }
+            }
+        }
+
+        task_env = _PlaceTaskEnv()
+        scene = encode_obs(task_env, observation)
+
+        self.assertEqual(task_env.cameras.mask_requests, [{"shoe"}])
+        self.assertEqual(set(scene.objects), {"shoe", "target_block"})
+        self.assertEqual(scene.instance_labels.tolist(), [51, -1, -1])
+        np.testing.assert_allclose(
+            scene.objects["shoe"].world_pose[:3, 3], [-0.1, 0.1, 0.8]
+        )
+        np.testing.assert_allclose(
+            scene.objects["target_block"].world_pose[:3, 3],
+            [0.0, -0.08, 0.74],
         )
 
 

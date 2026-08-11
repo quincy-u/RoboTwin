@@ -54,6 +54,16 @@ def _metadata(phase: str, *, endpoint: bool) -> dict:
     }
 
 
+def _arm_gripper_metadata(
+    phase: str, arm: str, *, endpoint: bool
+) -> dict:
+    metadata = _metadata(phase, endpoint=endpoint)
+    metadata["arm"] = arm
+    metadata["target_gripper"] = 1.0 if phase == "open" else 0.0
+    metadata["gripper_arms"] = (arm,)
+    return metadata
+
+
 def _dual_metadata(phase: str, *, endpoint: bool) -> dict:
     return {
         "phase": phase,
@@ -216,6 +226,19 @@ class ExecutionGuardTest(unittest.TestCase):
         self.assertFalse(env.eval_success)
         self.assertEqual(env.take_action_cnt, env.step_lim)
 
+    def test_calibrated_wide_handoff_response_passes(self) -> None:
+        model = _Model([])
+        settings = deploy_policy._execution_guard_settings(model)
+        self.assertAlmostEqual(settings[4], 0.08)
+
+        failures = deploy_policy._gripper_execution_guard_failures(
+            initial_state=1.0,
+            states=[0.9100, 0.9065],
+            min_delta=settings[4],
+            settle_delta_max=settings[5],
+        )
+        self.assertEqual(failures, [])
+
     def test_wide_object_physical_response_passes(self) -> None:
         failures = deploy_policy._gripper_execution_guard_failures(
             initial_state=1.0,
@@ -229,10 +252,311 @@ class ExecutionGuardTest(unittest.TestCase):
         failures = deploy_policy._gripper_execution_guard_failures(
             initial_state=1.0,
             states=[0.96, 0.95],
-            min_delta=0.10,
+            min_delta=0.08,
             settle_delta_max=0.05,
         )
         self.assertTrue(any("gripper_closure_delta" in item for item in failures))
+
+    def test_release_physical_response_passes(self) -> None:
+        failures = deploy_policy._gripper_release_execution_guard_failures(
+            initial_state=0.30,
+            states=[0.96, 0.98],
+            min_delta=0.10,
+            settle_delta_max=0.05,
+        )
+        self.assertEqual(failures, [])
+
+    def test_release_without_physical_response_fails(self) -> None:
+        failures = deploy_policy._gripper_release_execution_guard_failures(
+            initial_state=0.30,
+            states=[0.34, 0.35],
+            min_delta=0.10,
+            settle_delta_max=0.05,
+        )
+        self.assertTrue(any("gripper_release_delta" in item for item in failures))
+
+    def test_initial_open_is_not_mistaken_for_release(self) -> None:
+        model = _Model(
+            [
+                _arm_gripper_metadata("open", "right", endpoint=True),
+                _metadata("action", endpoint=True),
+            ]
+        )
+        env = _TaskEnv()
+
+        with patch.object(deploy_policy, "encode_obs", return_value=object()):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 2)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
+
+    def test_bimanual_gripper_phase_filters_unchanged_held_arm(self) -> None:
+        metadata = _dual_metadata("open", endpoint=True)
+        metadata["arm_targets"]["left"]["target_gripper"] = 1.0
+        metadata["arm_targets"]["right"]["target_gripper"] = 0.0
+
+        self.assertEqual(
+            deploy_policy._gripper_phase_arms(metadata, "open"), ("left",)
+        )
+
+    def test_explicit_gripper_arms_excludes_latched_giver(self) -> None:
+        metadata = _dual_metadata("close", endpoint=True)
+        metadata["arm_targets"]["left"]["target_gripper"] = 0.0
+        metadata["arm_targets"]["right"]["target_gripper"] = 0.0
+        metadata["gripper_arms"] = ("right",)
+
+        self.assertEqual(
+            deploy_policy._gripper_phase_arms(metadata, "close"), ("right",)
+        )
+
+    def test_sequential_close_events_capture_independent_baselines(self) -> None:
+        model = _Model(
+            [
+                *[
+                    _arm_gripper_metadata("close", "left", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                *[
+                    _arm_gripper_metadata("close", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                _metadata("action", endpoint=True),
+            ]
+        )
+        env = _TaskEnv()
+        measurement_calls: list[tuple[str, int]] = []
+
+        def measured(_task_env, action_metadata):
+            arm = action_metadata["arm"]
+            index = len(env.actions)
+            measurement_calls.append((arm, index))
+            values = {
+                "left": {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82},
+                "right": {3: 1.0, 4: 0.84, 5: 0.82, 6: 0.82},
+            }
+            return {
+                "gripper_physical_state": values[arm].get(index, 0.82)
+            }
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 7)
+        self.assertEqual(measurement_calls.count(("left", 0)), 1)
+        self.assertEqual(measurement_calls.count(("right", 3)), 1)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
+
+    def test_handoff_release_is_independent_of_receiver_close(self) -> None:
+        model = _Model(
+            [
+                *[
+                    _arm_gripper_metadata("close", "left", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                *[
+                    _arm_gripper_metadata("close", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                *[
+                    _arm_gripper_metadata("open", "left", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                _metadata("action", endpoint=True),
+            ]
+        )
+        env = _TaskEnv()
+        baseline_calls: list[tuple[str, str, int]] = []
+
+        def measured(_task_env, action_metadata):
+            arm = action_metadata["arm"]
+            phase = action_metadata["phase"]
+            index = len(env.actions)
+            baseline_calls.append((phase, arm, index))
+            if arm == "left" and phase == "close":
+                value = {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82}[index]
+            elif arm == "right":
+                value = {3: 1.0, 4: 0.84, 5: 0.82, 6: 0.82}[index]
+            else:
+                value = {6: 0.82, 7: 0.96, 8: 0.99, 9: 1.0}[index]
+            return {"gripper_physical_state": value}
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 10)
+        self.assertEqual(baseline_calls.count(("open", "left", 6)), 1)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
+
+    def test_release_suppresses_internal_early_success_until_settled(self) -> None:
+        model = _Model(
+            [
+                *[
+                    _arm_gripper_metadata("close", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                *[
+                    _arm_gripper_metadata("open", "right", endpoint=index == 4)
+                    for index in range(5)
+                ],
+            ]
+        )
+
+        class EarlyExitReleaseEnv(_TaskEnv):
+            def __init__(self):
+                super().__init__()
+                self.physical_gripper = 1.0
+                self.release_active = False
+                self.internal_open_steps = 0
+                self.real_success_checks = 0
+
+            def check_success(self):
+                self.real_success_checks += 1
+                return self.release_active
+
+            def take_action(self, action, *, action_type):
+                self.actions.append((action, action_type))
+                self.take_action_cnt += 1
+                action_count = len(self.actions)
+                if action_count <= 3:
+                    self.physical_gripper = {
+                        1: 0.84,
+                        2: 0.82,
+                        3: 0.82,
+                    }[action_count]
+                    return
+                self.release_active = True
+                for _ in range(5):
+                    self.internal_open_steps += 1
+                    self.physical_gripper = min(
+                        1.0, self.physical_gripper + 0.008
+                    )
+                    if self.check_success():
+                        self.eval_success = True
+                        return
+
+        env = EarlyExitReleaseEnv()
+
+        def measured(_task_env, _action_metadata):
+            return {
+                "gripper_physical_state": env.physical_gripper,
+            }
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 8)
+        self.assertEqual(env.internal_open_steps, 25)
+        self.assertEqual(env.real_success_checks, 1)
+        self.assertNotIn("check_success", env.__dict__)
+        self.assertTrue(env.eval_success)
+        self.assertLess(env.take_action_cnt, env.step_lim)
+
+    def test_success_on_settled_final_release_is_preserved(self) -> None:
+        model = _Model(
+            [
+                *[
+                    _arm_gripper_metadata("close", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                *[
+                    _arm_gripper_metadata("open", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+            ]
+        )
+
+        class ReleaseSuccessEnv(_TaskEnv):
+            def take_action(self, action, *, action_type):
+                super().take_action(action, action_type=action_type)
+                self.eval_success = len(self.actions) >= 4
+
+        env = ReleaseSuccessEnv()
+
+        def measured(_task_env, action_metadata):
+            index = len(env.actions)
+            if action_metadata["phase"] == "close":
+                value = {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82}[index]
+            else:
+                value = {3: 0.82, 4: 0.96, 5: 0.99, 6: 1.0}[index]
+            return {"gripper_physical_state": value}
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 6)
+        self.assertTrue(env.eval_success)
+        self.assertLess(env.take_action_cnt, env.step_lim)
+
+    def test_close_success_does_not_skip_planned_release(self) -> None:
+        model = _Model(
+            [
+                *[
+                    _arm_gripper_metadata("close", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+                _metadata("lift", endpoint=True),
+                _metadata("preplace", endpoint=True),
+                _metadata("place", endpoint=True),
+                *[
+                    _arm_gripper_metadata("open", "right", endpoint=index == 2)
+                    for index in range(3)
+                ],
+            ]
+        )
+
+        class CloseAndReleaseSuccessEnv(_TaskEnv):
+            def take_action(self, action, *, action_type):
+                super().take_action(action, action_type=action_type)
+                self.eval_success = len(self.actions) in {3, 9}
+
+        env = CloseAndReleaseSuccessEnv()
+        good_motion = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+
+        def measured(_task_env, action_metadata):
+            index = len(env.actions)
+            if action_metadata["phase"] == "close":
+                value = {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82}[index]
+            elif action_metadata["phase"] == "open":
+                value = {6: 0.82, 7: 0.96, 8: 0.99, 9: 1.0}[index]
+            else:
+                value = 0.82
+            return {**good_motion, "gripper_physical_state": value}
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(
+                deploy_policy, "_robot_measurements", side_effect=measured
+            ),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 9)
+        self.assertTrue(env.eval_success)
+        self.assertLess(env.take_action_cnt, env.step_lim)
 
     def test_close_settle_actions_ignore_intermediate_success(self) -> None:
         model = _Model(

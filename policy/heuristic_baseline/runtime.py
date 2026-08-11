@@ -21,6 +21,7 @@ from simple_grasp.types import GraspCandidate, ObjectState, SceneObservation
 
 from .errors import NoFeasiblePlanFailure, TargetSelectionFailure
 from .m2t2_backend import RoboTwinM2T2Backend
+from .task_plan import Handoff, Pick, Place
 
 
 M2T2_TO_ROBOTWIN = np.array(
@@ -510,7 +511,7 @@ def _arm_joint_state(task_env: Any, arm: str) -> np.ndarray:
 
 
 def _aloha_self_collision_config(model: mujoco.MjModel) -> MinkCollisionConfig:
-    """Replace placeholder limits and constrain non-adjacent arm links."""
+    """Constrain active arms against themselves, each other, and the robot."""
     for prefix in ("fl_joint", "fr_joint"):
         for index in range(1, 7):
             joint_name = f"{prefix}{index}"
@@ -524,25 +525,51 @@ def _aloha_self_collision_config(model: mujoco.MjModel) -> MinkCollisionConfig:
             model.jnt_limited[joint_id] = 1
             model.jnt_range[joint_id] = (-np.pi, np.pi)
 
-    geom_pairs = []
+    def body_name(geom_id: int) -> str:
+        return (
+            mujoco.mj_id2name(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                int(model.geom_bodyid[geom_id]),
+            )
+            or ""
+        )
+
+    arm_groups: dict[str, tuple[int, ...]] = {}
+    movable_groups: dict[str, tuple[int, ...]] = {}
     for prefix in ("fl_link", "fr_link"):
-        geom_ids = tuple(
+        arm_groups[prefix] = tuple(
             geom_id
             for geom_id in range(model.ngeom)
-            if (
-                mujoco.mj_id2name(
-                    model,
-                    mujoco.mjtObj.mjOBJ_BODY,
-                    int(model.geom_bodyid[geom_id]),
-                )
-                or ""
-            ).startswith(prefix)
+            if body_name(geom_id).startswith(prefix)
         )
-        if len(geom_ids) < 2:
+        # link1 intentionally overlaps its fixed shoulder mount at qpos0.
+        movable_groups[prefix] = tuple(
+            geom_id
+            for geom_id in arm_groups[prefix]
+            if body_name(geom_id) != f"{prefix}1"
+        )
+        if len(arm_groups[prefix]) < 2 or not movable_groups[prefix]:
             raise ValueError(f"Mink model has no collision group for {prefix}")
-        geom_pairs.append((geom_ids, geom_ids))
+    fixed_group = tuple(
+        geom_id
+        for geom_id in range(model.ngeom)
+        if not body_name(geom_id).startswith(("fl_link", "fr_link"))
+    )
+    if not fixed_group:
+        raise ValueError("Mink model has no fixed robot collision group")
+
+    left = arm_groups["fl_link"]
+    right = arm_groups["fr_link"]
+    geom_pairs = (
+        (left, left),
+        (right, right),
+        (left, right),
+        (movable_groups["fl_link"], fixed_group),
+        (movable_groups["fr_link"], fixed_group),
+    )
     return MinkCollisionConfig(
-        geom_pairs=tuple(geom_pairs),
+        geom_pairs=geom_pairs,
         minimum_distance_m=0.002,
         detection_distance_m=0.03,
         bound_relaxation=0.001,
@@ -595,6 +622,20 @@ class RoboTwinMinkIK:
             world_from_model=self._world_from_model,
             config=ik_config or MinkIKConfig(),
         )
+        self._neutral_contact_depths: dict[tuple[int, int], float] = {}
+        model = getattr(self.solver, "model", None)
+        if model is not None:
+            neutral = mujoco.MjData(model)
+            neutral.qpos[:] = model.qpos0
+            mujoco.mj_forward(model, neutral)
+            for contact in neutral.contact[: neutral.ncon]:
+                if contact.dist >= 0.0:
+                    continue
+                key = tuple(sorted((int(contact.geom1), int(contact.geom2))))
+                self._neutral_contact_depths[key] = min(
+                    float(contact.dist),
+                    self._neutral_contact_depths.get(key, 0.0),
+                )
         self.reset_stats()
 
     def _joint_positions(self, arm: str) -> np.ndarray:
@@ -672,8 +713,35 @@ class RoboTwinMinkIK:
         steps = max(2, int(np.ceil(delta / self.max_joint_step_rad)))
         return np.linspace(start, target, steps + 1, dtype=np.float64)[1:]
 
+    def _has_disallowed_arm_contact(
+        self,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        monitored_body_ids: set[int],
+    ) -> bool:
+        """Reject new arm penetrations while preserving neutral mount overlap."""
+        for contact in data.contact[: data.ncon]:
+            if contact.dist >= -1e-4:
+                continue
+            first_body = int(model.geom_bodyid[contact.geom1])
+            second_body = int(model.geom_bodyid[contact.geom2])
+            if (
+                first_body not in monitored_body_ids
+                and second_body not in monitored_body_ids
+            ):
+                continue
+            key = tuple(sorted((int(contact.geom1), int(contact.geom2))))
+            neutral_depth = self._neutral_contact_depths.get(key)
+            if (
+                neutral_depth is not None
+                and contact.dist >= neutral_depth - 1e-3
+            ):
+                continue
+            return True
+        return False
+
     def _path_has_self_collision(self, arm: str, path: np.ndarray) -> bool:
-        """Return whether any waypoint penetrates non-adjacent active-arm links."""
+        """Return whether the active arm intersects robot or fixed geometry."""
         model = getattr(self.solver, "model", None)
         if model is None:
             return False
@@ -705,15 +773,8 @@ class RoboTwinMinkIK:
             data.qpos[:] = model.qpos0
             data.qpos[qpos_indices] = joints
             mujoco.mj_forward(model, data)
-            for contact in data.contact[: data.ncon]:
-                first_body = int(model.geom_bodyid[contact.geom1])
-                second_body = int(model.geom_bodyid[contact.geom2])
-                if (
-                    first_body in arm_body_ids
-                    and second_body in arm_body_ids
-                    and contact.dist < -1e-4
-                ):
-                    return True
+            if self._has_disallowed_arm_contact(model, data, arm_body_ids):
+                return True
         return False
 
     def _solve_safe_target(
@@ -759,6 +820,38 @@ class RoboTwinMinkIK:
             joints, path = self._solve_safe_target(arm, target, start)
         finally:
             self._candidate_seed = {}
+        if (
+            (joints is None or path is None)
+            and self.canonical_seed_on_failure
+        ):
+            canonical_rotation = t3d.quaternions.quat2mat(
+                CANONICAL_COMMAND_QUATERNIONS[arm]
+            )
+            canonical_target = self._with_command_rotation(
+                target, canonical_rotation
+            )
+            canonical_joints, canonical_path = self._solve_safe_target(
+                arm, canonical_target, start
+            )
+            if canonical_joints is not None and canonical_path is not None:
+                self._candidate_seed = {arm: canonical_joints.copy()}
+                exact_joints, exact_path = self._solve_safe_target(
+                    arm, target, canonical_joints
+                )
+                if exact_joints is not None and exact_path is not None:
+                    exact_joints = self._nearest_safe_revolute_solution(
+                        exact_joints, start
+                    )
+                    if exact_joints is not None:
+                        direct_path = self._path(start, exact_joints)
+                        if (
+                            len(direct_path) <= self.max_waypoints_per_segment
+                            and not self._path_has_self_collision(
+                                arm, direct_path
+                            )
+                        ):
+                            joints, path = exact_joints, direct_path
+                            self.canonical_seed_successes += 1
         if joints is None or path is None:
             self.failures["NoSolution"] = self.failures.get("NoSolution", 0) + 1
             return None
@@ -771,7 +864,7 @@ class RoboTwinMinkIK:
         *,
         max_joint_step_rad: float = 0.03,
     ) -> bool:
-        """Check dense paired-arm qpos motion for robot self-collision."""
+        """Check dense paired-arm motion against all robot/fixed geometry."""
         if max_joint_step_rad <= 0.0:
             raise ValueError("max_joint_step_rad must be positive")
         model = getattr(self.solver, "model", None)
@@ -835,15 +928,10 @@ class RoboTwinMinkIK:
                 data.qpos[arm_indices["left"]] = joints[:6]
                 data.qpos[arm_indices["right"]] = joints[6:]
                 mujoco.mj_forward(model, data)
-                for contact in data.contact[: data.ncon]:
-                    first_body = int(model.geom_bodyid[contact.geom1])
-                    second_body = int(model.geom_bodyid[contact.geom2])
-                    if (
-                        first_body in arm_body_ids
-                        and second_body in arm_body_ids
-                        and contact.dist < -1e-4
-                    ):
-                        return True
+                if self._has_disallowed_arm_contact(
+                    model, data, arm_body_ids
+                ):
+                    return True
             current = target
         return False
 
@@ -1120,6 +1208,209 @@ class QposActionBuffer:
             )
 
 
+class StagedQposActionBuffer:
+    """Compose named one- or two-arm stages into full 14D qpos rows."""
+
+    def __init__(self, task_env: Any, *, max_waypoints_per_segment: int = 64) -> None:
+        if max_waypoints_per_segment < 2:
+            raise ValueError("max_waypoints_per_segment must be at least 2")
+        self.task_env = task_env
+        self.max_waypoints_per_segment = int(max_waypoints_per_segment)
+        self.actions: list[np.ndarray] = []
+        self.metadata: list[dict[str, Any]] = []
+        self.left = np.empty(0)
+        self.right = np.empty(0)
+        self.left_gripper = 1.0
+        self.right_gripper = 1.0
+
+    def reset(self) -> None:
+        left = _arm_joint_state(self.task_env, "left")
+        right = _arm_joint_state(self.task_env, "right")
+        self.left, self.left_gripper = left[:-1].copy(), float(left[-1])
+        self.right, self.right_gripper = right[:-1].copy(), float(right[-1])
+        self.actions = []
+        self.metadata = []
+
+    @staticmethod
+    def _resample_path(start: np.ndarray, path: np.ndarray, count: int) -> np.ndarray:
+        start = np.asarray(start, dtype=np.float64)
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1:] != start.shape or len(path) < 1:
+            raise ValueError("each staged path must contain joint waypoints")
+        source = np.vstack((start, path))
+        source_progress = np.linspace(0.0, 1.0, len(source))
+        target_progress = np.linspace(0.0, 1.0, count + 1)[1:]
+        return np.column_stack([
+            np.interp(target_progress, source_progress, source[:, joint])
+            for joint in range(source.shape[1])
+        ])
+
+    @staticmethod
+    def _validate_arms(arms: set[str]) -> tuple[str, ...]:
+        if not arms or not arms <= {"left", "right"}:
+            raise ValueError("stage arms must be a nonempty subset of left/right")
+        return tuple(arm for arm in ("left", "right") if arm in arms)
+
+    def _append(
+        self,
+        *,
+        phase: str,
+        arms: tuple[str, ...],
+        endpoint: bool,
+        waypoint_index: int,
+        waypoint_count: int,
+        command_poses: dict[str, np.ndarray | None] | None,
+        target_names: dict[str, str] | None,
+        arm_sources: dict[str, str] | None,
+        gripper_arms: tuple[str, ...] | None,
+    ) -> None:
+        command_poses = command_poses or {}
+        target_names = target_names or {}
+        arm_sources = arm_sources or {}
+        self.actions.append(np.concatenate((
+            self.left, [self.left_gripper], self.right, [self.right_gripper]
+        )))
+
+        def arm_target(arm: str) -> dict[str, Any]:
+            qpos = self.left if arm == "left" else self.right
+            gripper = self.left_gripper if arm == "left" else self.right_gripper
+            command_pose = command_poses.get(arm)
+            return {
+                "target_qpos": qpos.copy(),
+                "target_gripper": float(gripper),
+                "command_pose": (
+                    None if command_pose is None
+                    else np.asarray(command_pose, dtype=np.float64).copy()
+                ),
+                "target_name": target_names.get(arm),
+                "arm_source": arm_sources.get(arm),
+            }
+
+        record: dict[str, Any] = {
+            "phase": str(phase),
+            "arm": arms[0] if len(arms) == 1 else "both",
+            "endpoint": bool(endpoint),
+            "waypoint_index": int(waypoint_index),
+            "waypoint_count": int(waypoint_count),
+        }
+        if gripper_arms is not None:
+            record["gripper_arms"] = list(gripper_arms)
+        if len(arms) == 1:
+            record.update(arm_target(arms[0]))
+        else:
+            record["arm_targets"] = {arm: arm_target(arm) for arm in arms}
+            sources = {
+                arm_sources[arm] for arm in arms if arm_sources.get(arm) is not None
+            }
+            record["arm_source"] = sources.pop() if len(sources) == 1 else "mixed"
+        self.metadata.append(record)
+
+    def move_phase(
+        self,
+        phase: str,
+        paths: dict[str, np.ndarray],
+        command_poses: dict[str, np.ndarray] | None = None,
+        target_names: dict[str, str] | None = None,
+        arm_sources: dict[str, str] | None = None,
+    ) -> None:
+        arms = self._validate_arms(set(paths))
+        arrays = {arm: np.asarray(paths[arm], dtype=np.float64) for arm in arms}
+        if any(
+            path.ndim != 2
+            or path.shape[1:] != (6,)
+            or len(path) < 1
+            or len(path) > self.max_waypoints_per_segment
+            or not np.all(np.isfinite(path))
+            for path in arrays.values()
+        ):
+            raise ValueError("staged paths must be finite bounded Nx6 arrays")
+        count = max(len(path) for path in arrays.values())
+        starts = {"left": self.left.copy(), "right": self.right.copy()}
+        waypoints = {
+            arm: self._resample_path(starts[arm], arrays[arm], count)
+            for arm in arms
+        }
+        for index in range(count):
+            for arm in arms:
+                if arm == "left":
+                    self.left = waypoints[arm][index].copy()
+                else:
+                    self.right = waypoints[arm][index].copy()
+            endpoint = index == count - 1
+            self._append(
+                phase=phase,
+                arms=arms,
+                endpoint=endpoint,
+                waypoint_index=index + 1,
+                waypoint_count=count,
+                command_poses=command_poses if endpoint else None,
+                target_names=target_names,
+                arm_sources=arm_sources,
+                gripper_arms=None,
+            )
+
+    def gripper_phase(
+        self,
+        phase: str,
+        targets: dict[str, float],
+        repeats: int,
+        target_names: dict[str, str] | None = None,
+        arm_sources: dict[str, str] | None = None,
+    ) -> None:
+        arms = self._validate_arms(set(targets))
+        if repeats < 1:
+            raise ValueError("gripper phase repeats must be at least one")
+        for arm in arms:
+            value = float(targets[arm])
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError("gripper targets must be finite values in [0, 1]")
+            if arm == "left":
+                self.left_gripper = value
+            else:
+                self.right_gripper = value
+        for index in range(1, repeats + 1):
+            self._append(
+                phase=phase,
+                arms=arms,
+                endpoint=index == repeats,
+                waypoint_index=index,
+                waypoint_count=repeats,
+                command_poses=None,
+                target_names=target_names,
+                arm_sources=arm_sources,
+                gripper_arms=arms,
+            )
+
+
+@dataclass(frozen=True)
+class _SingleArmPlacePlan:
+    """A fully prevalidated grasp, placement, release, and retreat chain."""
+
+    arm: str
+    target_name: str
+    arm_source: str
+    candidate: GraspCandidate
+    paths: tuple[np.ndarray, ...]
+    command_targets: tuple[np.ndarray, ...]
+    desired_object_pose: np.ndarray
+
+
+@dataclass(frozen=True)
+class _HandoffArmPlan:
+    """One arm's exact, prevalidated stages in an atomic handoff plan."""
+
+    arm: str
+    role: str
+    target_name: str
+    arm_source: str
+    candidate: GraspCandidate
+    paths: tuple[np.ndarray, ...]
+    command_targets: tuple[np.ndarray, ...]
+    contact_local_point: tuple[float, float, float]
+    gripper_target: float = 0.0
+    orientation_source: str = "m2t2"
+
+
 @dataclass(frozen=True)
 class _BimanualArmPlan:
     """One arm's complete grasp, lift, and held-transport plan."""
@@ -1149,6 +1440,271 @@ def _pose_matrix(pose: Any, *, name: str) -> np.ndarray:
     if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
         raise ValueError(f"{name} must be a finite 4x4 rigid transform")
     return matrix
+
+
+def _pose7_from_matrix(matrix: np.ndarray) -> np.ndarray:
+    pose = _pose_matrix(matrix, name="pose")
+    return np.concatenate(
+        (pose[:3, 3], t3d.quaternions.mat2quat(pose[:3, :3]))
+    )
+
+
+def _desired_object_pose(
+    world_object_pose: np.ndarray,
+    world_source_reference_pose: np.ndarray,
+    desired_world_source_reference_pose: np.ndarray,
+) -> np.ndarray:
+    """Move the full object so its source reference equals the destination."""
+    world_object = _pose_matrix(world_object_pose, name="world_object_pose")
+    world_source = _pose_matrix(
+        world_source_reference_pose, name="world_source_reference_pose"
+    )
+    desired_source = _pose_matrix(
+        desired_world_source_reference_pose,
+        name="desired_world_source_reference_pose",
+    )
+    object_from_source = np.linalg.inv(world_object) @ world_source
+    return desired_source @ np.linalg.inv(object_from_source)
+
+
+def _rigid_place_command_pose(
+    world_object_pose: np.ndarray,
+    world_source_reference_pose: np.ndarray,
+    world_grasp_command_pose: np.ndarray,
+    desired_world_source_reference_pose: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return desired object and gripper poses while preserving attachment."""
+    world_object = _pose_matrix(world_object_pose, name="world_object_pose")
+    world_grasp = _pose_matrix(
+        world_grasp_command_pose, name="world_grasp_command_pose"
+    )
+    desired_object = _desired_object_pose(
+        world_object,
+        world_source_reference_pose,
+        desired_world_source_reference_pose,
+    )
+    object_from_gripper = np.linalg.inv(world_object) @ world_grasp
+    return desired_object, desired_object @ object_from_gripper
+
+
+def _aligned_place_reference_pose(
+    world_source_reference_pose: np.ndarray,
+    world_destination_pose: np.ndarray,
+    world_grasp_command_pose: np.ndarray,
+    *,
+    arm: str,
+    constrain: str,
+    z_transform: bool,
+) -> np.ndarray:
+    """Apply the same reference-frame orientation rules as place_actor()."""
+    if arm not in {"left", "right"}:
+        raise ValueError(f"unknown placement arm {arm!r}")
+    source = _pose_matrix(
+        world_source_reference_pose, name="world_source_reference_pose"
+    )
+    destination = _pose_matrix(
+        world_destination_pose, name="world_destination_pose"
+    )
+    grasp = _pose_matrix(
+        world_grasp_command_pose, name="world_grasp_command_pose"
+    )
+    if constrain not in {"auto", "align", "free"}:
+        raise ValueError(f"unknown RoboTwin placement constraint {constrain!r}")
+
+    from envs.utils.transforms import get_place_pose
+
+    kwargs: dict[str, Any] = {"z_transform": bool(z_transform)}
+    resolved_constrain = constrain
+    if constrain == "auto":
+        actor_axis = source[:3, 3] - grasp[:3, 3]
+        if np.linalg.norm(actor_axis) < 1e-8:
+            actor_axis = grasp[:3, 0].copy()
+        resolved_constrain = "align"
+        kwargs.update(
+            actor_axis=actor_axis,
+            actor_axis_type="world",
+        )
+        if abs(float(np.dot(actor_axis, [0.0, 0.0, 1.0]))) <= 0.1:
+            kwargs["align_axis"] = (
+                [1.0, 1.0, 0.0]
+                if arm == "left"
+                else [-1.0, 1.0, 0.0]
+            )
+        else:
+            kwargs["actor_axis"] = grasp[:3, 2].copy()
+            kwargs["align_axis"] = [0.0, 1.0, 0.0]
+
+    result = get_place_pose(
+        _pose7_from_matrix(source),
+        _pose7_from_matrix(destination),
+        constrain=resolved_constrain,
+        **kwargs,
+    )
+    return _pose_matrix(np.asarray(result), name="aligned_place_reference_pose")
+
+
+def _place_offset_axis(
+    preplace_axis: str | np.ndarray,
+    desired_world_object_pose: np.ndarray,
+    desired_world_grasp_command_pose: np.ndarray,
+    world_destination_pose: np.ndarray,
+) -> np.ndarray:
+    """Resolve RoboTwin's pre-placement displacement direction in world."""
+    if isinstance(preplace_axis, str):
+        if preplace_axis == "grasp":
+            axis = (
+                np.asarray(desired_world_object_pose)[:3, 3]
+                - np.asarray(desired_world_grasp_command_pose)[:3, 3]
+            )
+        elif preplace_axis == "fp":
+            axis = np.asarray(world_destination_pose)[:3, 2]
+        else:
+            raise ValueError(f"unknown preplace_axis {preplace_axis!r}")
+    else:
+        axis = np.asarray(preplace_axis, dtype=np.float64)
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if axis.shape != (3,) or not np.isfinite(norm) or norm < 1e-8:
+        raise ValueError("placement offset axis must be a finite nonzero vector")
+    return axis / norm
+
+
+def _recorded_contact_region(
+    value: Any, *, name: str
+) -> np.ndarray | None:
+    """Normalize an optional procedural contact region in object coordinates."""
+    if value is None:
+        return None
+    points = np.asarray(value, dtype=np.float64)
+    if points.size == 0:
+        return None
+    if points.shape == (3,):
+        points = points[None, :]
+    if (
+        points.ndim != 2
+        or points.shape[1] != 3
+        or not np.all(np.isfinite(points))
+    ):
+        raise ValueError(f"{name} must contain finite object-local 3D points")
+    return points.copy()
+
+
+def _handoff_contact_regions(
+    local_target_points: np.ndarray,
+    giver_recorded: Any,
+    receiver_recorded: Any,
+    *,
+    giver_reference_local: np.ndarray | None,
+    receiver_reference_local: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, float, str]:
+    """Resolve role regions from trace data, else PCA endpoints and arm geometry."""
+    giver = _recorded_contact_region(
+        giver_recorded, name="giver contact region"
+    )
+    receiver = _recorded_contact_region(
+        receiver_recorded, name="receiver contact region"
+    )
+    local_target = np.asarray(local_target_points, dtype=np.float64)
+    if local_target.ndim != 2 or local_target.shape[1:] != (3,):
+        raise ValueError("local target points must have shape (N, 3)")
+    local_target = local_target[np.all(np.isfinite(local_target), axis=1)]
+    source = "recorded_regions"
+
+    if giver is None or receiver is None:
+        if len(local_target) < 2:
+            raise TargetSelectionFailure(
+                "handoff lacks recorded contact regions and segmented geometry"
+            )
+        centered = local_target - np.mean(local_target, axis=0)
+        _, singular_values, axes = np.linalg.svd(
+            centered, full_matrices=False
+        )
+        if not len(singular_values) or singular_values[0] < 1e-6:
+            raise TargetSelectionFailure(
+                "segmented handoff target has no usable principal axis"
+            )
+        projection = centered @ axes[0]
+        order = np.argsort(projection)
+        tail_count = max(1, int(np.ceil(0.15 * len(local_target))))
+        low = local_target[order[:tail_count]]
+        high = local_target[order[-tail_count:]]
+        source = "segmented_pca_fallback"
+
+        def centroid_distance(
+            region: np.ndarray, reference: np.ndarray
+        ) -> float:
+            return float(np.linalg.norm(np.mean(region, axis=0) - reference))
+
+        if giver is not None:
+            receiver = max(
+                (low, high),
+                key=lambda region: float(
+                    np.linalg.norm(
+                        np.mean(region, axis=0) - np.mean(giver, axis=0)
+                    )
+                ),
+            )
+        elif receiver is not None:
+            giver = max(
+                (low, high),
+                key=lambda region: float(
+                    np.linalg.norm(
+                        np.mean(region, axis=0) - np.mean(receiver, axis=0)
+                    )
+                ),
+            )
+        else:
+            direct = 0.0
+            reverse = 0.0
+            if giver_reference_local is not None:
+                direct += centroid_distance(low, giver_reference_local)
+                reverse += centroid_distance(high, giver_reference_local)
+            if receiver_reference_local is not None:
+                direct += centroid_distance(high, receiver_reference_local)
+                reverse += centroid_distance(low, receiver_reference_local)
+            giver, receiver = (
+                (low, high) if direct <= reverse else (high, low)
+            )
+
+    assert giver is not None and receiver is not None
+    centroid_separation = float(
+        np.linalg.norm(np.mean(giver, axis=0) - np.mean(receiver, axis=0))
+    )
+    object_span = (
+        float(np.linalg.norm(np.ptp(local_target, axis=0)))
+        if len(local_target) >= 2
+        else centroid_separation
+    )
+    scale = centroid_separation if centroid_separation > 1e-6 else object_span
+    if object_span > 1e-6:
+        scale = min(scale, object_span)
+    minimum_separation = max(0.005, 0.25 * scale)
+    return giver, receiver, minimum_separation, source
+
+
+def _grasp_command_tcp(
+    world_grasp_pose: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+) -> np.ndarray:
+    """Return M2T2's predicted contact as RoboTwin's logical TCP."""
+    grasp = _pose_matrix(world_grasp_pose, name="world_grasp_pose")
+    transform = _pose_matrix(grasp_to_robotwin, name="grasp_to_robotwin")
+    command = grasp @ transform
+    return command[:3, 3] + 0.12 * command[:3, 0]
+
+
+def _approach_offset_command_pose(
+    world_command_pose: np.ndarray, distance_m: float
+) -> np.ndarray:
+    """Withdraw a RoboTwin command along its calibrated approach axis."""
+    command = _pose_matrix(
+        world_command_pose, name="world_command_pose"
+    ).copy()
+    distance = float(distance_m)
+    if not np.isfinite(distance) or distance < 0.0:
+        raise ValueError("approach offset must be finite and nonnegative")
+    command[:3, 3] -= distance * command[:3, 0]
+    return command
 
 
 def _rigid_transport_command_pose(
@@ -1216,6 +1772,188 @@ def _robot_facing_grasp_pose(
     return adjusted_command @ np.linalg.inv(transform)
 
 
+def _place_facing_grasp_pose(
+    world_grasp_pose: np.ndarray,
+    world_object_pose: np.ndarray,
+    desired_world_object_pose: np.ndarray,
+    arm_reference_position: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+    *,
+    world_closing_axis: np.ndarray | None = None,
+) -> np.ndarray:
+    """Preserve a grasp TCP while making its transported pose robot-facing."""
+    transform = _pose_matrix(
+        grasp_to_robotwin, name="grasp_to_robotwin"
+    )
+    initial_command = _pose_matrix(
+        world_grasp_pose, name="world_grasp_pose"
+    ) @ transform
+    world_object = _pose_matrix(
+        world_object_pose, name="world_object_pose"
+    )
+    desired_object = _pose_matrix(
+        desired_world_object_pose, name="desired_world_object_pose"
+    )
+    arm_reference = np.asarray(arm_reference_position, dtype=np.float64)
+    if arm_reference.shape != (3,) or not np.all(np.isfinite(arm_reference)):
+        raise ValueError("arm_reference_position must be a finite 3-vector")
+
+    object_delta = desired_object @ np.linalg.inv(world_object)
+    initial_tcp = (
+        initial_command[:3, 3] + 0.12 * initial_command[:3, 0]
+    )
+    final_tcp = (
+        object_delta[:3, :3] @ initial_tcp + object_delta[:3, 3]
+    )
+    approach = final_tcp - arm_reference
+    approach_norm = float(np.linalg.norm(approach))
+    if approach_norm < 1e-8:
+        raise ValueError("arm reference already coincides with final grasp TCP")
+    approach /= approach_norm
+
+    if world_closing_axis is None:
+        transported_closing = (
+            object_delta[:3, :3] @ initial_command[:3, 1]
+        )
+    else:
+        closing_axis = np.asarray(world_closing_axis, dtype=np.float64)
+        closing_norm = float(np.linalg.norm(closing_axis))
+        if closing_axis.shape != (3,) or not np.isfinite(closing_norm) or closing_norm < 1e-8:
+            raise ValueError("world_closing_axis must be a finite nonzero 3-vector")
+        transported_closing = object_delta[:3, :3] @ (closing_axis / closing_norm)
+        transported_raw = object_delta[:3, :3] @ initial_command[:3, 1]
+        if np.dot(transported_closing, transported_raw) < 0.0:
+            transported_closing = -transported_closing
+    closing = transported_closing - np.dot(
+        transported_closing, approach
+    ) * approach
+    if np.linalg.norm(closing) < 1e-6:
+        fallback_axis = np.eye(3)[int(np.argmin(np.abs(approach)))]
+        closing = fallback_axis - np.dot(fallback_axis, approach) * approach
+    closing /= np.linalg.norm(closing)
+    lateral = np.cross(approach, closing)
+    lateral /= np.linalg.norm(lateral)
+    closing = np.cross(lateral, approach)
+
+    final_command = np.eye(4, dtype=np.float64)
+    final_command[:3, :3] = np.column_stack(
+        (approach, closing, lateral)
+    )
+    final_command[:3, 3] = final_tcp - 0.12 * approach
+    adjusted_initial_command = np.linalg.inv(object_delta) @ final_command
+    return adjusted_initial_command @ np.linalg.inv(transform)
+
+def _narrow_axis_grasp_poses(
+    world_grasp_pose: np.ndarray,
+    world_object_pose: np.ndarray,
+    desired_world_object_pose: np.ndarray,
+    arm_reference_position: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+    world_narrow_axis: np.ndarray,
+    canonical_final_approach: np.ndarray,
+    *,
+    max_approaches: int = 10,
+) -> tuple[np.ndarray, ...]:
+    """Sweep bounded approach rolls while preserving a target-narrow jaw axis."""
+    if max_approaches < 1:
+        raise ValueError("max_approaches must be positive")
+    transform = _pose_matrix(
+        grasp_to_robotwin, name="grasp_to_robotwin"
+    )
+    initial_command = _pose_matrix(
+        world_grasp_pose, name="world_grasp_pose"
+    ) @ transform
+    world_object = _pose_matrix(
+        world_object_pose, name="world_object_pose"
+    )
+    desired_object = _pose_matrix(
+        desired_world_object_pose, name="desired_world_object_pose"
+    )
+    arm_reference = np.asarray(arm_reference_position, dtype=np.float64)
+    if arm_reference.shape != (3,) or not np.all(np.isfinite(arm_reference)):
+        raise ValueError("arm_reference_position must be a finite 3-vector")
+    narrow = np.asarray(world_narrow_axis, dtype=np.float64)
+    narrow_norm = float(np.linalg.norm(narrow))
+    if narrow.shape != (3,) or not np.isfinite(narrow_norm) or narrow_norm < 1e-8:
+        raise ValueError("world_narrow_axis must be a finite nonzero 3-vector")
+    narrow = narrow / narrow_norm
+    if np.dot(narrow, initial_command[:3, 1]) < 0.0:
+        narrow = -narrow
+
+    object_delta = desired_object @ np.linalg.inv(world_object)
+    initial_tcp = (
+        initial_command[:3, 3] + 0.12 * initial_command[:3, 0]
+    )
+    final_tcp = (
+        object_delta[:3, :3] @ initial_tcp + object_delta[:3, 3]
+    )
+    final_narrow = object_delta[:3, :3] @ narrow
+
+    def projected(axis: np.ndarray, normal: np.ndarray) -> np.ndarray | None:
+        value = np.asarray(axis, dtype=np.float64)
+        if value.shape != (3,) or not np.all(np.isfinite(value)):
+            return None
+        value = value - np.dot(value, normal) * normal
+        norm = float(np.linalg.norm(value))
+        return None if norm < 1e-8 else value / norm
+
+    seed_axes: list[np.ndarray] = []
+    initial_seed = projected(initial_tcp - arm_reference, narrow)
+    if initial_seed is not None:
+        seed_axes.append(initial_seed)
+    final_seed = projected(final_tcp - arm_reference, final_narrow)
+    if final_seed is not None:
+        final_seed = projected(object_delta[:3, :3].T @ final_seed, narrow)
+        if final_seed is not None:
+            seed_axes.append(final_seed)
+    canonical = projected(canonical_final_approach, final_narrow)
+    if canonical is not None:
+        canonical = projected(object_delta[:3, :3].T @ canonical, narrow)
+        if canonical is not None:
+            seed_axes.append(canonical)
+    if not seed_axes:
+        return ()
+
+    approaches: list[np.ndarray] = []
+
+    def add(axis: np.ndarray) -> None:
+        value = projected(axis, narrow)
+        if value is None:
+            return
+        if any(np.linalg.norm(value - existing) < 1e-4 for existing in approaches):
+            return
+        if len(approaches) < max_approaches:
+            approaches.append(value)
+
+    for seed in seed_axes:
+        add(seed)
+    primary = seed_axes[0]
+    for angle in (
+        np.pi,
+        np.pi / 4.0,
+        -np.pi / 4.0,
+        np.pi / 2.0,
+        -np.pi / 2.0,
+        3.0 * np.pi / 4.0,
+        -3.0 * np.pi / 4.0,
+    ):
+        add(t3d.axangles.axangle2mat(narrow, angle) @ primary)
+
+    poses: list[np.ndarray] = []
+    for approach in approaches:
+        lateral = np.cross(approach, narrow)
+        lateral /= np.linalg.norm(lateral)
+        closing = np.cross(lateral, approach)
+        command = np.eye(4, dtype=np.float64)
+        command[:3, :3] = np.column_stack(
+            (approach, closing, lateral)
+        )
+        command[:3, 3] = initial_tcp - 0.12 * approach
+        poses.append(command @ np.linalg.inv(transform))
+    return tuple(poses)
+
+
+
 def _elongated_object_axis(
     scene: SceneObservation,
     target: ObjectState,
@@ -1241,6 +1979,56 @@ def _elongated_object_axis(
     ):
         return None
     return eigenvectors[:, -1]
+
+
+def _target_narrow_axis(
+    scene: SceneObservation,
+    target: ObjectState,
+    desired_world_object_pose: np.ndarray,
+    final_approach_axis: np.ndarray,
+    *,
+    maximum_approach_alignment: float = 0.35,
+) -> np.ndarray | None:
+    """Choose the narrowest GT object axis compatible with final approach."""
+    if (
+        not np.isfinite(maximum_approach_alignment)
+        or maximum_approach_alignment < 0.0
+        or maximum_approach_alignment >= 1.0
+    ):
+        raise ValueError("maximum_approach_alignment must be in [0, 1)")
+    world_object = _pose_matrix(
+        target.world_pose, name="target.world_pose"
+    )
+    desired_object = _pose_matrix(
+        desired_world_object_pose, name="desired_world_object_pose"
+    )
+    approach = np.array(final_approach_axis, dtype=np.float64, copy=True)
+    approach_norm = float(np.linalg.norm(approach))
+    if approach.shape != (3,) or not np.isfinite(approach_norm) or approach_norm < 1e-8:
+        raise ValueError("final_approach_axis must be a finite nonzero 3-vector")
+    approach /= approach_norm
+
+    labels = np.asarray(scene.instance_labels)
+    points = np.asarray(scene.xyz, dtype=np.float64)[
+        labels == target.instance_id
+    ]
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) < 2:
+        return None
+    local_points = (
+        points - world_object[:3, 3]
+    ) @ world_object[:3, :3]
+    extents = np.ptp(local_points, axis=0)
+    eligible = [
+        axis
+        for axis in range(3)
+        if abs(float(np.dot(desired_object[:3, axis], approach)))
+        <= maximum_approach_alignment
+    ]
+    if not eligible:
+        return None
+    selected = min(eligible, key=lambda axis: float(extents[axis]))
+    return world_object[:3, selected].copy()
 
 
 def _target_width_along_axis(
@@ -1503,6 +2291,123 @@ def _robotwin_ground_truth_arm(task_env: Any, target_name: str) -> str | None:
     return normalized if normalized in {"left", "right"} else None
 
 
+def _structural_handoff_stages(
+    stages: tuple[Any, ...],
+) -> tuple[Any, Any, Any] | None:
+    """Select one ordered Pick/Handoff/Place chain from procedural stages."""
+    handoffs = [
+        (index, stage)
+        for index, stage in enumerate(stages)
+        if all(
+            hasattr(stage, name)
+            for name in ("object", "from_arm", "to_arm")
+        )
+        and (
+            hasattr(stage, "rendezvous_pose")
+            or hasattr(stage, "rendezvous_pose_attr")
+        )
+    ]
+    if not handoffs:
+        return None
+
+    def normalized_arm(stage: Any) -> str | None:
+        arm = getattr(stage, "arm", None)
+        if arm is None:
+            return None
+        value = str(arm).strip().lower()
+        return value if value in {"left", "right"} else ""
+
+    def group_id(stage: Any) -> int | None:
+        value = getattr(stage, "group_id", None)
+        return None if value is None else int(value)
+
+    def nearest_grouped(
+        candidates: list[tuple[int, Any]],
+        handoff_stage: Any,
+        *,
+        preceding: bool,
+    ) -> Any:
+        if not candidates:
+            side = "preceding Pick" if preceding else "following Place"
+            raise TargetSelectionFailure(
+                f"handoff task lacks a matching {side}"
+            )
+        reference_group = group_id(handoff_stage)
+        grouped = [
+            (index, stage, group_id(stage))
+            for index, stage in candidates
+            if group_id(stage) is not None
+        ]
+        if reference_group is not None and grouped:
+            eligible = [
+                item
+                for item in grouped
+                if (
+                    item[2] <= reference_group
+                    if preceding
+                    else item[2] >= reference_group
+                )
+            ]
+            if not eligible:
+                raise TargetSelectionFailure(
+                    "handoff stage groups violate procedural order"
+                )
+            selected_group = (
+                max(item[2] for item in eligible)
+                if preceding
+                else min(item[2] for item in eligible)
+            )
+            nearest = [
+                item for item in eligible if item[2] == selected_group
+            ]
+            if len(nearest) != 1:
+                raise TargetSelectionFailure(
+                    "handoff stage group is structurally ambiguous"
+                )
+            return nearest[0][1]
+        return candidates[-1 if preceding else 0][1]
+
+    chains: list[tuple[Any, Any, Any]] = []
+    for handoff_index, handoff in handoffs:
+        giver = str(handoff.from_arm).strip().lower()
+        receiver = str(handoff.to_arm).strip().lower()
+        if {giver, receiver} != {"left", "right"}:
+            raise TargetSelectionFailure(
+                "handoff requires distinct left/right giver and receiver arms"
+            )
+        pick_candidates = [
+            (index, stage)
+            for index, stage in enumerate(stages[:handoff_index])
+            if getattr(stage, "target", None) == handoff.object
+            and normalized_arm(stage) in {None, giver}
+        ]
+        place_candidates = [
+            (index, stage)
+            for index, stage in enumerate(
+                stages[handoff_index + 1 :],
+                start=handoff_index + 1,
+            )
+            if getattr(stage, "object", None) == handoff.object
+            and (
+                hasattr(stage, "destination")
+                or hasattr(stage, "target_pose")
+            )
+            and normalized_arm(stage) in {None, receiver}
+        ]
+        pick = nearest_grouped(
+            pick_candidates, handoff, preceding=True
+        )
+        place = nearest_grouped(
+            place_candidates, handoff, preceding=False
+        )
+        chains.append((pick, handoff, place))
+    if len(chains) != 1:
+        raise TargetSelectionFailure(
+            "task plan contains multiple structural handoff chains"
+        )
+    return chains[0]
+
+
 class RoboTwinHeuristicRuntime:
     def __init__(
         self,
@@ -1603,6 +2508,11 @@ class RoboTwinHeuristicRuntime:
             max_waypoints_per_segment=max_waypoints_per_segment,
             gripper_settle_actions=gripper_settle_actions,
         )
+        self.staged_controller = StagedQposActionBuffer(
+            task_env,
+            max_waypoints_per_segment=max_waypoints_per_segment,
+        )
+        self.gripper_settle_actions = int(gripper_settle_actions)
         self.bimanual_controller = BimanualQposActionBuffer(
             task_env,
             gripper_settle_actions=gripper_settle_actions,
@@ -1759,278 +2669,1412 @@ class RoboTwinHeuristicRuntime:
             for key, value in trace.items()
         }
 
-    def _plan_bimanual_arm(
+    @staticmethod
+    def _handoff_stages(
+        task_env: Any,
+    ) -> tuple[Pick, Handoff, Place] | None:
+        task_plan = getattr(task_env, "heuristic_task_plan", None)
+        stages = tuple(getattr(task_plan, "stages", ()))
+        return _structural_handoff_stages(stages)
+
+    @staticmethod
+    def _single_arm_place_stages(task_env: Any) -> tuple[Pick, Place] | None:
+        task_plan = getattr(task_env, "heuristic_task_plan", None)
+        stages = tuple(getattr(task_plan, "stages", ()))
+        # eval_policy attaches the plan through ``policy.heuristic_baseline``
+        # while the deploy package can be imported as ``heuristic_baseline``.
+        # Match the frozen stage protocol structurally so duplicate module
+        # namespaces cannot make otherwise-identical dataclasses fail here.
+        if (
+            len(stages) == 2
+            and getattr(stages[0], "target", None) is not None
+            and getattr(stages[1], "object", None) == stages[0].target
+            and (
+                getattr(stages[1], "destination", None) is not None
+                or getattr(stages[1], "target_pose", None) is not None
+            )
+            and hasattr(stages[1], "preplace_offset_m")
+            and hasattr(stages[1], "place_offset_m")
+        ):
+            return stages[0], stages[1]
+        return None
+
+
+    @staticmethod
+    def _grouped_bimanual_place_stages(
+        task_env: Any,
+    ) -> tuple[tuple[Pick, Place], tuple[Pick, Place]] | None:
+        """Return two structurally grouped Pick/Place chains, independent of names."""
+        task_plan = getattr(task_env, "heuristic_task_plan", None)
+        stages = tuple(getattr(task_plan, "stages", ()))
+        picks = [
+            stage
+            for stage in stages
+            if getattr(stage, "target", None) is not None
+        ]
+        places = [
+            stage
+            for stage in stages
+            if getattr(stage, "object", None) is not None
+            and hasattr(stage, "preplace_offset_m")
+            and hasattr(stage, "place_offset_m")
+        ]
+        if len(picks) != 2 or len(places) != 2 or len(stages) != 4:
+            return None
+        if (
+            getattr(picks[0], "group_id", None)
+            != getattr(picks[1], "group_id", None)
+            or getattr(places[0], "group_id", None)
+            != getattr(places[1], "group_id", None)
+        ):
+            return None
+        place_by_object = {place.object: place for place in places}
+        if len(place_by_object) != 2 or set(place_by_object) != {
+            pick.target for pick in picks
+        }:
+            return None
+        pairs = tuple((pick, place_by_object[pick.target]) for pick in picks)
+        arms = []
+        for pick, place in pairs:
+            pick_arm = str(getattr(pick, "arm", "")).strip().lower()
+            place_arm = str(getattr(place, "arm", "")).strip().lower()
+            if pick_arm not in {"left", "right"}:
+                return None
+            if place_arm in {"left", "right"} and place_arm != pick_arm:
+                raise TargetSelectionFailure(
+                    "grouped Pick and Place stages assign different arms"
+                )
+            arms.append(pick_arm)
+        if set(arms) != {"left", "right"}:
+            raise TargetSelectionFailure(
+                "grouped bimanual stages require one left and one right arm"
+            )
+        return tuple(
+            pair
+            for _, pair in sorted(
+                zip(arms, pairs), key=lambda item: item[0]
+            )
+        )
+
+    def _place_reference_poses(
+        self,
+        target: ObjectState,
+        place: Place,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        tracked = self.task_env.get_tracked_objects() or {}
+        if target.name not in tracked:
+            raise TargetSelectionFailure(
+                f"placement source {target.name!r} is not tracked"
+            )
+        actor = tracked[target.name]
+        if place.object_functional_point_id is None:
+            source_reference = target.world_pose
+        else:
+            source_reference = actor.get_functional_point(
+                place.object_functional_point_id, "matrix"
+            )
+            if source_reference is None:
+                raise TargetSelectionFailure(
+                    f"{target.name!r} lacks functional point "
+                    f"{place.object_functional_point_id}"
+                )
+
+        explicit_target = getattr(place, "target_pose", None)
+        if explicit_target is not None:
+            destination_reference = explicit_target
+        else:
+            destination_name = getattr(place, "destination", None)
+            if destination_name is None or destination_name not in tracked:
+                raise TargetSelectionFailure(
+                    "placement requires an explicit target pose or tracked "
+                    f"destination; got {destination_name!r}"
+                )
+            destination = tracked[destination_name]
+            if place.destination_functional_point_id is None:
+                destination_reference = destination.get_pose()
+            else:
+                destination_reference = destination.get_functional_point(
+                    place.destination_functional_point_id, "matrix"
+                )
+                if destination_reference is None:
+                    raise TargetSelectionFailure(
+                        f"{destination_name!r} lacks functional point "
+                        f"{place.destination_functional_point_id}"
+                    )
+        return (
+            _pose_matrix(source_reference, name="source_reference"),
+            _pose_matrix(destination_reference, name="destination_reference"),
+        )
+
+    def _plan_single_arm_place(
         self,
         scene: SceneObservation,
         target: ObjectState,
         *,
+        pick: Pick,
+        place: Place,
         arm: str,
         arm_source: str,
-        actor: Any,
-    ) -> tuple[list[_BimanualArmPlan], list[GraspCandidate], dict[str, Any]]:
+        plan_limit: int = 1,
+    ) -> tuple[
+        list[_SingleArmPlacePlan],
+        list[GraspCandidate],
+        dict[str, Any],
+        dict[str, int],
+    ]:
+        if plan_limit < 1:
+            raise ValueError("plan_limit must be positive")
+        source_reference, destination_reference = (
+            self._place_reference_poses(target, place)
+        )
+        pregrasp_offset = (
+            self.config.pregrasp_offset_m
+            if pick.pregrasp_offset_m is None
+            else float(pick.pregrasp_offset_m)
+        )
+        grasp_offset = float(getattr(pick, "grasp_offset_m", 0.0))
+        gripper_target = float(getattr(pick, "gripper_target", 0.0))
+        postgrasp = np.asarray(
+            pick.postgrasp_displacement
+            if pick.postgrasp_displacement is not None
+            else (0.0, 0.0, self.config.retreat_offset_m),
+            dtype=np.float64,
+        )
+        preplace_offset = float(place.preplace_offset_m)
+        place_offset = float(place.place_offset_m)
+        if (
+            pregrasp_offset < 0.0
+            or grasp_offset < 0.0
+            or grasp_offset > pregrasp_offset
+            or not 0.0 <= gripper_target <= 1.0
+            or postgrasp.shape != (3,)
+            or not np.all(np.isfinite(postgrasp))
+            or not np.isfinite(preplace_offset)
+            or not np.isfinite(place_offset)
+            or preplace_offset < place_offset
+            or place_offset < 0.0
+        ):
+            raise ValueError("invalid structured pick/place offsets")
+
         ranker = ConfidenceRankedGrasps(
             self.grasps, min_confidence=self.config.min_confidence
         )
         ranked = ranker.propose(scene, target)[: self.config.max_candidates]
-        trace = self._copy_backend_trace(getattr(self.backend, "last_trace", {}))
-        plans: list[_BimanualArmPlan] = []
-        failure_counts = {
-            "pregrasp": 0,
-            "grasp": 0,
-            "lift": 0,
-            "robot_facing": 0,
-            "jaw_axis": 0,
-            "jaw_width": 0,
-            "transport": 0,
+        trace = self._copy_backend_trace(
+            getattr(self.backend, "last_trace", {})
+        )
+        failures = {
+            stage: 0
+            for stage in (
+                "pregrasp", "grasp", "lift", "robot_facing", "place_facing",
+                "narrow_facing",
+                "jaw_axis", "jaw_width", "preplace", "place",
+                "retreat"
+            )
         }
+        ee_getter = getattr(self.task_env.robot, f"get_{arm}_ee_pose")
+        current_ee_position = np.asarray(
+            ee_getter(), dtype=np.float64
+        )[:3]
         elongated_axis = _elongated_object_axis(scene, target)
 
-        functional_pose = actor.get_functional_point(0, "matrix")
-        desired_pose_name = f"{arm}_target_pose"
-        if not hasattr(self.task_env, desired_pose_name):
-            raise TargetSelectionFailure(
-                f"bimanual task lacks RoboTwin {desired_pose_name}"
-            )
-        desired_functional_pose = getattr(self.task_env, desired_pose_name)
-        ee_getter = getattr(self.task_env.robot, f"get_{arm}_ee_pose")
-        current_ee_position = np.asarray(ee_getter(), dtype=np.float64)[:3]
+        variants: list[tuple[GraspCandidate, str]] = []
+        for candidate_index, raw_candidate in enumerate(ranked):
+            variants.append((raw_candidate, "m2t2"))
+            try:
+                adjusted_pose = _robot_facing_grasp_pose(
+                    raw_candidate.world_grasp_pose,
+                    current_ee_position,
+                    self.ik.grasp_to_robotwin,
+                )
+            except ValueError:
+                failures["robot_facing"] += 1
+            else:
+                variants.append((
+                    GraspCandidate(
+                        adjusted_pose,
+                        float(raw_candidate.confidence),
+                        raw_candidate.object_name,
+                    ),
+                    "robot_facing",
+                ))
+            try:
+                raw_command = (
+                    np.asarray(raw_candidate.world_grasp_pose)
+                    @ self.ik.grasp_to_robotwin
+                )
+                variant_reference = _aligned_place_reference_pose(
+                    source_reference,
+                    destination_reference,
+                    raw_command,
+                    arm=arm,
+                    constrain=place.constrain,
+                    z_transform=place.object_functional_point_id is None,
+                )
+                variant_object = _desired_object_pose(
+                    target.world_pose,
+                    source_reference,
+                    variant_reference,
+                )
+                adjusted_pose = _place_facing_grasp_pose(
+                    raw_candidate.world_grasp_pose,
+                    target.world_pose,
+                    variant_object,
+                    current_ee_position,
+                    self.ik.grasp_to_robotwin,
+                )
+            except ValueError:
+                failures["place_facing"] += 1
+            else:
+                variants.append((
+                    GraspCandidate(
+                        adjusted_pose,
+                        float(raw_candidate.confidence),
+                        raw_candidate.object_name,
+                    ),
+                    "place_facing",
+                ))
+                if candidate_index < 16:
+                    try:
+                        canonical_approach = t3d.quaternions.quat2mat(
+                            CANONICAL_COMMAND_QUATERNIONS[arm]
+                        )[:, 0]
+                        narrow_axis = _target_narrow_axis(
+                            scene,
+                            target,
+                            variant_object,
+                            canonical_approach,
+                        )
+                        narrow_poses = (
+                            ()
+                            if narrow_axis is None
+                            else _narrow_axis_grasp_poses(
+                                raw_candidate.world_grasp_pose,
+                                target.world_pose,
+                                variant_object,
+                                current_ee_position,
+                                self.ik.grasp_to_robotwin,
+                                narrow_axis,
+                                canonical_approach,
+                                max_approaches=10,
+                            )
+                        )
+                    except ValueError:
+                        failures["narrow_facing"] += 1
+                    else:
+                        if not narrow_poses:
+                            failures["narrow_facing"] += 1
+                        for narrow_pose in narrow_poses:
+                            variants.append((
+                                GraspCandidate(
+                                    narrow_pose,
+                                    float(raw_candidate.confidence),
+                                    raw_candidate.object_name,
+                                ),
+                                "narrow_facing",
+                            ))
 
-        for candidate in ranked:
-            grasp_pose = np.asarray(
+        plans: list[_SingleArmPlacePlan] = []
+        for candidate, variant_source in variants:
+            raw_grasp_pose = np.asarray(
                 candidate.world_grasp_pose, dtype=np.float64
             )
-            pregrasp_pose = grasp_pose.copy()
+            grasp_pose = raw_grasp_pose.copy()
+            grasp_pose[:3, 3] -= raw_grasp_pose[:3, 2] * grasp_offset
+            pregrasp_pose = raw_grasp_pose.copy()
             pregrasp_pose[:3, 3] -= (
-                pregrasp_pose[:3, 2] * self.config.pregrasp_offset_m
+                raw_grasp_pose[:3, 2] * pregrasp_offset
             )
             lift_pose = grasp_pose.copy()
-            lift_pose[2, 3] += self.bimanual_lift_m
+            lift_pose[:3, 3] += postgrasp
             solutions = [
                 self.ik.solve(arm, pose)
                 for pose in (pregrasp_pose, grasp_pose, lift_pose)
             ]
             if any(solution is None for solution in solutions):
                 failed_stage = next(
-                    stage
-                    for stage, solution in zip(
+                    stage for stage, solution in zip(
                         ("pregrasp", "grasp", "lift"), solutions
                     )
                     if solution is None
                 )
-                failure_counts[failed_stage] += 1
-                grasp_pose = _robot_facing_grasp_pose(
-                    candidate.world_grasp_pose,
-                    current_ee_position,
-                    self.ik.grasp_to_robotwin,
+                failures[failed_stage] += 1
+                if variant_source != "m2t2":
+                    failures[variant_source] += 1
+                continue
+
+            grasp_paths = self.ik.completed_paths
+            grasp_targets = self.ik.completed_command_targets
+            if len(grasp_paths) != 3 or len(grasp_targets) != 3:
+                raise RuntimeError(
+                    "Mink omitted a completed three-stage grasp plan"
                 )
-                pregrasp_pose = grasp_pose.copy()
-                pregrasp_pose[:3, 3] -= (
-                    pregrasp_pose[:3, 2] * self.config.pregrasp_offset_m
-                )
-                lift_pose = grasp_pose.copy()
-                lift_pose[2, 3] += self.bimanual_lift_m
-                solutions = [
-                    self.ik.solve(arm, pose)
-                    for pose in (pregrasp_pose, grasp_pose, lift_pose)
-                ]
-                if any(solution is None for solution in solutions):
-                    failure_counts["robot_facing"] += 1
-                    continue
-                candidate = GraspCandidate(
-                    grasp_pose,
-                    float(candidate.confidence),
-                    candidate.object_name,
-                )
-                orientation_source = "robot_facing_fallback"
-            else:
-                orientation_source = "m2t2"
-            paths = self.ik.completed_paths
-            command_targets = self.ik.completed_command_targets
-            if len(paths) != 3 or len(command_targets) != 3:
-                raise RuntimeError("Mink omitted a completed bimanual grasp path")
+            jaw_axis = grasp_targets[1][:3, 1]
             if (
                 elongated_axis is not None
-                and abs(
-                    float(
-                        np.dot(command_targets[1][:3, 1], elongated_axis)
-                    )
-                )
+                and abs(float(np.dot(jaw_axis, elongated_axis)))
                 > self.bimanual_max_jaw_axis_alignment
             ):
-                failure_counts["jaw_axis"] += 1
+                failures["jaw_axis"] += 1
                 continue
             target_width = _target_width_along_axis(
-                scene, target, command_targets[1][:3, 1]
+                scene, target, jaw_axis
             )
             if (
                 target_width is not None
                 and target_width > self.bimanual_max_target_width_m
             ):
-                failure_counts["jaw_width"] += 1
+                failures["jaw_width"] += 1
                 continue
-
-            transport_command = _rigid_transport_command_pose(
+            desired_reference = _aligned_place_reference_pose(
+                source_reference,
+                destination_reference,
+                grasp_targets[1],
+                arm=arm,
+                constrain=place.constrain,
+                z_transform=place.object_functional_point_id is None,
+            )
+            desired_object, desired_gripper = _rigid_place_command_pose(
                 target.world_pose,
-                functional_pose,
-                command_targets[1],
-                desired_functional_pose,
+                source_reference,
+                grasp_targets[1],
+                desired_reference,
             )
-            followup = self.ik.solve_command_target(
-                arm,
-                transport_command,
-                np.asarray(solutions[2], dtype=np.float64),
+            offset_axis = _place_offset_axis(
+                place.preplace_axis,
+                desired_object,
+                desired_gripper,
+                destination_reference,
             )
-            if followup is None:
-                failure_counts["transport"] += 1
+            preplace_command = desired_gripper.copy()
+            preplace_command[:3, 3] -= preplace_offset * offset_axis
+            place_command = desired_gripper.copy()
+            place_command[:3, 3] -= place_offset * offset_axis
+            retreat_command = preplace_command.copy()
+
+            followup_paths: list[np.ndarray] = []
+            followup_targets: list[np.ndarray] = []
+            start = np.asarray(solutions[2], dtype=np.float64)
+            complete = True
+            followup_commands = [
+                ("preplace", preplace_command),
+                ("place", place_command),
+            ]
+            if place.release:
+                followup_commands.append(("retreat", retreat_command))
+            for stage, command in followup_commands:
+                before_ik_failures = dict(self.ik.failures)
+                result = self.ik.solve_command_target(arm, command, start)
+                if result is None:
+                    if stage == "preplace" and failures[stage] == 0:
+                        print(
+                            "[heuristic] first rejected preplace command="
+                            + np.array2string(command, precision=3)
+                        )
+                    failures[stage] += 1
+                    for reason, count in self.ik.failures.items():
+                        delta = int(count) - int(
+                            before_ik_failures.get(reason, 0)
+                        )
+                        if delta > 0:
+                            key = f"{stage}_{reason}"
+                            failures[key] = failures.get(key, 0) + delta
+                    complete = False
+                    break
+                start, path, accepted = result
+                followup_paths.append(path)
+                followup_targets.append(accepted)
+            if not complete:
                 continue
-            _, transport_path, accepted_transport = followup
             plans.append(
-                _BimanualArmPlan(
+                _SingleArmPlacePlan(
                     arm=arm,
                     target_name=target.name,
                     arm_source=arm_source,
                     candidate=candidate,
-                    paths=tuple(paths) + (transport_path,),
-                    command_targets=tuple(command_targets)
-                    + (accepted_transport,),
-                    orientation_source=orientation_source,
+                    paths=tuple(grasp_paths) + tuple(followup_paths),
+                    command_targets=tuple(grasp_targets)
+                    + tuple(followup_targets),
+                    desired_object_pose=desired_object,
                 )
             )
-            if len(plans) >= self.bimanual_max_plans_per_arm:
+            if len(plans) >= plan_limit:
                 break
-        print(
-            f"[heuristic] bimanual IK target={target.name} arm={arm} "
-            f"orientation_attempts={sum(failure_counts.values()) + len(plans)} "
-            f"feasible={len(plans)} failures={failure_counts}"
-        )
-        return plans, list(ranker.last_candidates), trace
+        return plans, list(ranker.last_candidates), trace, failures
 
-    def _get_bimanual_action(
+    def _get_single_place_action(
         self,
         scene: SceneObservation,
-        target_names: tuple[str, ...],
+        target: ObjectState,
+        *,
+        pick: Pick,
+        place: Place,
+        arm: str,
+        arm_source: str,
     ) -> list[np.ndarray]:
-        if len(target_names) != 2:
-            raise TargetSelectionFailure(
-                "bimanual policy currently requires exactly two targets"
-            )
-        tracked = self.task_env.get_tracked_objects() or {}
-        targets_by_arm: dict[str, ObjectState] = {}
-        actors_by_arm: dict[str, Any] = {}
-        sources_by_arm: dict[str, str] = {}
-        for target_name in target_names:
-            target = self.simulator.object_state(target_name)
-            arm, arm_source = self._select_arm(target)
-            if arm in targets_by_arm:
-                raise TargetSelectionFailure(
-                    f"bimanual arm assignment is ambiguous: both targets use {arm}"
-                )
-            if target_name not in tracked:
-                raise TargetSelectionFailure(
-                    f"bimanual target {target_name!r} is not tracked"
-                )
-            targets_by_arm[arm] = target
-            actors_by_arm[arm] = tracked[target_name]
-            sources_by_arm[arm] = arm_source
-            print(
-                f"[heuristic] arm selection target={target_name} arm={arm} "
-                f"source={arm_source}"
-            )
-        if set(targets_by_arm) != {"left", "right"}:
-            raise TargetSelectionFailure(
-                "bimanual targets must resolve to one left and one right arm"
-            )
-
-        searches: dict[
-            str,
-            tuple[list[_BimanualArmPlan], list[GraspCandidate], dict[str, Any]],
-        ] = {}
-        for arm in ("left", "right"):
-            searches[arm] = self._plan_bimanual_arm(
+        plans, ranked, trace, failures = self._plan_single_arm_place(
+            scene,
+            target,
+            pick=pick,
+            place=place,
+            arm=arm,
+            arm_source=arm_source,
+        )
+        selected = plans[0] if plans else None
+        if selected is None:
+            self._save_grasp_visualization(
                 scene,
-                targets_by_arm[arm],
-                arm=arm,
-                arm_source=sources_by_arm[arm],
-                actor=actors_by_arm[arm],
+                target,
+                ranked,
+                None,
+                arm,
+                raw_trace_override=trace,
+                executed_command_pose_override=None,
+                use_default_executed_pose=False,
+            )
+            raise NoFeasiblePlanFailure(
+                "M2T2/Mink produced no complete atomic placement plan; "
+                f"failures={failures}; ik_failures={self.ik.failures}"
             )
 
-        if not searches["left"][0] or not searches["right"][0]:
-            for arm in ("left", "right"):
-                plans, ranked, trace = searches[arm]
-                self._save_grasp_visualization(
-                    scene,
-                    targets_by_arm[arm],
-                    ranked,
-                    plans[0].candidate if plans else None,
-                    arm,
-                    raw_trace_override=trace,
-                    executed_command_pose_override=(
-                        plans[0].command_targets[1] if plans else None
-                    ),
-                    use_default_executed_pose=False,
+        controller = self.staged_controller
+        controller.reset()
+        names = {arm: target.name}
+        sources = {arm: arm_source}
+        controller.gripper_phase(
+            "open", {arm: 1.0}, 1, names, sources
+        )
+        for phase, index in (("pregrasp", 0), ("grasp", 1)):
+            controller.move_phase(
+                phase,
+                {arm: selected.paths[index]},
+                {arm: selected.command_targets[index]},
+                names,
+                sources,
+            )
+        controller.gripper_phase(
+            "close",
+            {arm: float(getattr(pick, "gripper_target", 0.0))},
+            self.gripper_settle_actions,
+            names,
+            sources,
+        )
+        for phase, index in (
+            ("lift", 2),
+            ("preplace", 3),
+            ("place", 4),
+        ):
+            controller.move_phase(
+                phase,
+                {arm: selected.paths[index]},
+                {arm: selected.command_targets[index]},
+                names,
+                sources,
+            )
+        if place.release:
+            controller.gripper_phase(
+                "open",
+                {arm: 1.0},
+                self.gripper_settle_actions,
+                names,
+                sources,
+            )
+            controller.move_phase(
+                "retreat",
+                {arm: selected.paths[5]},
+                {arm: selected.command_targets[5]},
+                names,
+                sources,
+            )
+        self._action_metadata_override = list(controller.metadata)
+        self._save_grasp_visualization(
+            scene,
+            target,
+            ranked,
+            selected.candidate,
+            arm,
+            raw_trace_override=trace,
+            executed_command_pose_override=selected.command_targets[1],
+            use_default_executed_pose=False,
+        )
+        desired = selected.desired_object_pose
+        print(
+            "[heuristic] placement plan selected "
+            f"target={target.name} destination={place.destination} arm={arm} "
+            f"confidence={selected.candidate.confidence:.3f} "
+            f"desired_xyz={np.array2string(desired[:3, 3], precision=3)}"
+        )
+        return [action.copy() for action in controller.actions]
+
+    def _handoff_reference_poses(
+        self,
+        target: ObjectState,
+        handoff: Handoff,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        tracked = self.task_env.get_tracked_objects() or {}
+        if target.name not in tracked:
+            raise TargetSelectionFailure(
+                f"handoff source {target.name!r} is not tracked"
+            )
+        actor = tracked[target.name]
+        if handoff.object_functional_point_id is None:
+            source_reference = target.world_pose
+        else:
+            source_reference = actor.get_functional_point(
+                handoff.object_functional_point_id, "matrix"
+            )
+            if source_reference is None:
+                raise TargetSelectionFailure(
+                    f"{target.name!r} lacks functional point "
+                    f"{handoff.object_functional_point_id}"
                 )
-            counts = {arm: len(searches[arm][0]) for arm in ("left", "right")}
+        rendezvous = getattr(handoff, "rendezvous_pose", None)
+        if rendezvous is None:
+            pose_attribute = getattr(
+                handoff, "rendezvous_pose_attr", None
+            )
+            if pose_attribute is None or not hasattr(
+                self.task_env, pose_attribute
+            ):
+                raise TargetSelectionFailure(
+                    "handoff stage lacks an explicit rendezvous pose"
+                )
+            rendezvous = getattr(self.task_env, pose_attribute)
+        return (
+            _pose_matrix(source_reference, name="handoff_source_reference"),
+            _pose_matrix(rendezvous, name="handoff_rendezvous_pose"),
+        )
+
+    def _solve_handoff_command_chain(
+        self,
+        arm: str,
+        role: str,
+        stage_commands: tuple[tuple[str, np.ndarray], ...],
+        failures: dict[str, int],
+    ) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]] | None:
+        start = _arm_joint_state(self.task_env, arm)[:-1]
+        paths: list[np.ndarray] = []
+        accepted_targets: list[np.ndarray] = []
+        for stage, command in stage_commands:
+            result = self.ik.solve_command_target(arm, command, start)
+            if result is None:
+                key = f"{role}_{stage}"
+                failures[key] = failures.get(key, 0) + 1
+                return None
+            start, path, accepted = result
+            paths.append(path)
+            accepted_targets.append(accepted)
+        return tuple(paths), tuple(accepted_targets)
+
+    def _plan_handoff_sides(
+        self,
+        scene: SceneObservation,
+        target: ObjectState,
+        *,
+        pick: Pick,
+        handoff: Handoff,
+        place: Place,
+    ) -> tuple[
+        list[_HandoffArmPlan],
+        list[_HandoffArmPlan],
+        list[GraspCandidate],
+        dict[str, Any],
+        dict[str, int],
+        float,
+    ]:
+        giver_arm = str(handoff.from_arm).strip().lower()
+        receiver_arm = str(handoff.to_arm).strip().lower()
+        for stage_arm, expected, label in (
+            (pick.arm, giver_arm, "pick"),
+            (place.arm, receiver_arm, "place"),
+        ):
+            if stage_arm is None:
+                continue
+            normalized = str(stage_arm).strip().lower()
+            if normalized in {"left", "right"} and normalized != expected:
+                raise TargetSelectionFailure(
+                    f"handoff {label} arm differs from its ownership stage"
+                )
+
+        giver_pregrasp_offset = (
+            self.config.pregrasp_offset_m
+            if pick.pregrasp_offset_m is None
+            else float(pick.pregrasp_offset_m)
+        )
+        receiver_pregrasp_offset = float(handoff.pregrasp_offset_m)
+        giver_grasp_offset = float(getattr(pick, "grasp_offset_m", 0.0))
+        receiver_grasp_offset = float(
+            getattr(handoff, "grasp_offset_m", 0.0)
+        )
+        giver_gripper_target = float(
+            getattr(pick, "gripper_target", 0.0)
+        )
+        receiver_gripper_target = float(
+            getattr(handoff, "gripper_target", 0.0)
+        )
+        postgrasp = np.asarray(
+            pick.postgrasp_displacement
+            if pick.postgrasp_displacement is not None
+            else (0.0, 0.0, self.config.retreat_offset_m),
+            dtype=np.float64,
+        )
+        giver_release_retreat = max(
+            giver_pregrasp_offset, float(np.linalg.norm(postgrasp))
+        )
+        preplace_offset = float(place.preplace_offset_m)
+        place_offset = float(place.place_offset_m)
+        if (
+            not all(
+                np.isfinite(value)
+                for value in (
+                    giver_pregrasp_offset,
+                    receiver_pregrasp_offset,
+                    giver_grasp_offset,
+                    receiver_grasp_offset,
+                    giver_gripper_target,
+                    receiver_gripper_target,
+                )
+            )
+            or giver_pregrasp_offset < 0.0
+            or giver_grasp_offset < 0.0
+            or giver_grasp_offset > giver_pregrasp_offset
+            or receiver_pregrasp_offset < 0.0
+            or receiver_grasp_offset < 0.0
+            or receiver_grasp_offset > receiver_pregrasp_offset
+            or not 0.0 <= giver_gripper_target <= 1.0
+            or not 0.0 <= receiver_gripper_target <= 1.0
+            or postgrasp.shape != (3,)
+            or not np.all(np.isfinite(postgrasp))
+            or not np.isfinite(preplace_offset)
+            or not np.isfinite(place_offset)
+            or preplace_offset < place_offset
+            or place_offset < 0.0
+        ):
+            raise ValueError("invalid structured handoff offsets")
+
+        source_reference, rendezvous_reference = (
+            self._handoff_reference_poses(target, handoff)
+        )
+        place_source_reference, destination_reference = (
+            self._place_reference_poses(target, place)
+        )
+        world_object = _pose_matrix(
+            target.world_pose, name="handoff_world_object_pose"
+        )
+        desired_middle_object = _desired_object_pose(
+            world_object, source_reference, rendezvous_reference
+        )
+        object_delta = desired_middle_object @ np.linalg.inv(world_object)
+        predicted_place_source = (
+            object_delta @ place_source_reference
+        )
+
+        ranker = ConfidenceRankedGrasps(
+            self.grasps, min_confidence=self.config.min_confidence
+        )
+        ranked = ranker.propose(scene, target)[: self.config.max_candidates]
+        trace = self._copy_backend_trace(
+            getattr(self.backend, "last_trace", {})
+        )
+        failures: dict[str, int] = {
+            "giver_region": 0,
+            "receiver_region": 0,
+            "pair_separation": 0,
+        }
+
+        world_from_object = np.linalg.inv(world_object)
+
+        target_points = np.asarray(
+            scene.xyz[scene.instance_labels == target.instance_id],
+            dtype=np.float64,
+        )
+        local_target = (
+            target_points @ world_from_object[:3, :3].T
+            + world_from_object[:3, 3]
+            if len(target_points)
+            else np.empty((0, 3), dtype=np.float64)
+        )
+        elongated_axis = _elongated_object_axis(scene, target)
+
+        def current_ee_position(arm: str) -> np.ndarray | None:
+            getter = getattr(self.task_env.robot, f"get_{arm}_ee_pose", None)
+            if getter is None:
+                return None
+            values = np.asarray(getter(), dtype=np.float64)
+            if values.ndim != 1 or len(values) < 3:
+                return None
+            position = values[:3]
+            return position if np.all(np.isfinite(position)) else None
+
+        def grasp_is_feasible(
+            world_grasp_pose: np.ndarray, role: str
+        ) -> bool:
+            command = (
+                np.asarray(world_grasp_pose, dtype=np.float64)
+                @ self.ik.grasp_to_robotwin
+            )
+            if (
+                elongated_axis is not None
+                and abs(float(np.dot(command[:3, 1], elongated_axis)))
+                > self.bimanual_max_jaw_axis_alignment
+            ):
+                key = f"{role}_jaw_axis"
+                failures[key] = failures.get(key, 0) + 1
+                return False
+            width = _target_width_along_axis(
+                scene, target, command[:3, 1]
+            )
+            if (
+                width is not None
+                and width > self.bimanual_max_target_width_m
+            ):
+                key = f"{role}_jaw_width"
+                failures[key] = failures.get(key, 0) + 1
+                return False
+            return True
+
+        giver_ee = current_ee_position(giver_arm)
+        receiver_ee = current_ee_position(receiver_arm)
+
+        def local_reference(
+            world_reference: np.ndarray | None,
+        ) -> np.ndarray | None:
+            if world_reference is None:
+                return None
+            return (
+                world_from_object[:3, :3] @ world_reference
+                + world_from_object[:3, 3]
+            )
+
+        (
+            giver_region,
+            receiver_region,
+            minimum_separation,
+            contact_region_source,
+        ) = _handoff_contact_regions(
+            local_target,
+            getattr(pick, "allowed_contact_points_local", None),
+            getattr(handoff, "allowed_contact_points_local", None),
+            giver_reference_local=local_reference(giver_ee),
+            receiver_reference_local=local_reference(receiver_ee),
+        )
+        classified: dict[
+            str,
+            list[tuple[GraspCandidate, tuple[float, float, float]]],
+        ] = {"giver": [], "receiver": []}
+        for candidate in ranked:
+            tcp = _grasp_command_tcp(
+                candidate.world_grasp_pose, self.ik.grasp_to_robotwin
+            )
+            local_tcp = (
+                world_from_object[:3, :3] @ tcp
+                + world_from_object[:3, 3]
+            )
+            local_contact = tuple(float(value) for value in local_tcp)
+            giver_distance = float(
+                np.min(np.linalg.norm(giver_region - local_tcp, axis=1))
+            )
+            receiver_distance = float(
+                np.min(np.linalg.norm(receiver_region - local_tcp, axis=1))
+            )
+            if giver_distance + 1e-6 < receiver_distance:
+                classified["giver"].append((candidate, local_contact))
+            else:
+                failures["giver_region"] += 1
+            if receiver_distance + 1e-6 < giver_distance:
+                classified["receiver"].append((candidate, local_contact))
+            else:
+                failures["receiver_region"] += 1
+
+        giver_plans: list[_HandoffArmPlan] = []
+        for candidate, local_contact in classified["giver"]:
+            variants = [("m2t2", candidate.world_grasp_pose)]
+            if giver_ee is not None:
+                adjusted = _robot_facing_grasp_pose(
+                    candidate.world_grasp_pose,
+                    giver_ee,
+                    self.ik.grasp_to_robotwin,
+                )
+                if not np.allclose(adjusted, candidate.world_grasp_pose):
+                    variants.append(("robot_facing_fallback", adjusted))
+            for orientation_source, grasp_pose in variants:
+                if not grasp_is_feasible(grasp_pose, "giver"):
+                    continue
+                contact_command = (
+                    np.asarray(grasp_pose, dtype=np.float64)
+                    @ self.ik.grasp_to_robotwin
+                )
+                pregrasp_command = _approach_offset_command_pose(
+                    contact_command, giver_pregrasp_offset
+                )
+                grasp_command = _approach_offset_command_pose(
+                    contact_command, giver_grasp_offset
+                )
+                lift_command = grasp_command.copy()
+                lift_command[:3, 3] += postgrasp
+                _, rendezvous_command = _rigid_place_command_pose(
+                    world_object,
+                    source_reference,
+                    grasp_command,
+                    rendezvous_reference,
+                )
+                retreat_command = _approach_offset_command_pose(
+                    rendezvous_command, giver_release_retreat
+                )
+                chain = self._solve_handoff_command_chain(
+                    giver_arm,
+                    "giver",
+                    (
+                        ("pregrasp", pregrasp_command),
+                        ("grasp", grasp_command),
+                        ("lift", lift_command),
+                        ("transport", rendezvous_command),
+                        ("retreat", retreat_command),
+                    ),
+                    failures,
+                )
+                if chain is None:
+                    continue
+                paths, commands = chain
+                planned_candidate = GraspCandidate(
+                    np.asarray(grasp_pose, dtype=np.float64),
+                    float(candidate.confidence),
+                    candidate.object_name,
+                )
+                giver_plans.append(
+                    _HandoffArmPlan(
+                        arm=giver_arm,
+                        role="giver",
+                        target_name=target.name,
+                        arm_source="robotwin_ground_truth",
+                        candidate=planned_candidate,
+                        paths=paths,
+                        command_targets=commands,
+                        contact_local_point=local_contact,
+                        gripper_target=giver_gripper_target,
+                        orientation_source=orientation_source,
+                    )
+                )
+                break
+            if len(giver_plans) >= self.bimanual_max_plans_per_arm:
+                break
+
+        receiver_plans: list[_HandoffArmPlan] = []
+        for candidate, local_contact in classified["receiver"]:
+            variants = [("m2t2", candidate.world_grasp_pose)]
+            if receiver_ee is not None:
+                adjusted = _place_facing_grasp_pose(
+                    candidate.world_grasp_pose,
+                    world_object,
+                    desired_middle_object,
+                    receiver_ee,
+                    self.ik.grasp_to_robotwin,
+                )
+                if not np.allclose(adjusted, candidate.world_grasp_pose):
+                    variants.append(("robot_facing_fallback", adjusted))
+            for orientation_source, source_grasp_pose in variants:
+                if not grasp_is_feasible(source_grasp_pose, "receiver"):
+                    continue
+                source_contact_command = (
+                    np.asarray(source_grasp_pose, dtype=np.float64)
+                    @ self.ik.grasp_to_robotwin
+                )
+                rendezvous_contact_command = (
+                    object_delta @ source_contact_command
+                )
+                pregrasp_command = _approach_offset_command_pose(
+                    rendezvous_contact_command, receiver_pregrasp_offset
+                )
+                rendezvous_command = _approach_offset_command_pose(
+                    rendezvous_contact_command, receiver_grasp_offset
+                )
+                desired_reference = _aligned_place_reference_pose(
+                    predicted_place_source,
+                    destination_reference,
+                    rendezvous_command,
+                    arm=receiver_arm,
+                    constrain=place.constrain,
+                    z_transform=place.object_functional_point_id is None,
+                )
+                desired_object, desired_gripper = _rigid_place_command_pose(
+                    desired_middle_object,
+                    predicted_place_source,
+                    rendezvous_command,
+                    desired_reference,
+                )
+                offset_axis = _place_offset_axis(
+                    place.preplace_axis,
+                    desired_object,
+                    desired_gripper,
+                    destination_reference,
+                )
+                preplace_command = desired_gripper.copy()
+                preplace_command[:3, 3] -= preplace_offset * offset_axis
+                place_command = desired_gripper.copy()
+                place_command[:3, 3] -= place_offset * offset_axis
+                chain = self._solve_handoff_command_chain(
+                    receiver_arm,
+                    "receiver",
+                    (
+                        ("pregrasp", pregrasp_command),
+                        ("grasp", rendezvous_command),
+                        ("preplace", preplace_command),
+                        ("place", place_command),
+                    ),
+                    failures,
+                )
+                if chain is None:
+                    continue
+                paths, commands = chain
+                planned_candidate = GraspCandidate(
+                    np.asarray(source_grasp_pose, dtype=np.float64),
+                    float(candidate.confidence),
+                    candidate.object_name,
+                )
+                receiver_plans.append(
+                    _HandoffArmPlan(
+                        arm=receiver_arm,
+                        role="receiver",
+                        target_name=target.name,
+                        arm_source="robotwin_ground_truth",
+                        candidate=planned_candidate,
+                        paths=paths,
+                        command_targets=commands,
+                        contact_local_point=local_contact,
+                        gripper_target=receiver_gripper_target,
+                        orientation_source=orientation_source,
+                    )
+                )
+                break
+            if len(receiver_plans) >= self.bimanual_max_plans_per_arm:
+                break
+
+        print(
+            "[heuristic] handoff IK "
+            f"target={target.name} giver={giver_arm}:{len(giver_plans)} "
+            f"receiver={receiver_arm}:{len(receiver_plans)} "
+            f"source_candidates={len(ranked)} "
+            f"contact_regions={contact_region_source} failures={failures}"
+        )
+        return (
+            giver_plans,
+            receiver_plans,
+            list(ranker.last_candidates),
+            trace,
+            failures,
+            minimum_separation,
+        )
+
+    def _build_handoff_action_pair(
+        self,
+        giver: _HandoffArmPlan,
+        receiver: _HandoffArmPlan,
+        *,
+        release: bool,
+    ) -> list[np.ndarray]:
+        if (
+            giver.role != "giver"
+            or receiver.role != "receiver"
+            or giver.arm == receiver.arm
+            or len(giver.paths) != 5
+            or len(receiver.paths) != 4
+            or any(
+                not np.isfinite(plan.gripper_target)
+                or not 0.0 <= plan.gripper_target <= 1.0
+                for plan in (giver, receiver)
+            )
+        ):
+            raise ValueError("invalid giver/receiver handoff plans")
+        controller = self.staged_controller
+        controller.reset()
+        names = {
+            giver.arm: giver.target_name,
+            receiver.arm: receiver.target_name,
+        }
+        sources = {
+            giver.arm: giver.arm_source,
+            receiver.arm: receiver.arm_source,
+        }
+
+        controller.gripper_phase(
+            "open",
+            {giver.arm: 1.0, receiver.arm: 1.0},
+            1,
+            names,
+            sources,
+        )
+
+        def move(phase: str, plan: _HandoffArmPlan, index: int) -> None:
+            controller.move_phase(
+                phase,
+                {plan.arm: plan.paths[index]},
+                {plan.arm: plan.command_targets[index]},
+                names,
+                sources,
+            )
+
+        move("pregrasp", giver, 0)
+        move("grasp", giver, 1)
+        controller.gripper_phase(
+            "close",
+            {giver.arm: giver.gripper_target},
+            self.gripper_settle_actions,
+            names,
+            sources,
+        )
+        move("lift", giver, 2)
+        move("transport", giver, 3)
+        move("pregrasp", receiver, 0)
+        move("grasp", receiver, 1)
+        controller.gripper_phase(
+            "close",
+            {receiver.arm: receiver.gripper_target},
+            self.gripper_settle_actions,
+            names,
+            sources,
+        )
+        controller.gripper_phase(
+            "open",
+            {giver.arm: 1.0},
+            self.gripper_settle_actions,
+            names,
+            sources,
+        )
+        move("retreat", giver, 4)
+        move("preplace", receiver, 2)
+        move("place", receiver, 3)
+        if release:
+            controller.gripper_phase(
+                "open",
+                {receiver.arm: 1.0},
+                self.gripper_settle_actions,
+                names,
+                sources,
+            )
+        return [action.copy() for action in controller.actions]
+
+    def _get_handoff_action(
+        self,
+        scene: SceneObservation,
+        target: ObjectState,
+        *,
+        pick: Pick,
+        handoff: Handoff,
+        place: Place,
+    ) -> list[np.ndarray]:
+        (
+            giver_plans,
+            receiver_plans,
+            ranked,
+            trace,
+            failures,
+            minimum_separation,
+        ) = self._plan_handoff_sides(
+            scene, target, pick=pick, handoff=handoff, place=place
+        )
+        if not giver_plans or not receiver_plans:
+            self._save_grasp_visualization(
+                scene,
+                target,
+                ranked,
+                None,
+                str(handoff.from_arm).strip().lower(),
+                raw_trace_override=trace,
+                executed_command_pose_override=None,
+                use_default_executed_pose=False,
+            )
             raise NoFeasiblePlanFailure(
-                "M2T2/Mink produced no complete atomic bimanual plan; "
-                f"feasible_per_arm={counts}; failures={self.ik.failures}"
+                "M2T2/Mink produced no complete source-only handoff plan; "
+                f"giver={len(giver_plans)} receiver={len(receiver_plans)} "
+                f"failures={failures}; ik_failures={self.ik.failures}"
             )
 
         pairs = [
-            (left, right)
-            for left in searches["left"][0]
-            for right in searches["right"][0]
+            (giver, receiver)
+            for giver in giver_plans
+            for receiver in receiver_plans
+            if float(
+                np.linalg.norm(
+                    np.asarray(giver.contact_local_point)
+                    - np.asarray(receiver.contact_local_point)
+                )
+            )
+            >= minimum_separation
         ]
+        failures["pair_separation"] += (
+            len(giver_plans) * len(receiver_plans) - len(pairs)
+        )
         pairs.sort(
             key=lambda pair: (
-                pair[0].candidate.confidence + pair[1].candidate.confidence
+                pair[0].candidate.confidence
+                + pair[1].candidate.confidence
             ),
             reverse=True,
         )
-        selected_pair: tuple[_BimanualArmPlan, _BimanualArmPlan] | None = None
-        rejected_pairs = 0
+        selected: tuple[_HandoffArmPlan, _HandoffArmPlan] | None = None
         actions: list[np.ndarray] = []
-        for left_plan, right_plan in pairs:
-            candidate_actions = self.bimanual_controller.build(
-                left_plan, right_plan
+        collision_rejections = 0
+        for giver, receiver in pairs:
+            candidate_actions = self._build_handoff_action_pair(
+                giver, receiver, release=place.release
             )
             if self.ik.full_robot_path_has_self_collision(
                 candidate_actions,
                 max_joint_step_rad=self.bimanual_collision_step_rad,
             ):
-                rejected_pairs += 1
+                collision_rejections += 1
                 continue
-            selected_pair = (left_plan, right_plan)
+            selected = giver, receiver
+            actions = candidate_actions
+            break
+        if selected is None:
+            raise NoFeasiblePlanFailure(
+                "all confidence-ranked separated-region handoff pairs are "
+                "infeasible; "
+                f"separation_rejections={failures['pair_separation']} "
+                f"collision_rejections={collision_rejections}"
+            )
+
+        self._action_metadata_override = list(
+            self.staged_controller.metadata
+        )
+        giver, receiver = selected
+        for plan in selected:
+            self._save_grasp_visualization(
+                scene,
+                target,
+                ranked,
+                plan.candidate,
+                plan.arm,
+                raw_trace_override=trace,
+                executed_command_pose_override=plan.command_targets[1],
+                use_default_executed_pose=False,
+            )
+        print(
+            "[heuristic] handoff plan selected "
+            f"giver={giver.arm} conf={giver.candidate.confidence:.3f} "
+            f"contact={giver.contact_local_point} receiver={receiver.arm} "
+            f"conf={receiver.candidate.confidence:.3f} "
+            f"contact={receiver.contact_local_point} "
+            f"orientation_sources={giver.orientation_source}/"
+            f"{receiver.orientation_source} "
+            f"collision_rejections={collision_rejections}"
+        )
+        return actions
+
+    def _get_grouped_bimanual_place_action(
+        self,
+        scene: SceneObservation,
+        target_names: tuple[str, ...],
+        stage_pairs: tuple[tuple[Pick, Place], tuple[Pick, Place]],
+    ) -> list[np.ndarray]:
+        """Select a collision-free pair of recorded Pick/Place chains."""
+        if {pick.target for pick, _ in stage_pairs} != set(target_names):
+            raise TargetSelectionFailure(
+                "grouped Pick targets differ from segmented manipulation targets"
+            )
+
+        records: dict[str, tuple[Any, ...]] = {}
+        for pick, place in stage_pairs:
+            target = self.simulator.object_state(pick.target)
+            arm, arm_source = self._select_arm(target)
+            expected_arm = str(pick.arm).strip().lower()
+            if arm != expected_arm:
+                raise TargetSelectionFailure(
+                    "recorded bimanual Pick arm differs from selected arm"
+                )
+            plans, ranked, trace, failures = self._plan_single_arm_place(
+                scene,
+                target,
+                pick=pick,
+                place=place,
+                arm=arm,
+                arm_source=arm_source,
+                plan_limit=self.bimanual_max_plans_per_arm,
+            )
+            if not plans:
+                self._save_grasp_visualization(
+                    scene,
+                    target,
+                    ranked,
+                    None,
+                    arm,
+                    raw_trace_override=trace,
+                    executed_command_pose_override=None,
+                    use_default_executed_pose=False,
+                )
+                raise NoFeasiblePlanFailure(
+                    "M2T2/Mink produced no complete grouped bimanual "
+                    f"placement plan for arm={arm}; failures={failures}; "
+                    f"ik_failures={self.ik.failures}"
+                )
+            if arm in records:
+                raise TargetSelectionFailure(
+                    f"grouped bimanual plan assigns multiple objects to {arm}"
+                )
+            records[arm] = (
+                target,
+                pick,
+                place,
+                plans,
+                ranked,
+                trace,
+            )
+        if set(records) != {"left", "right"}:
+            raise TargetSelectionFailure(
+                "grouped bimanual plan requires one chain per arm"
+            )
+
+        names = {arm: records[arm][0].name for arm in records}
+        sources = {
+            arm: records[arm][3][0].arm_source for arm in records
+        }
+
+        def compose(
+            selected: dict[str, _SingleArmPlacePlan],
+        ) -> list[np.ndarray]:
+            controller = self.staged_controller
+            controller.reset()
+            controller.gripper_phase(
+                "open",
+                {arm: 1.0 for arm in selected},
+                1,
+                names,
+                sources,
+            )
+            for phase, index in (("pregrasp", 0), ("grasp", 1)):
+                controller.move_phase(
+                    phase,
+                    {
+                        arm: selected[arm].paths[index]
+                        for arm in selected
+                    },
+                    {
+                        arm: selected[arm].command_targets[index]
+                        for arm in selected
+                    },
+                    names,
+                    sources,
+                )
+            controller.gripper_phase(
+                "close",
+                {
+                    arm: float(records[arm][1].gripper_target)
+                    for arm in selected
+                },
+                self.gripper_settle_actions,
+                names,
+                sources,
+            )
+            for phase, index in (
+                ("lift", 2),
+                ("preplace", 3),
+                ("place", 4),
+            ):
+                controller.move_phase(
+                    phase,
+                    {
+                        arm: selected[arm].paths[index]
+                        for arm in selected
+                    },
+                    {
+                        arm: selected[arm].command_targets[index]
+                        for arm in selected
+                    },
+                    names,
+                    sources,
+                )
+            release_arms = {
+                arm for arm in selected if records[arm][2].release
+            }
+            if release_arms:
+                controller.gripper_phase(
+                    "open",
+                    {arm: 1.0 for arm in release_arms},
+                    self.gripper_settle_actions,
+                    names,
+                    sources,
+                )
+                controller.move_phase(
+                    "retreat",
+                    {
+                        arm: selected[arm].paths[5]
+                        for arm in release_arms
+                    },
+                    {
+                        arm: selected[arm].command_targets[5]
+                        for arm in release_arms
+                    },
+                    names,
+                    sources,
+                )
+            return [action.copy() for action in controller.actions]
+
+        pairs = [
+            (left, right)
+            for left in records["left"][3]
+            for right in records["right"][3]
+        ]
+        pairs.sort(
+            key=lambda pair: (
+                pair[0].candidate.confidence
+                + pair[1].candidate.confidence
+            ),
+            reverse=True,
+        )
+        selected_pair: tuple[
+            _SingleArmPlacePlan, _SingleArmPlacePlan
+        ] | None = None
+        actions: list[np.ndarray] = []
+        collision_rejections = 0
+        for left, right in pairs:
+            candidate_actions = compose({"left": left, "right": right})
+            if self.ik.full_robot_path_has_self_collision(
+                candidate_actions,
+                max_joint_step_rad=self.bimanual_collision_step_rad,
+            ):
+                collision_rejections += 1
+                continue
+            selected_pair = left, right
             actions = candidate_actions
             break
         if selected_pair is None:
             raise NoFeasiblePlanFailure(
-                "all confidence-ranked bimanual grasp pairs self-collide; "
-                f"rejected_pairs={rejected_pairs}"
+                "all confidence-ranked grouped bimanual placement pairs "
+                f"collide; rejected_pairs={collision_rejections}"
             )
 
-        self._action_metadata_override = list(self.bimanual_controller.metadata)
-        for arm, selected in zip(("left", "right"), selected_pair):
-            _, ranked, trace = searches[arm]
+        selected = {
+            "left": selected_pair[0],
+            "right": selected_pair[1],
+        }
+        self._action_metadata_override = list(
+            self.staged_controller.metadata
+        )
+        for arm in ("left", "right"):
+            target, _, _, _, ranked, trace = records[arm]
+            plan = selected[arm]
             self._save_grasp_visualization(
                 scene,
-                targets_by_arm[arm],
+                target,
                 ranked,
-                selected.candidate,
+                plan.candidate,
                 arm,
                 raw_trace_override=trace,
-                executed_command_pose_override=selected.command_targets[1],
+                executed_command_pose_override=plan.command_targets[1],
                 use_default_executed_pose=False,
             )
         print(
-            "[heuristic] bimanual plan selected "
-            f"left_conf={selected_pair[0].candidate.confidence:.3f} "
-            f"right_conf={selected_pair[1].candidate.confidence:.3f} "
-            f"orientation_sources="
-            f"{selected_pair[0].orientation_source}/"
-            f"{selected_pair[1].orientation_source} "
-            f"pair_collision_rejections={rejected_pairs}"
+            "[heuristic] grouped bimanual placement selected "
+            + " ".join(
+                f"{arm}_target={records[arm][0].name} "
+                f"{arm}_confidence={selected[arm].candidate.confidence:.3f}"
+                for arm in ("left", "right")
+            )
+            + f" collision_rejections={collision_rejections}"
         )
         return actions
+
 
     @property
     def action_metadata(self) -> list[dict[str, Any]]:
@@ -2054,7 +4098,17 @@ class RoboTwinHeuristicRuntime:
         target_names = self._target_names(scene)
         if len(target_names) == 2:
             self.ik.reset_stats()
-            return self._get_bimanual_action(scene, target_names)
+            grouped_stages = self._grouped_bimanual_place_stages(
+                self.task_env
+            )
+            if grouped_stages is None:
+                raise TargetSelectionFailure(
+                    "two-target manipulation requires two recorded, grouped "
+                    "Pick/Place chains"
+                )
+            return self._get_grouped_bimanual_place_action(
+                scene, target_names, grouped_stages
+            )
         if len(target_names) != 1:
             raise TargetSelectionFailure(
                 f"unsupported manipulation target count: {len(target_names)}"
@@ -2069,6 +4123,45 @@ class RoboTwinHeuristicRuntime:
 
         self.controller.reset()
         self.ik.reset_stats()
+        handoff_stages = self._handoff_stages(self.task_env)
+        if handoff_stages is not None:
+            pick, handoff, place = handoff_stages
+            if pick.target != target_name:
+                raise TargetSelectionFailure(
+                    "structured handoff source does not match M2T2 target: "
+                    f"{pick.target!r} != {target_name!r}"
+                )
+            return self._get_handoff_action(
+                scene,
+                target,
+                pick=pick,
+                handoff=handoff,
+                place=place,
+            )
+        place_stages = self._single_arm_place_stages(self.task_env)
+        if place_stages is not None:
+            pick, place = place_stages
+            if pick.target != target_name:
+                raise TargetSelectionFailure(
+                    "structured place source does not match M2T2 target: "
+                    f"{pick.target!r} != {target_name!r}"
+                )
+            if (
+                place.arm is not None
+                and str(place.arm).strip().lower() in {"left", "right"}
+                and str(place.arm).strip().lower() != arm
+            ):
+                raise TargetSelectionFailure(
+                    "structured place arm differs from selected grasp arm"
+                )
+            return self._get_single_place_action(
+                scene,
+                target,
+                pick=pick,
+                place=place,
+                arm=arm,
+                arm_source=arm_source,
+            )
         ranker = ConfidenceRankedGrasps(
             self.grasps, min_confidence=self.config.min_confidence
         )
@@ -2109,6 +4202,9 @@ class RoboTwinHeuristicRuntime:
         self._grasp_attempted = False
         self._action_metadata_override = None
         self.controller.reset()
+        staged_controller = getattr(self, "staged_controller", None)
+        if staged_controller is not None:
+            staged_controller.reset()
         self.bimanual_controller.reset()
         self.ik.reset_stats()
         self.backend.reset(int(getattr(self.task_env, "episode_seed", 0)))

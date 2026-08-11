@@ -215,6 +215,7 @@ def eval_policy(task_name,
     suc_test_seed_list = []
 
     policy_name = args["policy_name"]
+    is_heuristic_policy = policy_name == "heuristic_baseline"
     eval_func = eval_function_decorator(policy_name, "eval")
     reset_func = eval_function_decorator(policy_name, "reset_model")
 
@@ -234,10 +235,18 @@ def eval_policy(task_name,
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
+        procedural_trace = ()
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-                episode_info = TASK_ENV.play_once()
+                if is_heuristic_policy:
+                    from policy.heuristic_baseline.task_plan import ProceduralTaskRecorder
+
+                    with ProceduralTaskRecorder(TASK_ENV) as procedure_recorder:
+                        episode_info = TASK_ENV.play_once()
+                    procedural_trace = procedure_recorder.trace
+                else:
+                    episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
             except UnStableError as e:
                 # print(" -------------")
@@ -269,13 +278,17 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        # Preserve the expert task annotation for policies that derive explicit
-        # manipulation targets from {A}, {B}, and {a}.
-        TASK_ENV.heuristic_task_info = dict(episode_info["info"])
-        from policy.heuristic_baseline.task_plan import task_plan_from_task
-        TASK_ENV.heuristic_task_plan = task_plan_from_task(
-            TASK_ENV, args["task_name"], TASK_ENV.heuristic_task_info
-        )
+        if is_heuristic_policy:
+            # Replay the same-seed expert's procedural calls as a structured
+            # plan. The trace contains immutable actor names, poses, arms, and
+            # offsets; no task-name or language-metadata adapter is involved.
+            TASK_ENV.heuristic_task_info = dict(episode_info["info"])
+            TASK_ENV.heuristic_procedural_trace = procedural_trace
+            from policy.heuristic_baseline.task_plan import task_plan_from_trace
+
+            TASK_ENV.heuristic_task_plan = task_plan_from_trace(
+                TASK_ENV, args["task_name"], procedural_trace
+            )
         episode_info_list = [episode_info["info"]]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
         instruction = np.random.choice(results[0][instruction_type])

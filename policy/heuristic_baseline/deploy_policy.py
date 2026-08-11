@@ -13,9 +13,19 @@ from .model import HeuristicPolicy
 from .observation import encode_obs
 
 _MOTION_ENDPOINT_PHASES = frozenset(
-    {"pregrasp", "grasp", "retreat", "lift", "transport", "place"}
+    {
+        "pregrasp",
+        "grasp",
+        "retreat",
+        "lift",
+        "transport",
+        "preplace",
+        "place",
+    }
 )
-_POST_CLOSE_MOTION_PHASES = frozenset({"retreat", "lift", "transport", "place"})
+_POST_CLOSE_MOTION_PHASES = frozenset(
+    {"retreat", "lift", "transport", "preplace", "place"}
+)
 _ARM_NAMES = ("left", "right")
 
 
@@ -27,6 +37,61 @@ def _metadata_arms(metadata: dict[str, Any]) -> tuple[str, ...]:
     if arm in _ARM_NAMES:
         return (arm,)
     return ()
+
+
+def _gripper_phase_arms(
+    metadata: dict[str, Any], phase: str
+) -> tuple[str, ...]:
+    """Return only arms whose gripper target agrees with this phase.
+
+    Sequential handoff actions still contain a full 14-D qpos command. A
+    metadata record may therefore describe both arms while changing only one
+    gripper. Filtering nested targets prevents a held receiver from being
+    mistaken for an opening giver, or vice versa. Legacy metadata without an
+    explicit target remains supported.
+    """
+    if phase not in {"close", "open"}:
+        return ()
+
+    commanded_arms = _metadata_arms(metadata)
+    explicit = metadata.get("gripper_arms")
+    if explicit is not None:
+        if isinstance(explicit, str):
+            requested = (explicit,)
+        elif isinstance(explicit, (list, tuple, set, frozenset)):
+            requested = tuple(explicit)
+        else:
+            raise ValueError("gripper_arms must be an arm name or collection")
+        invalid = set(requested) - set(commanded_arms)
+        if invalid or any(arm not in _ARM_NAMES for arm in requested):
+            raise ValueError(
+                "gripper_arms must be a subset of the metadata command arms"
+            )
+        return tuple(
+            arm for arm in _ARM_NAMES if arm in set(requested)
+        )
+
+    result: list[str] = []
+    for arm in commanded_arms:
+        target_metadata: dict[str, Any] = metadata
+        if metadata.get("arm") == "both":
+            targets = metadata.get("arm_targets", {})
+            if isinstance(targets, dict):
+                nested = targets.get(arm, {})
+                if isinstance(nested, dict):
+                    target_metadata = nested
+        target = target_metadata.get("target_gripper")
+        if target is None:
+            result.append(arm)
+            continue
+        try:
+            opening = float(target) > 0.5
+        except (TypeError, ValueError):
+            result.append(arm)
+            continue
+        if opening == (phase == "open"):
+            result.append(arm)
+    return tuple(result)
 
 
 def _arm_measurements(
@@ -93,7 +158,7 @@ def _execution_guard_settings(
         float(args.get("execution_guard_qpos_tolerance_rad", 0.10)),
         float(args.get("execution_guard_ee_position_tolerance_m", 0.03)),
         float(args.get("execution_guard_ee_orientation_tolerance_rad", 0.20)),
-        float(args.get("execution_guard_gripper_min_delta", 0.10)),
+        float(args.get("execution_guard_gripper_min_delta", 0.08)),
         float(args.get("execution_guard_gripper_settle_delta_max", 0.05)),
     )
 
@@ -120,6 +185,38 @@ def _gripper_execution_guard_failures(
     closure_delta = float(initial_state) - float(states[-1])
     if closure_delta < min_delta:
         failures.append(f"gripper_closure_delta={closure_delta:.4f}<{min_delta:.4f}")
+    settle_delta = abs(float(states[-1]) - float(states[-2]))
+    if settle_delta > settle_delta_max:
+        failures.append(
+            f"gripper_settle_delta={settle_delta:.4f}>{settle_delta_max:.4f}"
+        )
+    return failures
+
+
+def _gripper_release_execution_guard_failures(
+    *,
+    initial_state: float | None,
+    states: list[float],
+    min_delta: float,
+    settle_delta_max: float,
+) -> list[str]:
+    """Check that a previously closed gripper opened and settled."""
+    if not np.isfinite(min_delta) or not 0.0 < min_delta <= 1.0:
+        raise ValueError("execution_guard_gripper_min_delta must be in (0, 1]")
+    if not np.isfinite(settle_delta_max) or not 0.0 < settle_delta_max <= 1.0:
+        raise ValueError(
+            "execution_guard_gripper_settle_delta_max must be in (0, 1]"
+        )
+    if initial_state is None or not np.isfinite(initial_state):
+        return ["gripper_initial_physical_state=missing"]
+    if len(states) < 2 or not all(np.isfinite(value) for value in states[-2:]):
+        return ["gripper_settle_samples<2"]
+    failures: list[str] = []
+    release_delta = float(states[-1]) - float(initial_state)
+    if release_delta < min_delta:
+        failures.append(
+            f"gripper_release_delta={release_delta:.4f}<{min_delta:.4f}"
+        )
     settle_delta = abs(float(states[-1]) - float(states[-2]))
     if settle_delta > settle_delta_max:
         failures.append(
@@ -355,48 +452,115 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             print(f"[heuristic] execution telemetry disabled: {exc}")
 
     close_completed = False
-    close_initial_physical_states: dict[str, float] = {}
-    close_physical_states: dict[str, list[float]] = {arm: [] for arm in _ARM_NAMES}
+    closed_arms: set[str] = set()
+    active_gripper_phase: dict[str, str] = {}
+    gripper_initial_physical_states: dict[str, float] = {}
+    gripper_physical_states: dict[str, list[float]] = {}
     deferred_close_success = False
     for action_index, (action, action_metadata) in enumerate(
         zip(actions, metadata)
     ):
         phase = action_metadata.get("phase", "action")
         endpoint = bool(action_metadata.get("endpoint", False))
-        action_arms = _metadata_arms(action_metadata)
         bimanual = action_metadata.get("arm") == "both"
+        gripper_arms = _gripper_phase_arms(action_metadata, phase)
+        future_release_planned = any(
+            item.get("phase") == "open"
+            and bool(_gripper_phase_arms(item, "open"))
+            for item in metadata[action_index + 1:]
+        )
+        guarded_gripper_arms = (
+            gripper_arms
+            if phase == "close"
+            else tuple(arm for arm in gripper_arms if arm in closed_arms)
+        )
 
-        # A task-level collision can set eval_success during an intermediate
-        # close pulse. Clear it so the remaining settle pulses are actually
-        # executed; validate the final physical response below.
+        # Capture one baseline per arm and per gripper event. The receiver's
+        # close in a handoff must not reuse the giver's earlier close samples.
+        # Initial setup opens are ignored until that arm has passed a close.
+        new_event_arms = tuple(
+            arm
+            for arm in guarded_gripper_arms
+            if active_gripper_phase.get(arm) != phase
+        )
         if (
-            phase == "close"
-            and not close_completed
+            guard_enabled
+            and new_event_arms
             and task_env.take_action_cnt < task_env.step_lim
         ):
+            before_gripper: dict[str, Any] = {}
             try:
-                before_close = _robot_measurements(task_env, action_metadata)
-                for arm in action_arms:
-                    arm_values = _arm_measurements(before_close, arm, bimanual=bimanual)
-                    value = arm_values.get("gripper_physical_state")
-                    if value is not None and np.isfinite(value):
-                        close_initial_physical_states.setdefault(arm, float(value))
+                before_gripper = _robot_measurements(task_env, action_metadata)
             except Exception:
                 pass
+            for arm in new_event_arms:
+                arm_values = _arm_measurements(
+                    before_gripper, arm, bimanual=bimanual
+                )
+                value = arm_values.get("gripper_physical_state")
+                active_gripper_phase[arm] = phase
+                gripper_physical_states[arm] = []
+                gripper_initial_physical_states.pop(arm, None)
+                if value is not None and np.isfinite(value):
+                    gripper_initial_physical_states[arm] = float(value)
+
+        # Task checks can fire during interpolation. Complete every close and
+        # every multi-pulse release before accepting task-level success.
+        if phase == "close" and gripper_arms:
+            task_env.eval_success = False
+        elif phase == "open" and guarded_gripper_arms and not endpoint:
             task_env.eval_success = False
 
+        real_check_success = None
         if getattr(task_env, "eval_success", False):
             status = "skipped_eval_success"
         elif task_env.take_action_cnt >= task_env.step_lim:
             status = "skipped_step_limit"
         else:
-            task_env.take_action(action, action_type="qpos")
+            # RoboTwin exits take_action's interpolation loop as soon as
+            # check_success() is true. During a release, several tasks report
+            # success from the commanded-open cache before the physical
+            # aperture moves. Suppress that internal early exit, then run the
+            # real task check after the final release endpoint is validated.
+            suppress_release_success = (
+                phase == "open" and bool(guarded_gripper_arms)
+            )
+            if suppress_release_success:
+                candidate = getattr(task_env, "check_success", None)
+                if callable(candidate):
+                    real_check_success = candidate
+                    instance_attributes = getattr(task_env, "__dict__", {})
+                    had_instance_override = (
+                        isinstance(instance_attributes, dict)
+                        and "check_success" in instance_attributes
+                    )
+                    previous_override = (
+                        instance_attributes.get("check_success")
+                        if had_instance_override
+                        else None
+                    )
+                    setattr(task_env, "check_success", lambda: False)
+                else:
+                    had_instance_override = False
+                    previous_override = None
+            try:
+                task_env.take_action(action, action_type="qpos")
+            finally:
+                if real_check_success is not None:
+                    if had_instance_override:
+                        setattr(task_env, "check_success", previous_override)
+                    else:
+                        try:
+                            delattr(task_env, "check_success")
+                        except AttributeError:
+                            pass
             status = "executed"
 
         eval_success_reported = bool(getattr(task_env, "eval_success", False))
         terminal_post_close_success = (
             eval_success_reported
             and close_completed
+            and not future_release_planned
             and phase in _POST_CLOSE_MOTION_PHASES
         )
         premature_success = (
@@ -409,27 +573,34 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             and (endpoint or premature_success)
             and not terminal_post_close_success
         )
-        close_guard_required = (
+        gripper_guard_required = (
             guard_enabled
             and status == "executed"
-            and phase == "close"
             and endpoint
+            and bool(guarded_gripper_arms)
         )
         close_endpoint_executed = (
-            status == "executed" and phase == "close" and endpoint
+            status == "executed"
+            and phase == "close"
+            and endpoint
+            and bool(gripper_arms)
         )
         premature_guard_required = (
             guard_enabled and status == "executed" and premature_success
         )
         guard_required = (
             motion_guard_required
-            or close_guard_required
+            or gripper_guard_required
             or premature_guard_required
         )
         measurement_required = (
             telemetry_enabled
             or guard_required
-            or (guard_enabled and status == "executed" and phase == "close")
+            or (
+                guard_enabled
+                and status == "executed"
+                and bool(guarded_gripper_arms)
+            )
         )
         measurements: dict[str, Any] = {}
         if status == "executed" and measurement_required:
@@ -438,15 +609,21 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             except Exception as exc:
                 measurements["telemetry_error"] = f"{type(exc).__name__}: {exc}"
 
-        if status == "executed" and phase == "close":
-            for arm in action_arms:
-                arm_values = _arm_measurements(measurements, arm, bimanual=bimanual)
+        if status == "executed" and guard_enabled:
+            for arm in guarded_gripper_arms:
+                if active_gripper_phase.get(arm) != phase:
+                    continue
+                arm_values = _arm_measurements(
+                    measurements, arm, bimanual=bimanual
+                )
                 physical_state = arm_values.get("gripper_physical_state")
                 if physical_state is not None and np.isfinite(physical_state):
-                    close_physical_states[arm].append(float(physical_state))
+                    gripper_physical_states.setdefault(arm, []).append(
+                        float(physical_state)
+                    )
 
         guard_failures: list[str] = []
-        close_validation_failures: list[str] = []
+        gripper_validation_failures: list[str] = []
         if motion_guard_required:
             guard_failures.extend(
                 _execution_guard_failures(
@@ -458,24 +635,56 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             )
         if premature_guard_required:
             guard_failures.append("eval_success_before_close")
-        if close_endpoint_executed and guard_enabled:
-            for arm in action_arms:
-                arm_failures = _gripper_execution_guard_failures(
-                    initial_state=close_initial_physical_states.get(arm),
-                    states=close_physical_states[arm],
+        if gripper_guard_required:
+            for arm in guarded_gripper_arms:
+                validator = (
+                    _gripper_execution_guard_failures
+                    if phase == "close"
+                    else _gripper_release_execution_guard_failures
+                )
+                arm_failures = validator(
+                    initial_state=gripper_initial_physical_states.get(arm),
+                    states=gripper_physical_states.get(arm, []),
                     min_delta=guard_gripper_min_delta,
                     settle_delta_max=guard_gripper_settle_delta_max,
                 )
-                close_validation_failures.extend(
+                gripper_validation_failures.extend(
                     f"{arm}.{failure}" if bimanual else failure
                     for failure in arm_failures
                 )
-        if close_guard_required:
-            guard_failures.extend(close_validation_failures)
-        if close_endpoint_executed and not close_validation_failures:
-            close_completed = True
+            guard_failures.extend(gripper_validation_failures)
 
-        if phase == "close" and not endpoint and eval_success_reported:
+        gripper_endpoint_executed = (
+            status == "executed"
+            and endpoint
+            and bool(guarded_gripper_arms)
+        )
+        if gripper_endpoint_executed:
+            if not gripper_validation_failures:
+                if phase == "close":
+                    close_completed = True
+                    closed_arms.update(guarded_gripper_arms)
+                elif phase == "open":
+                    closed_arms.difference_update(guarded_gripper_arms)
+            for arm in guarded_gripper_arms:
+                active_gripper_phase.pop(arm, None)
+                gripper_initial_physical_states.pop(arm, None)
+                gripper_physical_states.pop(arm, None)
+
+        if (
+            not endpoint
+            and eval_success_reported
+            and (
+                (phase == "close" and bool(gripper_arms))
+                or (phase == "open" and bool(guarded_gripper_arms))
+            )
+        ):
+            task_env.eval_success = False
+
+        # Position-only task checks may report success while an object is
+        # still held. A planned release is part of the policy contract, so
+        # keep executing until the final open event has completed.
+        if eval_success_reported and future_release_planned:
             task_env.eval_success = False
 
         if guard_failures:
@@ -488,15 +697,27 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
                 + ", ".join(guard_failures)
             )
 
-        # If RoboTwin reports task success partway through the final close
-        # interpolation, take_action() can return before the requested 0.0
-        # gripper target is fully applied. Defer that success until one
-        # post-close motion command executes with the closed target, leaving
-        # the gripper drive closed without a retry.
+        release_endpoint_executed = (
+            status == "executed"
+            and phase == "open"
+            and endpoint
+            and bool(guarded_gripper_arms)
+        )
+        if (
+            release_endpoint_executed
+            and not guard_failures
+            and real_check_success is not None
+        ):
+            task_env.eval_success = bool(real_check_success())
+            eval_success_reported = bool(task_env.eval_success)
+
+        # A close-triggered success is terminal only for pick plans. Place
+        # and handoff plans must continue through their later release.
         if (
             close_endpoint_executed
             and not guard_failures
             and eval_success_reported
+            and not future_release_planned
         ):
             deferred_close_success = True
             task_env.eval_success = False

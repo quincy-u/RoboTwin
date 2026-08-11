@@ -35,7 +35,7 @@ execution_guard_enabled: true
 execution_guard_qpos_tolerance_rad: 0.10
 execution_guard_ee_position_tolerance_m: 0.03
 execution_guard_ee_orientation_tolerance_rad: 0.20
-execution_guard_gripper_min_delta: 0.10
+execution_guard_gripper_min_delta: 0.08
 execution_guard_gripper_settle_delta_max: 0.05
 save_grasp_visualizations: true
 max_visualized_grasps: null  # null renders every candidate

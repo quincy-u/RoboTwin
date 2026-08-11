@@ -73,31 +73,45 @@ def _resolve_target_name(
 def _resolve_target_names(
     task_env: Any, tracked: dict[str, Any], requested: str
 ) -> tuple[str, ...]:
-    """Resolve one normal target or both pick_dual_bottles targets."""
+    """Resolve exactly the objects that require M2T2 grasp proposals."""
     if requested != "auto":
         selected = _resolve_target_name(task_env, tracked, requested)
         return () if selected is None else (selected,)
 
     task_plan = getattr(task_env, "heuristic_task_plan", None)
-    if getattr(task_plan, "task_name", None) == "pick_dual_bottles":
-        targets = tuple(
-            getattr(stage, "target")
-            for stage in getattr(task_plan, "stages", ())
-            if getattr(stage, "target", None) is not None
-        )
-        if len(targets) != 2 or len(set(targets)) != 2:
-            raise ValueError(
-                "pick_dual_bottles requires exactly two distinct Pick targets"
-            )
+    targets = tuple(getattr(task_plan, "manipulation_targets", ()))
+    if targets:
         missing = [name for name in targets if name not in tracked]
         if missing:
             raise ValueError(
-                f"pick_dual_bottles targets are not tracked: {', '.join(missing)}"
+                "task-plan manipulation targets are not tracked: "
+                + ", ".join(missing)
             )
         return targets
 
     selected = _resolve_target_name(task_env, tracked, requested)
     return () if selected is None else (selected,)
+
+
+def _resolve_pose_object_names(
+    task_env: Any,
+    tracked: dict[str, Any],
+    requested: str,
+    manipulation_targets: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Add GT-pose-only destinations without turning them into mask targets."""
+    if requested != "auto":
+        return manipulation_targets
+    task_plan = getattr(task_env, "heuristic_task_plan", None)
+    names = tuple(getattr(task_plan, "pose_objects", ()))
+    if not names:
+        return manipulation_targets
+    missing = [name for name in names if name not in tracked]
+    if missing:
+        raise ValueError(
+            "task-plan pose objects are not tracked: " + ", ".join(missing)
+        )
+    return names
 
 
 def _object_states(
@@ -230,11 +244,21 @@ def encode_obs(
     }
     instance_ids = _instance_ids(tracked)
     selected_targets = _resolve_target_names(task_env, tracked, target_name)
-    target_only = {name: tracked[name] for name in selected_targets}
+    pose_object_names = _resolve_pose_object_names(
+        task_env, tracked, target_name, selected_targets
+    )
+    segmentation_targets = {
+        name: tracked[name] for name in selected_targets
+    }
+    pose_objects = {
+        name: tracked[name] for name in pose_object_names
+    }
 
     labels = np.full(depth_m.shape, -1, dtype=np.int64)
-    if target_only:
-        target_masks = task_env.cameras.get_object_masks(target_only)["head_camera"]
+    if segmentation_targets:
+        target_masks = task_env.cameras.get_object_masks(
+            segmentation_targets
+        )["head_camera"]
         for selected_target in selected_targets:
             labels[
                 np.asarray(target_masks[selected_target], dtype=bool)
@@ -246,7 +270,7 @@ def encode_obs(
         instance_labels=labels.reshape(-1)[valid],
         camera_pose=camera_to_world,
         objects=_object_states(
-            target_only if selected_targets else tracked,
+            pose_objects if pose_object_names else tracked,
             instance_ids,
             ObjectState,
         ),
