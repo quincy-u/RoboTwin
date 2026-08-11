@@ -4795,6 +4795,7 @@ class RoboTwinHeuristicRuntime:
         pick: Pick,
         handoff: Handoff,
         place: Place,
+        allow_rendezvous_fallback: bool = True,
     ) -> list[np.ndarray]:
         (
             giver_plans,
@@ -4898,6 +4899,47 @@ class RoboTwinHeuristicRuntime:
                 break
             if selected is not None:
                 break
+        if selected is None and allow_rendezvous_fallback:
+            _, base_rendezvous = self._handoff_reference_poses(
+                target, handoff
+            )
+            rendezvous_offsets = (
+                (0.0, 0.06, 0.0),
+                (0.0, -0.06, 0.0),
+                (0.06, 0.0, 0.0),
+                (-0.06, 0.0, 0.0),
+                (0.0, 0.0, 0.06),
+            )
+            fallback_failures = 0
+            for offset in rendezvous_offsets:
+                adjusted_rendezvous = base_rendezvous.copy()
+                adjusted_rendezvous[:3, 3] += np.asarray(
+                    offset, dtype=np.float64
+                )
+                adjusted_handoff = replace(
+                    handoff, rendezvous_pose=adjusted_rendezvous
+                )
+                try:
+                    print(
+                        "[heuristic] retrying handoff rendezvous offset="
+                        + np.array2string(
+                            np.asarray(offset), precision=3
+                        )
+                    )
+                    return self._get_handoff_action(
+                        scene,
+                        target,
+                        pick=pick,
+                        handoff=adjusted_handoff,
+                        place=place,
+                        allow_rendezvous_fallback=False,
+                    )
+                except NoFeasiblePlanFailure:
+                    fallback_failures += 1
+            print(
+                "[heuristic] handoff rendezvous fallbacks exhausted "
+                f"attempts={fallback_failures}"
+            )
         if selected is None:
             raise NoFeasiblePlanFailure(
                 "all confidence-ranked separated-region handoff pairs are "
