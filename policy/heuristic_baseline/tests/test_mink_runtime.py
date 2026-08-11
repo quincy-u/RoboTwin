@@ -126,6 +126,35 @@ class PoseMatrixTests(unittest.TestCase):
             _pose_matrix(pose, name="scaled_pose")
 
 
+    def test_aligned_place_recovers_from_arccos_roundoff(self):
+        source = I.copy()
+        source[:3, 3] = [-0.15, -0.12, 0.79]
+        destination = I.copy()
+        destination[:3, 3] = [0.03, -0.02, 0.95]
+        grasp = I.copy()
+        grasp[:3, 3] = source[:3, 3] - [0.1, 0.0, 0.0]
+
+        with patch(
+            "envs.utils.transforms.get_place_pose",
+            side_effect=FloatingPointError("invalid value in arccos"),
+        ):
+            recovered = _aligned_place_reference_pose(
+                source,
+                destination,
+                grasp,
+                arm="left",
+                constrain="auto",
+                z_transform=True,
+            )
+
+        np.testing.assert_allclose(recovered[:3, 3], destination[:3, 3])
+        np.testing.assert_allclose(
+            recovered[:3, :3].T @ recovered[:3, :3], np.eye(3), atol=1e-12
+        )
+        self.assertAlmostEqual(np.linalg.det(recovered[:3, :3]), 1.0)
+
+
+
 class FakeSolver:
     def __init__(self, results):
         self.results = list(results)

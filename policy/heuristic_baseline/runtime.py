@@ -1925,13 +1925,9 @@ def _aligned_place_reference_pose(
                 **kwargs,
             )
     except (FloatingPointError, np.linalg.LinAlgError):
-        if resolved_constrain != "free":
-            raise
-
-        # Free placement only constrains the reference Z direction. The
-        # shared helper computes arccos(dot) without clipping and can turn a
-        # numerically valid, nearly parallel pair into NaNs. Keep that
-        # numerical recovery local to the heuristic policy.
+        # The shared helper computes arccos(dot) without clipping and can turn
+        # numerically valid, nearly parallel vectors into NaNs. Reproduce its
+        # orientation rules with clipped dot products as a local fallback.
         actor2world = np.array(
             [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
         ).T
@@ -1963,6 +1959,62 @@ def _aligned_place_reference_pose(
         recovered = source.copy()
         recovered[:3, :3] = alignment @ source[:3, :3]
         recovered[:3, 3] = destination[:3, 3]
+        if resolved_constrain == "align":
+            align_axes = kwargs.get("align_axis")
+            if align_axes is None:
+                align_axes = destination[:3, 0].reshape(3, 1)
+            else:
+                align_axes = np.asarray(
+                    align_axes, dtype=np.float64
+                ).reshape(-1, 3).T
+            align_axes /= np.linalg.norm(align_axes, axis=0)
+
+            actor_axis = np.asarray(
+                kwargs.get("actor_axis", [1.0, 0.0, 0.0]),
+                dtype=np.float64,
+            ).reshape(3)
+            if kwargs.get("actor_axis_type", "actor") == "actor":
+                actor_axis = recovered[:3, :3] @ actor_axis
+            selected_axis = align_axes[:, int(
+                np.argmax(actor_axis @ align_axes)
+            )]
+            target_x = destination[:3, 0]
+            target_y = destination[:3, 1]
+            actor_projected = (
+                np.dot(target_x, actor_axis) * target_x
+                + np.dot(target_y, actor_axis) * target_y
+            )
+            selected_projected = (
+                np.dot(target_x, selected_axis) * target_x
+                + np.dot(target_y, selected_axis) * target_y
+            )
+            for projected, label in (
+                (actor_projected, "actor"),
+                (selected_projected, "alignment"),
+            ):
+                if np.linalg.norm(projected) < 1e-8:
+                    raise ValueError(
+                        f"{label} placement axis has no target-plane projection"
+                    )
+            actor_projected /= np.linalg.norm(actor_projected)
+            selected_projected /= np.linalg.norm(selected_projected)
+            cross = np.cross(actor_projected, selected_projected)
+            sine = float(np.linalg.norm(cross))
+            cosine = float(np.clip(
+                np.dot(actor_projected, selected_projected), -1.0, 1.0
+            ))
+            if sine < 1e-8:
+                planar_alignment = (
+                    np.eye(3) if cosine >= 0.0
+                    else t3d.axangles.axangle2mat(destination[:3, 2], np.pi)
+                )
+            else:
+                planar_alignment = t3d.axangles.axangle2mat(
+                    cross / sine, np.arctan2(sine, cosine)
+                )
+            recovered[:3, :3] = (
+                planar_alignment @ recovered[:3, :3]
+            )
         result = _pose7_from_matrix(recovered)
     return _pose_matrix(np.asarray(result), name="aligned_place_reference_pose")
 
