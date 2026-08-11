@@ -1,7 +1,7 @@
 """Adapters connecting simple-grasp orchestration to RoboTwin."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -635,6 +635,11 @@ class RoboTwinMinkIK:
         """Accepted world command poses for pregrasp, grasp, and retreat."""
         return tuple(item.copy() for item in self._completed_command_targets)
 
+    @property
+    def completed_paths(self) -> tuple[np.ndarray, ...]:
+        """Joint paths for the last complete three-stage grasp plan."""
+        return tuple(item.copy() for item in self._completed_paths)
+
     @staticmethod
     def _with_command_rotation(
         target: np.ndarray, rotation: np.ndarray
@@ -736,6 +741,111 @@ class RoboTwinMinkIK:
             )
             return None, None
         return joints, path
+
+    def solve_command_target(
+        self,
+        arm: str,
+        world_command_pose: np.ndarray,
+        start: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Solve one exact command-frame follow-up without changing stage state."""
+        target = np.asarray(world_command_pose, dtype=np.float64)
+        start = np.asarray(start, dtype=np.float64)
+        if target.shape != (4, 4):
+            raise ValueError("world_command_pose must have shape (4, 4)")
+        self.calls += 1
+        self._candidate_seed = {arm: start.copy()}
+        try:
+            joints, path = self._solve_safe_target(arm, target, start)
+        finally:
+            self._candidate_seed = {}
+        if joints is None or path is None:
+            self.failures["NoSolution"] = self.failures.get("NoSolution", 0) + 1
+            return None
+        self.successes += 1
+        return joints.copy(), path.copy(), target.copy()
+
+    def full_robot_path_has_self_collision(
+        self,
+        actions: list[np.ndarray],
+        *,
+        max_joint_step_rad: float = 0.03,
+    ) -> bool:
+        """Check dense paired-arm qpos motion for robot self-collision."""
+        if max_joint_step_rad <= 0.0:
+            raise ValueError("max_joint_step_rad must be positive")
+        model = getattr(self.solver, "model", None)
+        if model is None:
+            return False
+        rows = [np.asarray(action, dtype=np.float64) for action in actions]
+        if any(
+            row.shape != (14,) or not np.all(np.isfinite(row))
+            for row in rows
+        ):
+            raise ValueError("bimanual actions must be finite 14D qpos rows")
+        if not rows:
+            return False
+
+        arm_indices: dict[str, list[int]] = {}
+        arm_body_ids: set[int] = set()
+        for arm, prefix in (("left", "fl_link"), ("right", "fr_link")):
+            indices: list[int] = []
+            for joint_name in getattr(
+                self.task_env.robot, f"{arm}_arm_joints_name"
+            ):
+                joint_id = mujoco.mj_name2id(
+                    model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
+                )
+                if joint_id < 0:
+                    raise ValueError(f"Mink model lacks arm joint {joint_name}")
+                indices.append(int(model.jnt_qposadr[joint_id]))
+            arm_indices[arm] = indices
+            arm_body_ids.update(
+                body_id
+                for body_id in range(model.nbody)
+                if (
+                    mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_BODY, body_id
+                    )
+                    or ""
+                ).startswith(prefix)
+            )
+
+        current = np.concatenate(
+            (
+                _arm_joint_state(self.task_env, "left")[:-1],
+                _arm_joint_state(self.task_env, "right")[:-1],
+            )
+        )
+        data = mujoco.MjData(model)
+        for row in rows:
+            target = np.concatenate((row[:6], row[7:13]))
+            steps = max(
+                1,
+                int(
+                    np.ceil(
+                        float(np.max(np.abs(target - current)))
+                        / max_joint_step_rad
+                    )
+                ),
+            )
+            for alpha in np.linspace(0.0, 1.0, steps + 1)[1:]:
+                joints = current + float(alpha) * (target - current)
+                data.qpos[:] = model.qpos0
+                data.qpos[arm_indices["left"]] = joints[:6]
+                data.qpos[arm_indices["right"]] = joints[6:]
+                mujoco.mj_forward(model, data)
+                for contact in data.contact[: data.ncon]:
+                    first_body = int(model.geom_bodyid[contact.geom1])
+                    second_body = int(model.geom_bodyid[contact.geom2])
+                    if (
+                        first_body in arm_body_ids
+                        and second_body in arm_body_ids
+                        and contact.dist < -1e-4
+                    ):
+                        return True
+            current = target
+        return False
 
     def consume_path(self, arm: str, target: np.ndarray) -> np.ndarray | None:
         if not self._completed_paths:
@@ -1010,6 +1120,325 @@ class QposActionBuffer:
             )
 
 
+@dataclass(frozen=True)
+class _BimanualArmPlan:
+    """One arm's complete grasp, lift, and held-transport plan."""
+
+    arm: str
+    target_name: str
+    arm_source: str
+    candidate: GraspCandidate
+    paths: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    command_targets: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    orientation_source: str = "m2t2"
+
+
+def _pose_matrix(pose: Any, *, name: str) -> np.ndarray:
+    if hasattr(pose, "to_transformation_matrix"):
+        matrix = np.asarray(pose.to_transformation_matrix(), dtype=np.float64)
+    else:
+        values = np.asarray(pose, dtype=np.float64)
+        if values.shape == (4, 4):
+            matrix = values.copy()
+        elif values.shape == (7,):
+            matrix = np.eye(4, dtype=np.float64)
+            matrix[:3, 3] = values[:3]
+            matrix[:3, :3] = t3d.quaternions.quat2mat(values[3:])
+        else:
+            raise ValueError(f"{name} must be a pose7 or a 4x4 matrix")
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} must be a finite 4x4 rigid transform")
+    return matrix
+
+
+def _rigid_transport_command_pose(
+    world_object_pose: np.ndarray,
+    world_functional_pose: np.ndarray,
+    world_grasp_command_pose: np.ndarray,
+    desired_world_functional_pose: np.ndarray,
+) -> np.ndarray:
+    """Translate a rigid grasp so its functional point reaches target XYZ."""
+    _pose_matrix(world_object_pose, name="world_object_pose")
+    world_functional = _pose_matrix(
+        world_functional_pose, name="world_functional_pose"
+    )
+    world_grasp = _pose_matrix(
+        world_grasp_command_pose, name="world_grasp_command_pose"
+    )
+    desired_functional = _pose_matrix(
+        desired_world_functional_pose,
+        name="desired_world_functional_pose",
+    )
+    translation = np.eye(4, dtype=np.float64)
+    translation[:3, 3] = (
+        desired_functional[:3, 3] - world_functional[:3, 3]
+    )
+    return translation @ world_grasp
+
+
+def _robot_facing_grasp_pose(
+    world_grasp_pose: np.ndarray,
+    current_ee_position: np.ndarray,
+    grasp_to_robotwin: np.ndarray,
+) -> np.ndarray:
+    """Keep M2T2's contact while aiming its approach from robot to object."""
+    transform = _pose_matrix(
+        grasp_to_robotwin, name="grasp_to_robotwin"
+    )
+    command = _pose_matrix(
+        world_grasp_pose, name="world_grasp_pose"
+    ) @ transform
+    current = np.asarray(current_ee_position, dtype=np.float64)
+    if current.shape != (3,) or not np.all(np.isfinite(current)):
+        raise ValueError("current_ee_position must be a finite 3-vector")
+
+    tcp = command[:3, 3] + 0.12 * command[:3, 0]
+    approach = tcp - current
+    approach_norm = float(np.linalg.norm(approach))
+    if approach_norm < 1e-8:
+        raise ValueError("current EE already coincides with grasp TCP")
+    approach /= approach_norm
+
+    closing = command[:3, 1] - np.dot(command[:3, 1], approach) * approach
+    if np.linalg.norm(closing) < 1e-6:
+        fallback_axis = np.eye(3)[int(np.argmin(np.abs(approach)))]
+        closing = fallback_axis - np.dot(fallback_axis, approach) * approach
+    closing /= np.linalg.norm(closing)
+    lateral = np.cross(approach, closing)
+    lateral /= np.linalg.norm(lateral)
+    closing = np.cross(lateral, approach)
+
+    adjusted_command = command.copy()
+    adjusted_command[:3, :3] = np.column_stack(
+        (approach, closing, lateral)
+    )
+    adjusted_command[:3, 3] = tcp - 0.12 * approach
+    return adjusted_command @ np.linalg.inv(transform)
+
+
+def _elongated_object_axis(
+    scene: SceneObservation,
+    target: ObjectState,
+    *,
+    minimum_variance_ratio: float = 2.0,
+) -> np.ndarray | None:
+    """Return the target cloud's principal axis only when clearly elongated."""
+    if minimum_variance_ratio <= 1.0:
+        raise ValueError("minimum_variance_ratio must be greater than one")
+    labels = np.asarray(scene.instance_labels)
+    points = np.asarray(scene.xyz, dtype=np.float64)[
+        labels == target.instance_id
+    ]
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) < 3:
+        return None
+    centered = points - points.mean(axis=0)
+    eigenvalues, eigenvectors = np.linalg.eigh(
+        centered.T @ centered / len(centered)
+    )
+    if eigenvalues[-1] <= minimum_variance_ratio * max(
+        float(eigenvalues[-2]), 1e-12
+    ):
+        return None
+    return eigenvectors[:, -1]
+
+
+def _target_width_along_axis(
+    scene: SceneObservation,
+    target: ObjectState,
+    axis: np.ndarray,
+) -> float | None:
+    """Measure segmented target extent along a unit jaw-closing axis."""
+    direction = np.array(axis, dtype=np.float64, copy=True)
+    norm = float(np.linalg.norm(direction))
+    if direction.shape != (3,) or not np.isfinite(norm) or norm < 1e-8:
+        raise ValueError("axis must be a finite nonzero 3-vector")
+    direction /= norm
+    labels = np.asarray(scene.instance_labels)
+    points = np.asarray(scene.xyz, dtype=np.float64)[
+        labels == target.instance_id
+    ]
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) < 2:
+        return None
+    projections = points @ direction
+    return float(np.ptp(projections))
+
+
+class BimanualQposActionBuffer:
+    """Compose two independent IK paths into synchronized RoboTwin qpos rows."""
+
+    def __init__(
+        self,
+        task_env: Any,
+        *,
+        gripper_settle_actions: int = 5,
+    ) -> None:
+        if gripper_settle_actions < 1:
+            raise ValueError("gripper_settle_actions must be at least 1")
+        self.task_env = task_env
+        self.gripper_settle_actions = int(gripper_settle_actions)
+        self.actions: list[np.ndarray] = []
+        self.metadata: list[dict[str, Any]] = []
+        self.left = np.empty(0)
+        self.right = np.empty(0)
+        self.left_gripper = 1.0
+        self.right_gripper = 1.0
+
+    def reset(self) -> None:
+        left = _arm_joint_state(self.task_env, "left")
+        right = _arm_joint_state(self.task_env, "right")
+        self.left, self.left_gripper = left[:-1].copy(), float(left[-1])
+        self.right, self.right_gripper = right[:-1].copy(), float(right[-1])
+        self.actions = []
+        self.metadata = []
+
+    @staticmethod
+    def _resample_path(
+        start: np.ndarray, path: np.ndarray, count: int
+    ) -> np.ndarray:
+        start = np.asarray(start, dtype=np.float64)
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1:] != start.shape or len(path) < 1:
+            raise ValueError("each bimanual path must contain joint waypoints")
+        source = np.vstack((start, path))
+        source_progress = np.linspace(0.0, 1.0, len(source))
+        target_progress = np.linspace(0.0, 1.0, count + 1)[1:]
+        return np.column_stack(
+            [
+                np.interp(target_progress, source_progress, source[:, joint])
+                for joint in range(source.shape[1])
+            ]
+        )
+
+    def _append(
+        self,
+        *,
+        phase: str,
+        endpoint: bool,
+        waypoint_index: int,
+        waypoint_count: int,
+        plans: dict[str, _BimanualArmPlan],
+        command_poses: dict[str, np.ndarray | None] | None = None,
+    ) -> None:
+        command_poses = command_poses or {}
+        self.actions.append(
+            np.concatenate(
+                (
+                    self.left,
+                    [self.left_gripper],
+                    self.right,
+                    [self.right_gripper],
+                )
+            )
+        )
+        arm_targets: dict[str, dict[str, Any]] = {}
+        for arm in ("left", "right"):
+            plan = plans[arm]
+            qpos = self.left if arm == "left" else self.right
+            gripper = (
+                self.left_gripper if arm == "left" else self.right_gripper
+            )
+            command_pose = command_poses.get(arm)
+            arm_targets[arm] = {
+                "target_qpos": qpos.copy(),
+                "target_gripper": float(gripper),
+                "command_pose": (
+                    None
+                    if command_pose is None
+                    else np.asarray(command_pose, dtype=np.float64).copy()
+                ),
+                "target_name": plan.target_name,
+                "arm_source": plan.arm_source,
+            }
+        sources = {plan.arm_source for plan in plans.values()}
+        self.metadata.append(
+            {
+                "phase": phase,
+                "arm": "both",
+                "endpoint": bool(endpoint),
+                "waypoint_index": int(waypoint_index),
+                "waypoint_count": int(waypoint_count),
+                "arm_targets": arm_targets,
+                "arm_source": sources.pop() if len(sources) == 1 else "mixed",
+            }
+        )
+
+    def _move_phase(
+        self,
+        phase: str,
+        path_index: int,
+        plans: dict[str, _BimanualArmPlan],
+    ) -> None:
+        left_path = plans["left"].paths[path_index]
+        right_path = plans["right"].paths[path_index]
+        count = max(len(left_path), len(right_path))
+        left_waypoints = self._resample_path(self.left, left_path, count)
+        right_waypoints = self._resample_path(self.right, right_path, count)
+        for index, (left, right) in enumerate(
+            zip(left_waypoints, right_waypoints), start=1
+        ):
+            self.left = left.copy()
+            self.right = right.copy()
+            endpoint = index == count
+            self._append(
+                phase=phase,
+                endpoint=endpoint,
+                waypoint_index=index,
+                waypoint_count=count,
+                plans=plans,
+                command_poses=(
+                    {
+                        arm: plans[arm].command_targets[path_index]
+                        for arm in ("left", "right")
+                    }
+                    if endpoint
+                    else None
+                ),
+            )
+
+    def build(
+        self,
+        left_plan: _BimanualArmPlan,
+        right_plan: _BimanualArmPlan,
+    ) -> list[np.ndarray]:
+        plans = {"left": left_plan, "right": right_plan}
+        if left_plan.arm != "left" or right_plan.arm != "right":
+            raise ValueError("bimanual plans must contain one plan per arm")
+        for plan in plans.values():
+            if len(plan.paths) != 4 or len(plan.command_targets) != 4:
+                raise ValueError(
+                    "bimanual plans require pregrasp/grasp/lift/transport"
+                )
+
+        self.reset()
+        self.left_gripper = 1.0
+        self.right_gripper = 1.0
+        self._append(
+            phase="open",
+            endpoint=True,
+            waypoint_index=1,
+            waypoint_count=1,
+            plans=plans,
+        )
+        self._move_phase("pregrasp", 0, plans)
+        self._move_phase("grasp", 1, plans)
+
+        self.left_gripper = 0.0
+        self.right_gripper = 0.0
+        for index in range(1, self.gripper_settle_actions + 1):
+            self._append(
+                phase="close",
+                endpoint=index == self.gripper_settle_actions,
+                waypoint_index=index,
+                waypoint_count=self.gripper_settle_actions,
+                plans=plans,
+            )
+        self._move_phase("lift", 2, plans)
+        self._move_phase("transport", 3, plans)
+        return [action.copy() for action in self.actions]
+
+
 class ConfidenceRankedGrasps:
     """Filter target grasps and rank solely by raw M2T2 confidence."""
 
@@ -1032,27 +1461,11 @@ class ConfidenceRankedGrasps:
             if candidate.confidence >= self.min_confidence
         ]
 
-        confidence_candidates = []
-        for candidate in candidates:
-            pose = np.array(
-                candidate.world_grasp_pose, dtype=np.float64, copy=True
-            )
-            approximate_contact_center = pose[:3, 3] + 0.1034 * pose[:3, 2]
-            target_center = target.world_pose[:3, 3]
-            if np.linalg.norm(approximate_contact_center - target_center) > 0.08:
-                pose[:3, 3] = target_center - 0.1034 * pose[:3, 2]
-            confidence_candidates.append(
-                GraspCandidate(
-                    pose,
-                    float(candidate.confidence),
-                    candidate.object_name,
-                )
-            )
-
         # Python's sort is stable, so equal-confidence M2T2 candidates retain
-        # their generator order. Orientation is neither scored nor used here.
+        # their generator order. M2T2 poses are preserved exactly: neither
+        # orientation nor contact position is rescored or moved here.
         self.last_candidates = sorted(
-            confidence_candidates,
+            candidates,
             key=lambda item: item.confidence,
             reverse=True,
         )
@@ -1071,6 +1484,23 @@ class ReachabilityRankedGrasps(ConfidenceRankedGrasps):
     ) -> None:
         del arm, grasp_to_robotwin
         super().__init__(grasps, min_confidence=min_confidence)
+
+
+def _robotwin_ground_truth_arm(task_env: Any, target_name: str) -> str | None:
+    """Return the unique expert arm associated with the active target."""
+    plan = getattr(task_env, "heuristic_task_plan", None)
+    matching_stages = [
+        stage
+        for stage in getattr(plan, "stages", ())
+        if getattr(stage, "target", None) == target_name
+    ]
+    if len(matching_stages) != 1:
+        return None
+    arm = getattr(matching_stages[0], "arm", None)
+    if arm is None:
+        return None
+    normalized = str(arm).strip().lower()
+    return normalized if normalized in {"left", "right"} else None
 
 
 class RoboTwinHeuristicRuntime:
@@ -1095,6 +1525,11 @@ class RoboTwinHeuristicRuntime:
         max_visualized_grasps: int | None = None,
         max_visualized_points: int = 30_000,
         grasp_visualization_scale: int = 4,
+        bimanual_max_plans_per_arm: int = 4,
+        bimanual_lift_m: float = 0.10,
+        bimanual_collision_step_rad: float = 0.03,
+        bimanual_max_jaw_axis_alignment: float = 0.75,
+        bimanual_max_target_width_m: float = 0.10,
     ) -> None:
         self.task_env = task_env
         self.grasps = grasps
@@ -1114,6 +1549,17 @@ class RoboTwinHeuristicRuntime:
         )
         self.max_visualized_points = int(max_visualized_points)
         self.grasp_visualization_scale = int(grasp_visualization_scale)
+        self.bimanual_max_plans_per_arm = int(bimanual_max_plans_per_arm)
+        self.bimanual_lift_m = float(bimanual_lift_m)
+        self.bimanual_collision_step_rad = float(
+            bimanual_collision_step_rad
+        )
+        self.bimanual_max_jaw_axis_alignment = float(
+            bimanual_max_jaw_axis_alignment
+        )
+        self.bimanual_max_target_width_m = float(
+            bimanual_max_target_width_m
+        )
         if (
             self.max_visualized_grasps is not None
             and self.max_visualized_grasps <= 0
@@ -1122,7 +1568,18 @@ class RoboTwinHeuristicRuntime:
             or self.grasp_visualization_scale <= 0
         ):
             raise ValueError("visualization limits must be positive")
+        if (
+            self.bimanual_max_plans_per_arm <= 0
+            or self.bimanual_lift_m <= 0.0
+            or self.bimanual_collision_step_rad <= 0.0
+            or not 0.0 < self.bimanual_max_jaw_axis_alignment < 1.0
+            or not np.isfinite(self.bimanual_max_target_width_m)
+            or self.bimanual_max_target_width_m <= 0.0
+        ):
+            raise ValueError("bimanual planning limits must be positive")
         self._visualization_index = 0
+        self._grasp_attempted = False
+        self._action_metadata_override: list[dict[str, Any]] | None = None
         self.simulator = SceneSnapshot()
         if mink_model_path is None:
             mink_model_path = (
@@ -1146,19 +1603,55 @@ class RoboTwinHeuristicRuntime:
             max_waypoints_per_segment=max_waypoints_per_segment,
             gripper_settle_actions=gripper_settle_actions,
         )
+        self.bimanual_controller = BimanualQposActionBuffer(
+            task_env,
+            gripper_settle_actions=gripper_settle_actions,
+        )
         self.backend = grasps.backend
 
-    def _target_name(self, scene: SceneObservation) -> str:
+    def _target_names(self, scene: SceneObservation) -> tuple[str, ...]:
         if not self.automatic_target:
-            return self.config.object_name
+            return (self.config.object_name,)
+        plan = getattr(self.task_env, "heuristic_task_plan", None)
+        planned: list[str] = []
+        for stage in getattr(plan, "stages", ()):
+            name = getattr(stage, "target", None)
+            if name is not None and name not in planned:
+                planned.append(name)
+        if planned:
+            missing = [name for name in planned if name not in scene.objects]
+            if missing:
+                raise TargetSelectionFailure(
+                    "RoboTwin task-plan targets are absent from RGB-D scene: "
+                    + ", ".join(missing)
+                )
+            return tuple(planned)
         names = [name for name in scene.objects if name != "wall"]
         if len(names) != 1:
             available = ", ".join(sorted(names))
             raise TargetSelectionFailure(
-                "object_name=auto requires exactly one non-wall tracked object; "
+                "object_name=auto requires task-plan targets or exactly one "
+                "non-wall tracked object; "
                 f"available: {available}"
             )
+        return (names[0],)
+
+    def _target_name(self, scene: SceneObservation) -> str:
+        names = self._target_names(scene)
+        if len(names) != 1:
+            raise TargetSelectionFailure(
+                f"single-arm policy received {len(names)} task targets"
+            )
         return names[0]
+
+    def _select_arm(self, target: ObjectState) -> tuple[str, str]:
+        if not self.automatic_arm:
+            return self.config.arm, "explicit_config"
+        expert_arm = _robotwin_ground_truth_arm(self.task_env, target.name)
+        if expert_arm is not None:
+            return expert_arm, "robotwin_ground_truth"
+        geometric_arm = "left" if target.world_pose[0, 3] < 0.0 else "right"
+        return geometric_arm, "geometry_fallback"
 
     def _save_grasp_visualization(
         self,
@@ -1167,6 +1660,10 @@ class RoboTwinHeuristicRuntime:
         candidates: list[GraspCandidate],
         selected: GraspCandidate | None,
         arm: str,
+        *,
+        raw_trace_override: dict[str, Any] | None = None,
+        executed_command_pose_override: np.ndarray | None = None,
+        use_default_executed_pose: bool = True,
     ) -> None:
         if not self.save_grasp_visualizations or self.visualization_dir is None:
             return
@@ -1181,7 +1678,11 @@ class RoboTwinHeuristicRuntime:
             / f"episode{episode:04d}_seed{seed}_step{step:04d}_plan{plan_index:03d}.png"
         )
         try:
-            raw_trace = getattr(self.backend, "last_trace", {})
+            raw_trace = (
+                getattr(self.backend, "last_trace", {})
+                if raw_trace_override is None
+                else raw_trace_override
+            )
             raw_poses = np.asarray(
                 raw_trace.get("poses", np.empty((0, 4, 4))),
                 dtype=np.float64,
@@ -1233,7 +1734,11 @@ class RoboTwinHeuristicRuntime:
                 camera_extrinsic=head_observation["extrinsic_cv"],
                 rejected_candidates=rejected_candidates,
                 policy_ranked_candidates=candidates,
-                executed_command_pose=self.ik.selected_grasp_command_pose,
+                executed_command_pose=(
+                    self.ik.selected_grasp_command_pose
+                    if use_default_executed_pose
+                    else executed_command_pose_override
+                ),
                 raw_trace=raw_trace,
                 max_grasps=self.max_visualized_grasps,
                 max_points=self.max_visualized_points,
@@ -1247,17 +1752,320 @@ class RoboTwinHeuristicRuntime:
         except Exception as exc:
             print(f"[heuristic] grasp visualization failed: {exc}")
 
+    @staticmethod
+    def _copy_backend_trace(trace: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value.copy() if isinstance(value, np.ndarray) else value
+            for key, value in trace.items()
+        }
+
+    def _plan_bimanual_arm(
+        self,
+        scene: SceneObservation,
+        target: ObjectState,
+        *,
+        arm: str,
+        arm_source: str,
+        actor: Any,
+    ) -> tuple[list[_BimanualArmPlan], list[GraspCandidate], dict[str, Any]]:
+        ranker = ConfidenceRankedGrasps(
+            self.grasps, min_confidence=self.config.min_confidence
+        )
+        ranked = ranker.propose(scene, target)[: self.config.max_candidates]
+        trace = self._copy_backend_trace(getattr(self.backend, "last_trace", {}))
+        plans: list[_BimanualArmPlan] = []
+        failure_counts = {
+            "pregrasp": 0,
+            "grasp": 0,
+            "lift": 0,
+            "robot_facing": 0,
+            "jaw_axis": 0,
+            "jaw_width": 0,
+            "transport": 0,
+        }
+        elongated_axis = _elongated_object_axis(scene, target)
+
+        functional_pose = actor.get_functional_point(0, "matrix")
+        desired_pose_name = f"{arm}_target_pose"
+        if not hasattr(self.task_env, desired_pose_name):
+            raise TargetSelectionFailure(
+                f"bimanual task lacks RoboTwin {desired_pose_name}"
+            )
+        desired_functional_pose = getattr(self.task_env, desired_pose_name)
+        ee_getter = getattr(self.task_env.robot, f"get_{arm}_ee_pose")
+        current_ee_position = np.asarray(ee_getter(), dtype=np.float64)[:3]
+
+        for candidate in ranked:
+            grasp_pose = np.asarray(
+                candidate.world_grasp_pose, dtype=np.float64
+            )
+            pregrasp_pose = grasp_pose.copy()
+            pregrasp_pose[:3, 3] -= (
+                pregrasp_pose[:3, 2] * self.config.pregrasp_offset_m
+            )
+            lift_pose = grasp_pose.copy()
+            lift_pose[2, 3] += self.bimanual_lift_m
+            solutions = [
+                self.ik.solve(arm, pose)
+                for pose in (pregrasp_pose, grasp_pose, lift_pose)
+            ]
+            if any(solution is None for solution in solutions):
+                failed_stage = next(
+                    stage
+                    for stage, solution in zip(
+                        ("pregrasp", "grasp", "lift"), solutions
+                    )
+                    if solution is None
+                )
+                failure_counts[failed_stage] += 1
+                grasp_pose = _robot_facing_grasp_pose(
+                    candidate.world_grasp_pose,
+                    current_ee_position,
+                    self.ik.grasp_to_robotwin,
+                )
+                pregrasp_pose = grasp_pose.copy()
+                pregrasp_pose[:3, 3] -= (
+                    pregrasp_pose[:3, 2] * self.config.pregrasp_offset_m
+                )
+                lift_pose = grasp_pose.copy()
+                lift_pose[2, 3] += self.bimanual_lift_m
+                solutions = [
+                    self.ik.solve(arm, pose)
+                    for pose in (pregrasp_pose, grasp_pose, lift_pose)
+                ]
+                if any(solution is None for solution in solutions):
+                    failure_counts["robot_facing"] += 1
+                    continue
+                candidate = GraspCandidate(
+                    grasp_pose,
+                    float(candidate.confidence),
+                    candidate.object_name,
+                )
+                orientation_source = "robot_facing_fallback"
+            else:
+                orientation_source = "m2t2"
+            paths = self.ik.completed_paths
+            command_targets = self.ik.completed_command_targets
+            if len(paths) != 3 or len(command_targets) != 3:
+                raise RuntimeError("Mink omitted a completed bimanual grasp path")
+            if (
+                elongated_axis is not None
+                and abs(
+                    float(
+                        np.dot(command_targets[1][:3, 1], elongated_axis)
+                    )
+                )
+                > self.bimanual_max_jaw_axis_alignment
+            ):
+                failure_counts["jaw_axis"] += 1
+                continue
+            target_width = _target_width_along_axis(
+                scene, target, command_targets[1][:3, 1]
+            )
+            if (
+                target_width is not None
+                and target_width > self.bimanual_max_target_width_m
+            ):
+                failure_counts["jaw_width"] += 1
+                continue
+
+            transport_command = _rigid_transport_command_pose(
+                target.world_pose,
+                functional_pose,
+                command_targets[1],
+                desired_functional_pose,
+            )
+            followup = self.ik.solve_command_target(
+                arm,
+                transport_command,
+                np.asarray(solutions[2], dtype=np.float64),
+            )
+            if followup is None:
+                failure_counts["transport"] += 1
+                continue
+            _, transport_path, accepted_transport = followup
+            plans.append(
+                _BimanualArmPlan(
+                    arm=arm,
+                    target_name=target.name,
+                    arm_source=arm_source,
+                    candidate=candidate,
+                    paths=tuple(paths) + (transport_path,),
+                    command_targets=tuple(command_targets)
+                    + (accepted_transport,),
+                    orientation_source=orientation_source,
+                )
+            )
+            if len(plans) >= self.bimanual_max_plans_per_arm:
+                break
+        print(
+            f"[heuristic] bimanual IK target={target.name} arm={arm} "
+            f"orientation_attempts={sum(failure_counts.values()) + len(plans)} "
+            f"feasible={len(plans)} failures={failure_counts}"
+        )
+        return plans, list(ranker.last_candidates), trace
+
+    def _get_bimanual_action(
+        self,
+        scene: SceneObservation,
+        target_names: tuple[str, ...],
+    ) -> list[np.ndarray]:
+        if len(target_names) != 2:
+            raise TargetSelectionFailure(
+                "bimanual policy currently requires exactly two targets"
+            )
+        tracked = self.task_env.get_tracked_objects() or {}
+        targets_by_arm: dict[str, ObjectState] = {}
+        actors_by_arm: dict[str, Any] = {}
+        sources_by_arm: dict[str, str] = {}
+        for target_name in target_names:
+            target = self.simulator.object_state(target_name)
+            arm, arm_source = self._select_arm(target)
+            if arm in targets_by_arm:
+                raise TargetSelectionFailure(
+                    f"bimanual arm assignment is ambiguous: both targets use {arm}"
+                )
+            if target_name not in tracked:
+                raise TargetSelectionFailure(
+                    f"bimanual target {target_name!r} is not tracked"
+                )
+            targets_by_arm[arm] = target
+            actors_by_arm[arm] = tracked[target_name]
+            sources_by_arm[arm] = arm_source
+            print(
+                f"[heuristic] arm selection target={target_name} arm={arm} "
+                f"source={arm_source}"
+            )
+        if set(targets_by_arm) != {"left", "right"}:
+            raise TargetSelectionFailure(
+                "bimanual targets must resolve to one left and one right arm"
+            )
+
+        searches: dict[
+            str,
+            tuple[list[_BimanualArmPlan], list[GraspCandidate], dict[str, Any]],
+        ] = {}
+        for arm in ("left", "right"):
+            searches[arm] = self._plan_bimanual_arm(
+                scene,
+                targets_by_arm[arm],
+                arm=arm,
+                arm_source=sources_by_arm[arm],
+                actor=actors_by_arm[arm],
+            )
+
+        if not searches["left"][0] or not searches["right"][0]:
+            for arm in ("left", "right"):
+                plans, ranked, trace = searches[arm]
+                self._save_grasp_visualization(
+                    scene,
+                    targets_by_arm[arm],
+                    ranked,
+                    plans[0].candidate if plans else None,
+                    arm,
+                    raw_trace_override=trace,
+                    executed_command_pose_override=(
+                        plans[0].command_targets[1] if plans else None
+                    ),
+                    use_default_executed_pose=False,
+                )
+            counts = {arm: len(searches[arm][0]) for arm in ("left", "right")}
+            raise NoFeasiblePlanFailure(
+                "M2T2/Mink produced no complete atomic bimanual plan; "
+                f"feasible_per_arm={counts}; failures={self.ik.failures}"
+            )
+
+        pairs = [
+            (left, right)
+            for left in searches["left"][0]
+            for right in searches["right"][0]
+        ]
+        pairs.sort(
+            key=lambda pair: (
+                pair[0].candidate.confidence + pair[1].candidate.confidence
+            ),
+            reverse=True,
+        )
+        selected_pair: tuple[_BimanualArmPlan, _BimanualArmPlan] | None = None
+        rejected_pairs = 0
+        actions: list[np.ndarray] = []
+        for left_plan, right_plan in pairs:
+            candidate_actions = self.bimanual_controller.build(
+                left_plan, right_plan
+            )
+            if self.ik.full_robot_path_has_self_collision(
+                candidate_actions,
+                max_joint_step_rad=self.bimanual_collision_step_rad,
+            ):
+                rejected_pairs += 1
+                continue
+            selected_pair = (left_plan, right_plan)
+            actions = candidate_actions
+            break
+        if selected_pair is None:
+            raise NoFeasiblePlanFailure(
+                "all confidence-ranked bimanual grasp pairs self-collide; "
+                f"rejected_pairs={rejected_pairs}"
+            )
+
+        self._action_metadata_override = list(self.bimanual_controller.metadata)
+        for arm, selected in zip(("left", "right"), selected_pair):
+            _, ranked, trace = searches[arm]
+            self._save_grasp_visualization(
+                scene,
+                targets_by_arm[arm],
+                ranked,
+                selected.candidate,
+                arm,
+                raw_trace_override=trace,
+                executed_command_pose_override=selected.command_targets[1],
+                use_default_executed_pose=False,
+            )
+        print(
+            "[heuristic] bimanual plan selected "
+            f"left_conf={selected_pair[0].candidate.confidence:.3f} "
+            f"right_conf={selected_pair[1].candidate.confidence:.3f} "
+            f"orientation_sources="
+            f"{selected_pair[0].orientation_source}/"
+            f"{selected_pair[1].orientation_source} "
+            f"pair_collision_rejections={rejected_pairs}"
+        )
+        return actions
+
     @property
     def action_metadata(self) -> list[dict[str, Any]]:
+        if self._action_metadata_override is not None:
+            return list(self._action_metadata_override)
         return list(self.controller.metadata)
 
+    @property
+    def grasp_attempted(self) -> bool:
+        """Whether this episode has consumed its single grasp-planning attempt."""
+        return self._grasp_attempted
+
     def get_action(self, *, scene: SceneObservation) -> list[np.ndarray]:
+        if self._grasp_attempted:
+            raise NoFeasiblePlanFailure(
+                "one-shot grasp attempt already consumed for this episode"
+            )
+        self._grasp_attempted = True
+        self._action_metadata_override = None
         self.simulator.update(scene)
-        target_name = self._target_name(scene)
+        target_names = self._target_names(scene)
+        if len(target_names) == 2:
+            self.ik.reset_stats()
+            return self._get_bimanual_action(scene, target_names)
+        if len(target_names) != 1:
+            raise TargetSelectionFailure(
+                f"unsupported manipulation target count: {len(target_names)}"
+            )
+        target_name = target_names[0]
         target = self.simulator.object_state(target_name)
-        arm = self.config.arm
-        if self.automatic_arm:
-            arm = "left" if target.world_pose[0, 3] < 0.0 else "right"
+        arm, arm_source = self._select_arm(target)
+        print(
+            f"[heuristic] arm selection target={target_name} arm={arm} "
+            f"source={arm_source}"
+        )
 
         self.controller.reset()
         self.ik.reset_stats()
@@ -1293,11 +2101,15 @@ class RoboTwinHeuristicRuntime:
         )
         for metadata in self.controller.metadata:
             metadata["target_name"] = target_name
+            metadata["arm_source"] = arm_source
         return self.controller.actions
 
     def reset(self) -> None:
         self.simulator.scene = None
+        self._grasp_attempted = False
+        self._action_metadata_override = None
         self.controller.reset()
+        self.bimanual_controller.reset()
         self.ik.reset_stats()
         self.backend.reset(int(getattr(self.task_env, "episode_seed", 0)))
         self._visualization_index = 0
@@ -1391,5 +2203,18 @@ def create_runtime(
         ),
         grasp_visualization_scale=int(
             usr_args.get("grasp_visualization_scale", 4)
+        ),
+        bimanual_max_plans_per_arm=int(
+            usr_args.get("bimanual_max_plans_per_arm", 4)
+        ),
+        bimanual_lift_m=float(usr_args.get("bimanual_lift_m", 0.10)),
+        bimanual_collision_step_rad=float(
+            usr_args.get("bimanual_collision_step_rad", 0.03)
+        ),
+        bimanual_max_jaw_axis_alignment=float(
+            usr_args.get("bimanual_max_jaw_axis_alignment", 0.75)
+        ),
+        bimanual_max_target_width_m=float(
+            usr_args.get("bimanual_max_target_width_m", 0.10)
         ),
     )

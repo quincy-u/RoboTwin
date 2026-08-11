@@ -12,8 +12,33 @@ from .errors import HeuristicEpisodeFailure
 from .model import HeuristicPolicy
 from .observation import encode_obs
 
+_MOTION_ENDPOINT_PHASES = frozenset(
+    {"pregrasp", "grasp", "retreat", "lift", "transport", "place"}
+)
+_POST_CLOSE_MOTION_PHASES = frozenset({"retreat", "lift", "transport", "place"})
+_ARM_NAMES = ("left", "right")
 
-_MOTION_ENDPOINT_PHASES = frozenset({"pregrasp", "grasp", "retreat"})
+
+def _metadata_arms(metadata: dict[str, Any]) -> tuple[str, ...]:
+    """Return the arms commanded by one action-metadata record."""
+    arm = metadata.get("arm")
+    if arm == "both":
+        return _ARM_NAMES
+    if arm in _ARM_NAMES:
+        return (arm,)
+    return ()
+
+
+def _arm_measurements(
+    measurements: dict[str, Any], arm: str, *, bimanual: bool
+) -> dict[str, Any]:
+    if not bimanual:
+        return measurements
+    nested = measurements.get("arm_measurements", {})
+    if not isinstance(nested, dict):
+        return {}
+    arm_result = nested.get(arm, {})
+    return arm_result if isinstance(arm_result, dict) else {}
 
 
 def _execution_guard_failures(
@@ -24,6 +49,24 @@ def _execution_guard_failures(
     ee_orientation_tolerance_rad: float,
 ) -> list[str]:
     """Return concise reasons why measured execution missed its command."""
+    nested = measurements.get("arm_measurements")
+    if isinstance(nested, dict):
+        failures: list[str] = []
+        for arm in _ARM_NAMES:
+            arm_measurements = nested.get(arm, {})
+            if not isinstance(arm_measurements, dict):
+                arm_measurements = {}
+            failures.extend(
+                f"{arm}.{failure}"
+                for failure in _execution_guard_failures(
+                    arm_measurements,
+                    qpos_tolerance_rad=qpos_tolerance_rad,
+                    ee_position_tolerance_m=ee_position_tolerance_m,
+                    ee_orientation_tolerance_rad=ee_orientation_tolerance_rad,
+                )
+            )
+        return failures
+
     limits = (
         ("qpos_max_error_rad", qpos_tolerance_rad),
         ("ee_position_error_m", ee_position_tolerance_m),
@@ -87,6 +130,19 @@ def _gripper_execution_guard_failures(
 
 def _robot_measurements(task_env: Any, metadata: dict[str, Any]) -> dict[str, Any]:
     arm = metadata.get("arm")
+    if arm == "both":
+        targets = metadata.get("arm_targets", {})
+        if not isinstance(targets, dict):
+            targets = {}
+        arm_measurements: dict[str, dict[str, Any]] = {}
+        for side in _ARM_NAMES:
+            target_metadata = targets.get(side, {})
+            if not isinstance(target_metadata, dict):
+                target_metadata = {}
+            arm_measurements[side] = _robot_measurements(
+                task_env, {**target_metadata, "arm": side}
+            )
+        return {"arm_measurements": arm_measurements}
     robot = task_env.robot
     result: dict[str, Any] = {}
     if arm in {"left", "right"}:
@@ -155,25 +211,6 @@ def _robot_measurements(task_env: Any, metadata: dict[str, Any]) -> dict[str, An
             result["target_z_m"] = float(target_pose[2])
         except (AttributeError, KeyError, TypeError, ValueError):
             pass
-        try:
-            actor = (task_env.get_tracked_objects() or {})[target_name]
-            entity = getattr(actor, "actor", actor)
-            actor_name = getattr(entity, "name", None)
-            if actor_name is None:
-                name_getter = getattr(actor, "get_name", None)
-                actor_name = name_getter() if callable(name_getter) else None
-            contact_getter = getattr(
-                task_env, "get_gripper_actor_contact_position", None
-            )
-            if actor_name and callable(contact_getter):
-                contacts = np.asarray(contact_getter(actor_name), dtype=np.float64)
-                result["target_gripper_contact_count"] = int(len(contacts))
-                if contacts.size:
-                    result["target_gripper_contact_positions"] = contacts.reshape(
-                        -1, 3
-                    ).astype(float).tolist()
-        except (AttributeError, KeyError, TypeError, ValueError):
-            pass
     return result
 
 
@@ -194,6 +231,36 @@ def _execution_trace_path(task_env: Any, model: HeuristicPolicy) -> Path | None:
     return path
 
 
+def _trace_arm_targets(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    if metadata.get("arm") != "both":
+        return None
+    targets = metadata.get("arm_targets", {})
+    if not isinstance(targets, dict):
+        targets = {}
+    result: dict[str, Any] = {}
+    for side in _ARM_NAMES:
+        target = targets.get(side, {})
+        if not isinstance(target, dict):
+            target = {}
+        target_qpos = target.get("target_qpos")
+        command_pose = target.get("command_pose")
+        result[side] = {
+            "target_qpos": (
+                None
+                if target_qpos is None
+                else np.asarray(target_qpos, dtype=np.float64).tolist()
+            ),
+            "target_gripper": target.get("target_gripper"),
+            "command_pose": (
+                None
+                if command_pose is None
+                else np.asarray(command_pose, dtype=np.float64).tolist()
+            ),
+            "target_name": target.get("target_name"),
+        }
+    return result
+
+
 def _write_execution_record(path: Path | None, record: dict[str, Any]) -> None:
     if path is None:
         return
@@ -204,6 +271,20 @@ def _write_execution_record(path: Path | None, record: dict[str, Any]) -> None:
 def _print_endpoint(record: dict[str, Any]) -> None:
     if not record.get("endpoint") or record["status"] != "executed":
         return
+    if record.get("arm") == "both":
+        targets = record.get("arm_targets") or {}
+        measurements = record.get("arm_measurements") or {}
+        arm_source = record.get("arm_source")
+        for side in _ARM_NAMES:
+            side_target = targets.get(side, {})
+            side_measurement = measurements.get(side, {})
+            side_record = {**record, **side_measurement}
+            side_record["arm"] = side
+            side_record["gripper_target"] = side_target.get("target_gripper")
+            if isinstance(arm_source, dict):
+                side_record["arm_source"] = arm_source.get(side)
+            _print_endpoint(side_record)
+        return
 
     def value(name: str, unit: str = "") -> str:
         item = record.get(name)
@@ -211,13 +292,13 @@ def _print_endpoint(record: dict[str, Any]) -> None:
 
     print(
         f"[heuristic][exec] phase={record['phase']} arm={record.get('arm')} "
+        f"arm_source={record.get('arm_source', 'n/a')} "
         f"qerr_max={value('qpos_max_error_rad', 'rad')} "
         f"ee_pos={value('ee_position_error_m', 'm')} "
         f"ee_rot={value('ee_orientation_error_rad', 'rad')} "
         f"gripper={record.get('gripper_target')}/"
         f"{record.get('gripper_state', 'n/a')}/"
         f"{record.get('gripper_physical_state', 'n/a')} "
-        f"contacts={record.get('target_gripper_contact_count', 'n/a')} "
         f"target_z={value('target_z_m', 'm')}"
     )
 
@@ -274,13 +355,16 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             print(f"[heuristic] execution telemetry disabled: {exc}")
 
     close_completed = False
-    close_initial_physical_state: float | None = None
-    close_physical_states: list[float] = []
+    close_initial_physical_states: dict[str, float] = {}
+    close_physical_states: dict[str, list[float]] = {arm: [] for arm in _ARM_NAMES}
+    deferred_close_success = False
     for action_index, (action, action_metadata) in enumerate(
         zip(actions, metadata)
     ):
         phase = action_metadata.get("phase", "action")
         endpoint = bool(action_metadata.get("endpoint", False))
+        action_arms = _metadata_arms(action_metadata)
+        bimanual = action_metadata.get("arm") == "both"
 
         # A task-level collision can set eval_success during an intermediate
         # close pulse. Clear it so the remaining settle pulses are actually
@@ -290,14 +374,15 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             and not close_completed
             and task_env.take_action_cnt < task_env.step_lim
         ):
-            if close_initial_physical_state is None:
-                try:
-                    before_close = _robot_measurements(task_env, action_metadata)
-                    value = before_close.get("gripper_physical_state")
+            try:
+                before_close = _robot_measurements(task_env, action_metadata)
+                for arm in action_arms:
+                    arm_values = _arm_measurements(before_close, arm, bimanual=bimanual)
+                    value = arm_values.get("gripper_physical_state")
                     if value is not None and np.isfinite(value):
-                        close_initial_physical_state = float(value)
-                except Exception:
-                    pass
+                        close_initial_physical_states.setdefault(arm, float(value))
+            except Exception:
+                pass
             task_env.eval_success = False
 
         if getattr(task_env, "eval_success", False):
@@ -309,6 +394,11 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             status = "executed"
 
         eval_success_reported = bool(getattr(task_env, "eval_success", False))
+        terminal_post_close_success = (
+            eval_success_reported
+            and close_completed
+            and phase in _POST_CLOSE_MOTION_PHASES
+        )
         premature_success = (
             eval_success_reported and not close_completed and phase != "close"
         )
@@ -317,12 +407,16 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             and status == "executed"
             and phase in _MOTION_ENDPOINT_PHASES
             and (endpoint or premature_success)
+            and not terminal_post_close_success
         )
         close_guard_required = (
             guard_enabled
             and status == "executed"
             and phase == "close"
             and endpoint
+        )
+        close_endpoint_executed = (
+            status == "executed" and phase == "close" and endpoint
         )
         premature_guard_required = (
             guard_enabled and status == "executed" and premature_success
@@ -345,11 +439,14 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
                 measurements["telemetry_error"] = f"{type(exc).__name__}: {exc}"
 
         if status == "executed" and phase == "close":
-            physical_state = measurements.get("gripper_physical_state")
-            if physical_state is not None and np.isfinite(physical_state):
-                close_physical_states.append(float(physical_state))
+            for arm in action_arms:
+                arm_values = _arm_measurements(measurements, arm, bimanual=bimanual)
+                physical_state = arm_values.get("gripper_physical_state")
+                if physical_state is not None and np.isfinite(physical_state):
+                    close_physical_states[arm].append(float(physical_state))
 
         guard_failures: list[str] = []
+        close_validation_failures: list[str] = []
         if motion_guard_required:
             guard_failures.extend(
                 _execution_guard_failures(
@@ -361,17 +458,22 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             )
         if premature_guard_required:
             guard_failures.append("eval_success_before_close")
-        if close_guard_required:
-            guard_failures.extend(
-                _gripper_execution_guard_failures(
-                    initial_state=close_initial_physical_state,
-                    states=close_physical_states,
+        if close_endpoint_executed and guard_enabled:
+            for arm in action_arms:
+                arm_failures = _gripper_execution_guard_failures(
+                    initial_state=close_initial_physical_states.get(arm),
+                    states=close_physical_states[arm],
                     min_delta=guard_gripper_min_delta,
                     settle_delta_max=guard_gripper_settle_delta_max,
                 )
-            )
-            if not guard_failures:
-                close_completed = True
+                close_validation_failures.extend(
+                    f"{arm}.{failure}" if bimanual else failure
+                    for failure in arm_failures
+                )
+        if close_guard_required:
+            guard_failures.extend(close_validation_failures)
+        if close_endpoint_executed and not close_validation_failures:
+            close_completed = True
 
         if phase == "close" and not endpoint and eval_success_reported:
             task_env.eval_success = False
@@ -385,6 +487,28 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
                 f"arm={action_metadata.get('arm')}: "
                 + ", ".join(guard_failures)
             )
+
+        # If RoboTwin reports task success partway through the final close
+        # interpolation, take_action() can return before the requested 0.0
+        # gripper target is fully applied. Defer that success until one
+        # post-close motion command executes with the closed target, leaving
+        # the gripper drive closed without a retry.
+        if (
+            close_endpoint_executed
+            and not guard_failures
+            and eval_success_reported
+        ):
+            deferred_close_success = True
+            task_env.eval_success = False
+
+        if (
+            deferred_close_success
+            and status == "executed"
+            and phase in _POST_CLOSE_MOTION_PHASES
+            and not guard_failures
+        ):
+            task_env.eval_success = True
+            deferred_close_success = False
 
         if not telemetry_enabled:
             if status != "executed":
@@ -400,6 +524,8 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
             "action_index": action_index,
             "phase": phase,
             "arm": action_metadata.get("arm"),
+            "arm_source": action_metadata.get("arm_source"),
+            "arm_targets": _trace_arm_targets(action_metadata),
             "endpoint": endpoint,
             "waypoint_index": int(action_metadata.get("waypoint_index", 1)),
             "waypoint_count": int(action_metadata.get("waypoint_count", 1)),
@@ -429,6 +555,13 @@ def eval(task_env: Any, model: HeuristicPolicy, observation: dict) -> None:
         _print_endpoint(record)
         if guard_failures:
             break
+
+    if (
+        not bool(getattr(task_env, "eval_success", False))
+        and task_env.take_action_cnt < task_env.step_lim
+    ):
+        print("[heuristic][exec] one-shot rollout complete without task success")
+        task_env.take_action_cnt = task_env.step_lim
 
 
 def reset_model(model: HeuristicPolicy) -> None:

@@ -18,6 +18,11 @@ retreat_offset_m: 0.05
 max_waypoints_per_segment: 64
 max_joint_step_rad: 0.12
 gripper_settle_actions: 5
+bimanual_max_plans_per_arm: 4
+bimanual_lift_m: 0.10
+bimanual_collision_step_rad: 0.03
+bimanual_max_jaw_axis_alignment: 0.75
+bimanual_max_target_width_m: 0.10
 mink_solver: daqp
 mink_dt: 0.05
 mink_max_iterations: 100

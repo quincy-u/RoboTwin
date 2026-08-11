@@ -53,6 +53,25 @@ class TaskPlanTest(unittest.TestCase):
             (Pick("cup", "left"), Place("cup", "coaster", "left")),
         )
 
+    def test_dual_bottles_are_two_arm_specific_pick_targets(self):
+        env = Env(
+            {
+                "bottle1": Actor("001_bottle", 13),
+                "bottle2": Actor("001_bottle", 16),
+            }
+        )
+        plan = task_plan_from_task(
+            env,
+            "pick_dual_bottles",
+            {"{A}": "001_bottle/base13", "{B}": "001_bottle/base16"},
+        )
+        self.assertEqual(plan.family, "pick_place")
+        self.assertEqual(
+            plan.stages,
+            (Pick("bottle1", "left"), Pick("bottle2", "right")),
+        )
+        self.assertFalse(any(isinstance(stage, Place) for stage in plan.stages))
+
     def test_family_is_derived_from_task_source(self):
         self.assertEqual(task_family("shake_bottle"), "pick")
         self.assertEqual(task_family("place_empty_cup"), "pick_place")

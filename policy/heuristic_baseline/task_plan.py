@@ -98,6 +98,28 @@ def task_plan_from_task(task_env: Any, task_name: str, info: dict[str, str]) -> 
         raise ValueError("RoboTwin task metadata does not define primary target {A}")
     tracked = task_env.get_tracked_objects() or {}
     primary = _resolve_object_name(primary_label, tracked)
+
+    # ``pick_dual_bottles`` uses {A} and {B} for two independently grasped
+    # objects, not for a source object and place destination.  The task source
+    # is the ground truth for the fixed left/right expert-arm assignment.
+    if task_name == "pick_dual_bottles":
+        secondary_label = info.get("{B}")
+        if not secondary_label:
+            raise ValueError(
+                "RoboTwin pick_dual_bottles metadata does not define target {B}"
+            )
+        secondary = _resolve_object_name(secondary_label, tracked)
+        if primary == secondary:
+            raise ValueError(
+                "RoboTwin pick_dual_bottles targets {A} and {B} must resolve "
+                "to distinct tracked objects"
+            )
+        return TaskPlan(
+            task_name,
+            family,
+            (Pick(primary, "left"), Pick(secondary, "right")),
+        )
+
     arm = info.get("{a}")
     stages: list[TaskStage] = [Pick(primary, arm)]
     destination_label = info.get("{B}")

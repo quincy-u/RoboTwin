@@ -19,6 +19,23 @@ def _instance_id(actor: Any, fallback: int) -> int:
     return fallback if instance_id is None else int(instance_id)
 
 
+def _instance_ids(
+    tracked: dict[str, Any],
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    used: set[int] = set()
+    for index, (name, actor) in enumerate(tracked.items()):
+        fallback = -(index + 2)
+        candidate = _instance_id(actor, fallback=fallback)
+        if candidate in used:
+            candidate = fallback
+            while candidate in used:
+                candidate -= 1
+        result[name] = candidate
+        used.add(candidate)
+    return result
+
+
 def _actor_dataset_label(actor: Any) -> str | None:
     modelname = getattr(actor, "modelname", None)
     model_id = getattr(actor, "model_id", None)
@@ -51,6 +68,36 @@ def _resolve_target_name(
             return matches[0]
     candidates = [name for name in tracked if name != "wall"]
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_target_names(
+    task_env: Any, tracked: dict[str, Any], requested: str
+) -> tuple[str, ...]:
+    """Resolve one normal target or both pick_dual_bottles targets."""
+    if requested != "auto":
+        selected = _resolve_target_name(task_env, tracked, requested)
+        return () if selected is None else (selected,)
+
+    task_plan = getattr(task_env, "heuristic_task_plan", None)
+    if getattr(task_plan, "task_name", None) == "pick_dual_bottles":
+        targets = tuple(
+            getattr(stage, "target")
+            for stage in getattr(task_plan, "stages", ())
+            if getattr(stage, "target", None) is not None
+        )
+        if len(targets) != 2 or len(set(targets)) != 2:
+            raise ValueError(
+                "pick_dual_bottles requires exactly two distinct Pick targets"
+            )
+        missing = [name for name in targets if name not in tracked]
+        if missing:
+            raise ValueError(
+                f"pick_dual_bottles targets are not tracked: {', '.join(missing)}"
+            )
+        return targets
+
+    selected = _resolve_target_name(task_env, tracked, requested)
+    return () if selected is None else (selected,)
 
 
 def _object_states(
@@ -181,19 +228,17 @@ def encode_obs(
         for name, actor in (task_env.get_tracked_objects() or {}).items()
         if actor is not None
     }
-    instance_ids = {
-        name: _instance_id(actor, fallback=-(index + 2))
-        for index, (name, actor) in enumerate(tracked.items())
-    }
-    selected_target = _resolve_target_name(task_env, tracked, target_name)
+    instance_ids = _instance_ids(tracked)
+    selected_targets = _resolve_target_names(task_env, tracked, target_name)
+    target_only = {name: tracked[name] for name in selected_targets}
 
     labels = np.full(depth_m.shape, -1, dtype=np.int64)
-    if selected_target is not None:
-        target_only = {selected_target: tracked[selected_target]}
-        target_mask = task_env.cameras.get_object_masks(target_only)["head_camera"]
-        labels[np.asarray(target_mask[selected_target], dtype=bool)] = (
-            instance_ids[selected_target]
-        )
+    if target_only:
+        target_masks = task_env.cameras.get_object_masks(target_only)["head_camera"]
+        for selected_target in selected_targets:
+            labels[
+                np.asarray(target_masks[selected_target], dtype=bool)
+            ] = instance_ids[selected_target]
 
     return SceneObservation(
         xyz=xyz,
@@ -201,7 +246,7 @@ def encode_obs(
         instance_labels=labels.reshape(-1)[valid],
         camera_pose=camera_to_world,
         objects=_object_states(
-            ({selected_target: tracked[selected_target]} if selected_target else tracked),
+            target_only if selected_targets else tracked,
             instance_ids,
             ObjectState,
         ),

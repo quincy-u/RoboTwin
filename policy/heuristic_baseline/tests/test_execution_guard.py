@@ -50,6 +50,32 @@ def _metadata(phase: str, *, endpoint: bool) -> dict:
         "endpoint": endpoint,
         "waypoint_index": 1,
         "waypoint_count": 1,
+        "target_name": "bottle",
+    }
+
+
+def _dual_metadata(phase: str, *, endpoint: bool) -> dict:
+    return {
+        "phase": phase,
+        "arm": "both",
+        "endpoint": endpoint,
+        "waypoint_index": 1,
+        "waypoint_count": 1,
+        "arm_source": {"left": "task_plan", "right": "task_plan"},
+        "arm_targets": {
+            "left": {
+                "target_qpos": np.zeros(6),
+                "target_gripper": 0.0,
+                "command_pose": np.eye(4),
+                "target_name": "bottle1",
+            },
+            "right": {
+                "target_qpos": np.zeros(6),
+                "target_gripper": 0.0,
+                "command_pose": np.eye(4),
+                "target_name": "bottle2",
+            },
+        },
     }
 
 
@@ -188,6 +214,7 @@ class ExecutionGuardTest(unittest.TestCase):
 
         self.assertEqual(len(env.actions), 2)
         self.assertFalse(env.eval_success)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
 
     def test_wide_object_physical_response_passes(self) -> None:
         failures = deploy_policy._gripper_execution_guard_failures(
@@ -244,7 +271,7 @@ class ExecutionGuardTest(unittest.TestCase):
 
         self.assertEqual(len(env.actions), 4)
         self.assertFalse(env.eval_success)
-        self.assertLess(env.take_action_cnt, env.step_lim)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
 
     def test_close_guard_aborts_before_retreat_with_telemetry_off(self) -> None:
         model = _Model(
@@ -337,7 +364,254 @@ class ExecutionGuardTest(unittest.TestCase):
         self.assertTrue(env.eval_success)
         self.assertLess(env.take_action_cnt, env.step_lim)
 
+    def test_final_close_success_executes_one_closed_retreat_command(self) -> None:
+        model = _Model(
+            [
+                _metadata("close", endpoint=False),
+                _metadata("close", endpoint=False),
+                _metadata("close", endpoint=True),
+                _metadata("retreat", endpoint=True),
+            ]
+        )
 
+        class FinalCloseSuccessEnv(_TaskEnv):
+            def take_action(self, action, *, action_type):
+                super().take_action(action, action_type=action_type)
+                self.eval_success = len(self.actions) == 3
+
+        env = FinalCloseSuccessEnv()
+        good = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+
+        def measured(_task_env, _metadata):
+            physical = {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82}
+            return {
+                **good,
+                "gripper_physical_state": physical.get(len(env.actions), 0.82),
+            }
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(deploy_policy, "_robot_measurements", side_effect=measured),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 4)
+        self.assertEqual(env.actions[-1][0][13], 0.0)
+        self.assertTrue(env.eval_success)
+        self.assertLess(env.take_action_cnt, env.step_lim)
+
+    def test_robot_measurements_never_queries_ground_truth_contacts(self) -> None:
+        class Robot:
+            def get_right_arm_real_jointState(self):
+                return np.r_[np.zeros(6), 1.0]
+
+            def get_right_gripper_val(self):
+                return 1.0
+
+        class Env:
+            robot = Robot()
+
+            def get_gripper_actor_contact_position(self, *_args, **_kwargs):
+                raise AssertionError("policy must not query simulator contacts")
+
+        measurements = deploy_policy._robot_measurements(
+            Env(),
+            {
+                "arm": "right",
+                "target_qpos": np.zeros(6),
+                "target_name": None,
+            },
+        )
+
+        self.assertEqual(measurements["qpos_max_error_rad"], 0.0)
+        self.assertNotIn("target_gripper_contact_count", measurements)
+
+    def test_bimanual_measurements_are_nested_and_contact_free(self) -> None:
+        class Pose:
+            def __init__(self, x):
+                self.p = np.array([x, 0.0, 0.8])
+                self.q = np.array([1.0, 0.0, 0.0, 0.0])
+
+        class Actor:
+            def __init__(self, x):
+                self.pose = Pose(x)
+
+            def get_pose(self):
+                return self.pose
+
+        class Robot:
+            def get_left_arm_real_jointState(self):
+                return np.r_[np.zeros(6), 1.0]
+
+            def get_right_arm_real_jointState(self):
+                return np.r_[np.full(6, 0.2), 1.0]
+
+            def get_left_gripper_val(self):
+                return 0.3
+
+            def get_right_gripper_val(self):
+                return 0.4
+
+            def get_left_ee_pose(self):
+                return np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+
+            def get_right_ee_pose(self):
+                return np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+
+        class Env:
+            robot = Robot()
+
+            def get_tracked_objects(self):
+                return {"bottle1": Actor(-0.2), "bottle2": Actor(0.2)}
+
+            def get_gripper_actor_contact_position(self, *_args, **_kwargs):
+                raise AssertionError("policy must not query simulator contacts")
+
+        metadata = _dual_metadata("transport", endpoint=True)
+        metadata["arm_targets"]["right"]["target_qpos"] = np.full(6, 0.25)
+        measurements = deploy_policy._robot_measurements(Env(), metadata)
+
+        self.assertEqual(set(measurements["arm_measurements"]), {"left", "right"})
+        left = measurements["arm_measurements"]["left"]
+        right = measurements["arm_measurements"]["right"]
+        self.assertEqual(left["target_name"], "bottle1")
+        self.assertEqual(right["target_name"], "bottle2")
+        self.assertAlmostEqual(left["qpos_max_error_rad"], 0.0)
+        self.assertAlmostEqual(right["qpos_max_error_rad"], 0.05)
+        self.assertAlmostEqual(left["target_z_m"], 0.8)
+        self.assertAlmostEqual(right["target_z_m"], 0.8)
+        self.assertNotIn("target_gripper_contact_count", left)
+        self.assertNotIn("target_gripper_contact_count", right)
+
+        trace_targets = deploy_policy._trace_arm_targets(metadata)
+        self.assertEqual(trace_targets["left"]["target_name"], "bottle1")
+        self.assertEqual(trace_targets["right"]["target_name"], "bottle2")
+        self.assertEqual(len(trace_targets["right"]["target_qpos"]), 6)
+
+    def test_bimanual_motion_guard_labels_the_failing_arm(self) -> None:
+        good = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+        failures = deploy_policy._execution_guard_failures(
+            {
+                "arm_measurements": {
+                    "left": good,
+                    "right": {**good, "ee_position_error_m": 0.20},
+                }
+            },
+            qpos_tolerance_rad=0.10,
+            ee_position_tolerance_m=0.03,
+            ee_orientation_tolerance_rad=0.20,
+        )
+
+        self.assertEqual(failures, ["right.ee_position_error_m=0.2000>0.0300"])
+
+    def test_bimanual_close_guard_rejects_one_unresponsive_gripper(self) -> None:
+        model = _Model(
+            [
+                _dual_metadata("close", endpoint=False),
+                _dual_metadata("close", endpoint=False),
+                _dual_metadata("close", endpoint=True),
+                _dual_metadata("transport", endpoint=True),
+            ]
+        )
+        env = _TaskEnv()
+        good_motion = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+
+        def measured(_task_env, _metadata):
+            index = len(env.actions)
+            left = {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82}
+            right = {0: 1.0, 1: 0.98, 2: 0.96, 3: 0.95}
+            return {
+                "arm_measurements": {
+                    "left": {
+                        **good_motion,
+                        "gripper_physical_state": left.get(index, 0.82),
+                    },
+                    "right": {
+                        **good_motion,
+                        "gripper_physical_state": right.get(index, 0.95),
+                    },
+                }
+            }
+
+        output = io.StringIO()
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(deploy_policy, "_robot_measurements", side_effect=measured),
+            redirect_stdout(output),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 3)
+        self.assertFalse(env.eval_success)
+        self.assertEqual(env.take_action_cnt, env.step_lim)
+        self.assertIn("right.gripper_closure_delta", output.getvalue())
+
+    def test_bimanual_success_during_transport_is_preserved(self) -> None:
+        model = _Model(
+            [
+                _dual_metadata("close", endpoint=False),
+                _dual_metadata("close", endpoint=False),
+                _dual_metadata("close", endpoint=True),
+                _dual_metadata("transport", endpoint=True),
+            ]
+        )
+        model.usr_args["execution_telemetry"] = True
+
+        class TransportSuccessEnv(_TaskEnv):
+            def take_action(self, action, *, action_type):
+                super().take_action(action, action_type=action_type)
+                self.eval_success = len(self.actions) == 4
+
+        env = TransportSuccessEnv()
+        good_motion = {
+            "qpos_max_error_rad": 0.01,
+            "ee_position_error_m": 0.002,
+            "ee_orientation_error_raw_rad": 0.02,
+        }
+
+        def measured(_task_env, action_metadata):
+            index = len(env.actions)
+            physical = {0: 1.0, 1: 0.84, 2: 0.82, 3: 0.82}
+            motion = good_motion
+            if action_metadata["phase"] == "transport":
+                motion = {
+                    "qpos_max_error_rad": 1.0,
+                    "ee_position_error_m": 1.0,
+                    "ee_orientation_error_raw_rad": 1.0,
+                }
+            return {
+                "arm_measurements": {
+                    arm: {
+                        **motion,
+                        "gripper_physical_state": physical.get(index, 0.82),
+                    }
+                    for arm in ("left", "right")
+                }
+            }
+
+        with (
+            patch.object(deploy_policy, "encode_obs", return_value=object()),
+            patch.object(deploy_policy, "_robot_measurements", side_effect=measured),
+        ):
+            deploy_policy.eval(env, model, {})
+
+        self.assertEqual(len(env.actions), 4)
+        self.assertEqual(env.actions[-1][0][6], 0.0)
+        self.assertEqual(env.actions[-1][0][13], 0.0)
+        self.assertTrue(env.eval_success)
+        self.assertLess(env.take_action_cnt, env.step_lim)
 
 if __name__ == "__main__":
     unittest.main()
